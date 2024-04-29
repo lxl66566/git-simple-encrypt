@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 aes-gcm-siv = "0.11.1"
 anyhow = "1.0.82"
+assert2 = "0.3.14"
 clap = { version = "4.5.4", features = ["derive"] }
+colored = "2.1.0"
+die-exit = "0.5.0"
 sha3 = "0.10.8"
 tokio = { version = "1.37.0", features = ["macros", "fs", "rt-multi-thread"] }
 

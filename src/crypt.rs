@@ -5,12 +5,12 @@ use aes_gcm_siv::{
 };
 use anyhow::anyhow;
 use sha3::{Digest, Sha3_224};
-use std::{ops::Deref, path::PathBuf, sync::LazyLock as Lazy};
+use std::{ffi::OsStr, ops::Deref, path::PathBuf, sync::LazyLock as Lazy};
 
 type Result<T> = std::result::Result<T, aes_gcm_siv::Error>;
 
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
-static ENCRYPTED_EXTENSION: &str = ".enc";
+static ENCRYPTED_EXTENSION: &str = "enc";
 
 pub fn encrypt(key: &[u8], text: &[u8]) -> Result<Vec<u8>> {
     let mut hasher = Sha3_224::default();
@@ -36,13 +36,27 @@ pub async fn encrypt_file(file: PathBuf) -> anyhow::Result<()> {
         .file_name()
         .ok_or(anyhow!("cannot get file name"))?
         .to_owned();
-    new_file_name.push(ENCRYPTED_EXTENSION);
+    new_file_name.extend([".", ENCRYPTED_EXTENSION].into_iter().map(OsStr::new));
     let mut new_file = file.clone();
     new_file.set_file_name(new_file_name);
     tokio::fs::write(
-        new_file,
+        &new_file,
         encrypt(KEY.as_bytes(), &bytes)
-            .map_err(|e| anyhow!("error occurs in encrypting bytes: {e}"))?,
+            .map_err(|e| anyhow!("Encrypting file `{}` error: {e}", new_file.display()))?,
+    )
+    .await?;
+    Ok(())
+}
+
+pub async fn decrypt_file(file: PathBuf) -> anyhow::Result<()> {
+    assert!(file.extension().unwrap() == ENCRYPTED_EXTENSION);
+    let bytes = tokio::fs::read(&file).await?;
+    let mut new_file = file.clone();
+    new_file.set_extension("");
+    tokio::fs::write(
+        &new_file,
+        decrypt(KEY.as_bytes(), &bytes)
+            .map_err(|e| anyhow!("Decrypting file `{}` error: {e}", new_file.display()))?,
     )
     .await?;
     Ok(())

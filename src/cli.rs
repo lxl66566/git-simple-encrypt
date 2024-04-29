@@ -22,4 +22,6 @@ pub enum SubCommand {
     Add,
     /// Remove crypt attr to file or folder.
     Remove,
+    /// Set password (KEY) for encrypting.
+    Set,
 }
