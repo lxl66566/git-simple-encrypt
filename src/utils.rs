@@ -13,7 +13,8 @@ pub const END_OF_LINE: &str = "\r\n";
 
 #[cfg(unix)]
 pub fn bytes2path(b: &[u8]) -> &Path {
-    use std::os::unix::prelude::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
     Path::new(OsStr::from_bytes(b))
 }
 #[cfg(windows)]

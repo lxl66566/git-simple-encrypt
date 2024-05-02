@@ -27,6 +27,7 @@ sha3 = "0.10.8"
 tap = "1.0.1"
 # tokio = { version = "1.37.0", features = ["macros", "fs", "rt-multi-thread"] }
 
+openssl = { version = "0.10", features = ["vendored"] }
 
 [[bin]]
 name = "git-se"

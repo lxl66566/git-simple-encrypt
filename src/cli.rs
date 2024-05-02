@@ -1,5 +1,4 @@
 use clap::{Parser, Subcommand};
-use std::default;
 use std::path::PathBuf;
 use std::sync::LazyLock as Lazy;
 
