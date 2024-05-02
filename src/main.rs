@@ -7,7 +7,9 @@ mod utils;
 
 use anyhow::{Ok, Result};
 use cli::{SubCommand, CLI};
-use git_command::{decrypt_repo, encrypt_repo, set_key};
+use git_command::{
+    add_crypt_attributes, decrypt_repo, encrypt_repo, remove_crypt_attributes, set_key,
+};
 
 #[compio::main]
 async fn main() -> Result<()> {
@@ -16,7 +18,8 @@ async fn main() -> Result<()> {
         SubCommand::Encrypt => encrypt_repo().await?,
         SubCommand::Decrypt => decrypt_repo().await?,
         SubCommand::Set { key } => set_key(key)?,
-        _ => unimplemented!(),
+        SubCommand::Add { path } => add_crypt_attributes(path)?,
+        SubCommand::Remove { path } => remove_crypt_attributes(path)?,
     }
     Ok(())
 }

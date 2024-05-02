@@ -71,15 +71,16 @@ pub async fn decrypt_file(file: impl AsRef<Path>) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use anyhow::Ok;
-
     use super::*;
-    use std::env::temp_dir;
+    use anyhow::Ok;
+    use temp_testdir::TempDir;
 
     #[compio::test]
     async fn test_encrypt_decrypt() -> anyhow::Result<()> {
+        let temp_dir = TempDir::default();
+        let file = temp_dir.join("test_file.txt");
+
         const CONTENT: &[u8; 6] = b"123456";
-        let file = temp_dir().join("test_file.txt");
         std::fs::write(&file, CONTENT)?;
         encrypt_file(&file).await?;
         let encrypted_file = file.parent().unwrap().join("test_file.txt.enc");
@@ -90,8 +91,6 @@ mod test {
 
         decrypt_file(&encrypted_file).await?;
         assert_eq!(std::fs::read_to_string(&file)?, "123456");
-
-        std::fs::remove_file(&file)?;
         Ok(())
     }
 }

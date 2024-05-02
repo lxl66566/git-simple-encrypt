@@ -603,6 +603,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "git-simple-encrypt"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm-siv",
+ "anyhow",
+ "assert2",
+ "clap",
+ "colored",
+ "compio",
+ "die-exit",
+ "env_logger",
+ "futures-util",
+ "git2",
+ "log",
+ "regex",
+ "sha3",
+ "tap",
+ "temp_testdir",
+]
+
+[[package]]
 name = "git2"
 version = "0.18.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,25 +1001,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "simple-git-encrypt"
-version = "0.1.0"
-dependencies = [
- "aes-gcm-siv",
- "anyhow",
- "assert2",
- "clap",
- "colored",
- "compio",
- "die-exit",
- "env_logger",
- "futures-util",
- "git2",
- "log",
- "sha3",
- "tap",
-]
-
-[[package]]
 name = "slab"
 version = "0.4.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1062,6 +1064,12 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "temp_testdir"
+version = "0.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "921f1e9c427802414907a48b21a6504ff6b3a15a1a3cf37e699590949ad9befc"
 
 [[package]]
 name = "tinyvec"
