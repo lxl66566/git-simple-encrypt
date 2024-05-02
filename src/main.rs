@@ -3,21 +3,20 @@
 mod cli;
 mod crypt;
 mod git_command;
+mod utils;
 
-use crate::crypt::{decrypt, encrypt};
-use clap::Parser;
-use cli::Cli;
+use anyhow::{Ok, Result};
+use cli::{SubCommand, CLI};
+use git_command::{decrypt_repo, encrypt_repo, set_key};
 
-type Result<T> = std::result::Result<T, aes_gcm_siv::Error>;
-
-fn main() -> Result<()> {
-    let cli = Cli::parse();
-    println!("{:?}", cli);
-    let plaintext = b"Hello, world!";
-    let key = b"l".iter().cycle().take(128).copied().collect::<Vec<u8>>();
-    let ciphertext = encrypt(&key, plaintext)?;
-    println!("Ciphertext: {:?}", ciphertext);
-    let plaintext = decrypt(&key, &ciphertext)?;
-    println!("Decrypted: {:?}", plaintext);
+#[compio::main]
+async fn main() -> Result<()> {
+    env_logger::init();
+    match &CLI.command {
+        SubCommand::Encrypt => encrypt_repo().await?,
+        SubCommand::Decrypt => decrypt_repo().await?,
+        SubCommand::Set { key } => set_key(key)?,
+        _ => unimplemented!(),
+    }
     Ok(())
 }

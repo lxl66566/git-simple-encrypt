@@ -1,4 +1,8 @@
 use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+use std::sync::LazyLock as Lazy;
+
+pub static CLI: Lazy<Cli> = Lazy::new(Cli::parse);
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
@@ -8,6 +12,10 @@ pub struct Cli {
     /// Encrypt, Decrypt and Add
     #[command(subcommand)]
     pub command: SubCommand,
+    /// Repository path
+    #[arg(short, long, global = true)]
+    #[clap(default_value = ".")]
+    pub repo: PathBuf,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -23,5 +31,5 @@ pub enum SubCommand {
     /// Remove crypt attr to file or folder.
     Remove,
     /// Set password (KEY) for encrypting.
-    Set,
+    Set { key: String },
 }
