@@ -1,11 +1,13 @@
 mod binding;
+pub mod config;
 
 use crate::cli::CLI;
 use crate::crypt::{decrypt_file, encrypt_file, ENCRYPTED_EXTENSION};
 use crate::utils::{append_line_to_file, bytes2path, AppendExt, END_OF_LINE};
 use anyhow::Ok;
-pub use binding::{add_all, need_crypt, set_key, KEY, REPO};
+pub use binding::{add_all, need_crypt, REPO};
 use colored::Colorize;
+pub use config::{ConfigValue, CONFIG};
 use die_exit::{die, Die};
 use futures_util::stream::FuturesOrdered;
 use futures_util::StreamExt;
@@ -13,7 +15,6 @@ use regex::Regex;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock as Lazy;
 
-const KEY_NAME: &str = "simple-git-encrypt.key";
 const ATTR_NAME: &str = "crypt";
 static GIT_ATTRIBUTES: Lazy<PathBuf> = Lazy::new(|| CLI.repo.join(".gitattributes"));
 
@@ -135,7 +136,7 @@ mod tests {
         let read = || {
             // sleep, otherwise the read() access will be denied. (git2_rs call has delay)
             std::thread::sleep(std::time::Duration::from_millis(20));
-            std::fs::read_to_string(".gitattributes").unwrap()
+            std::fs::read_to_string(&*GIT_ATTRIBUTES).unwrap()
         };
         let origin_git_attributes = read();
 

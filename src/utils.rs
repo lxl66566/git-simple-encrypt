@@ -78,6 +78,11 @@ pub fn append_line_to_file(path: impl AsRef<Path>, line: &str) -> io::Result<()>
     Ok(())
 }
 
+#[cfg(any(test, debug_assertions))]
+pub fn format_hex(value: &[u8]) -> String {
+    value.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

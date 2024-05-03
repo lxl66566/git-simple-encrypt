@@ -1,4 +1,4 @@
-use super::{ATTR_NAME, GIT_ATTRIBUTES, KEY_NAME};
+use super::{ATTR_NAME, GIT_ATTRIBUTES};
 use crate::cli::CLI;
 use crate::utils::BetterStripPrefix;
 use colored::Colorize;
@@ -16,20 +16,6 @@ pub static REPO: Lazy<Mutex<Repository>> = Lazy::new(|| {
     debug!("Opened repository: {:?}", repo.path());
     Mutex::new(repo)
 });
-
-#[cfg(not(test))]
-pub static KEY: Lazy<String> = Lazy::new(|| {
-    use super::KEY_NAME;
-    use die_exit::Die;
-    REPO.lock()
-        .unwrap()
-        .config()
-        .die("Cannot get config from this repo.")
-        .get_string(KEY_NAME)
-        .die_with(|e| format!("KEY is empty: {e}"))
-});
-#[cfg(test)]
-pub static KEY: Lazy<String> = Lazy::new(|| "123".into());
 
 /// tracking https://github.com/rust-lang/git2-rs/issues/1048
 pub trait Git2Patch {
@@ -51,7 +37,7 @@ pub fn add_all() -> anyhow::Result<()> {
 }
 
 pub fn need_crypt(mut path: PathBuf) -> anyhow::Result<Option<PathBuf>> {
-    if is_same_file(&path, GIT_ATTRIBUTES.as_path())? {
+    if path.exists() && is_same_file(&path, GIT_ATTRIBUTES.as_path())? {
         println!(
             "{}",
             "Warning: cannot encrypt `.gitattributes` file.".yellow()
@@ -66,11 +52,6 @@ pub fn need_crypt(mut path: PathBuf) -> anyhow::Result<Option<PathBuf>> {
         .get_attr_bytes(&path, ATTR_NAME, AttrCheckFlags::default())?
         .tap(|x| debug!("attr: {:?}", x))
         .map(|_| path))
-}
-
-pub fn set_key(key: &str) -> anyhow::Result<()> {
-    REPO.lock().unwrap().config()?.set_str(KEY_NAME, key)?;
-    Ok(())
 }
 
 #[cfg(test)]

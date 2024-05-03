@@ -78,22 +78,15 @@ jobs:
 
       - name: Install openssl on ubuntu
         if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt install pkg-config libssl-dev
+        run: grep -q 'openssl' 'Cargo.lock' && sudo apt install pkg-config libssl-dev
 
       - name: Install openssl on macos
         if: startsWith(matrix.os, 'macos')
-        run: brew install openssl
+        run: grep -q 'openssl' 'Cargo.lock' && brew install openssl
 
-      - name: Install openssl on windows
-        if: startsWith(matrix.os, 'windows')
-        run: choco install openssl
-
-      # - name: cargo build
-      #   uses: houseabsolute/actions-rust-cross@v0
-      #   with:
-      #     command: build
-      #     args: --release --locked --bin git-se ${{ matrix.cargo_flags }}
-      #     target: ${{ matrix.target }}
+      # - name: Install openssl on windows
+      #   if: startsWith(matrix.os, 'windows')
+      #   run: choco install openssl
 
       - name: Build and Upload
         uses: taiki-e/upload-rust-binary-action@v1

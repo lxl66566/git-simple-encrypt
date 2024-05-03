@@ -48,5 +48,5 @@ pub enum SubCommand {
     /// Cancel mark of file or folder.
     Remove { path: PathBuf },
     /// Set password (KEY) for encrypting.
-    Set { key: String },
+    Set { field: String, value: String },
 }

@@ -46,7 +46,7 @@ git-se add file.txt     # 将 `file.txt` 添加到加密列表
 
 ```mermaid
 graph TD;
-    123 -- SHA3_224 --> 602bdc204140db016bee5374895e5568ce422fabe17e064061d80097 -- CUT --> 602bdc204140db016bee5374895e5568 --cipher--> Aes128GcmSiv  -- output--> b5e9ecbf3efaad4380998b1379d679a39109e150df74
-    123456 --content--> Aes128GcmSiv
+    A[Key: 123] -- SHA3_224 --> 602bdc204140db016bee5374895e5568ce422fabe17e064061d80097 -- CUT --> 602bdc204140db016bee5374895e5568 --cipher--> Aes128GcmSiv  -- output--> 86e900edb10f6d7d1a3b148538134412447be036b6806704b6ff526babe62c
+    B[Text: 123456] --zstd--> 28b52ffd0060310000313233343536 --content--> Aes128GcmSiv
     CONST --NONCE--> Aes128GcmSiv
 ```
