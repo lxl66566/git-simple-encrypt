@@ -80,10 +80,6 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt install pkg-config libssl-dev
 
-      - name: Install openssl on ubuntu arm64
-        if: startsWith(matrix.os, 'ubuntu') && startsWith(matrix.target, 'aarch64')
-        run: sudo apt-get update && sudo apt-get install --assume-yes libssl-dev:arm64
-
       - name: Install openssl on macos
         if: startsWith(matrix.os, 'macos')
         run: brew install openssl

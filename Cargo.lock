@@ -631,6 +631,7 @@ dependencies = [
  "env_logger",
  "futures-util",
  "git2",
+ "libz-sys",
  "log",
  "openssl",
  "regex",

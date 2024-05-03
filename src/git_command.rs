@@ -125,6 +125,7 @@ pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     content_to_write.push_str(&format!(" {}=1", ATTR_NAME));
     append_line_to_file(GIT_ATTRIBUTES.as_path(), &content_to_write)?;
     debug_assert!(need_crypt(path)?.is_some());
+    println!("Added attribute: {}", &content_to_write.green());
     Ok(())
 }
 
@@ -151,14 +152,15 @@ pub fn remove_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     ))
     .expect("builtin regex should be valid.");
     let index = content_vec.iter().position(|line| re.is_match(line));
+    let mut removed_attr = None;
     if let Some(i) = index {
-        println!("Removed line: `{}`", content_vec[i]);
-        content_vec.remove(i);
+        removed_attr = Some(content_vec.remove(i));
     } else {
         die!("Cannot find the match attribute. You can delete this attribute by editing `.gitattributes`.")
     }
     std::fs::write(GIT_ATTRIBUTES.as_path(), content_vec.join(END_OF_LINE))?;
     debug_assert!(need_crypt(path.as_ref().to_owned())?.is_none());
+    println!("Removed attribute: `{}`", removed_attr.unwrap().red());
     Ok(())
 }
 

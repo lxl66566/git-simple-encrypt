@@ -27,7 +27,14 @@ sha3 = "0.10.8"
 tap = "1.0.1"
 # tokio = { version = "1.37.0", features = ["macros", "fs", "rt-multi-thread"] }
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+libz-sys = { version = "1.1.16", features = ["static"] }
+
+[dev-dependencies]
+temp_testdir = "0.2.3"
 
 [[bin]]
 name = "git-se"
@@ -38,6 +45,3 @@ strip = true
 lto = true
 panic = "abort"
 opt-level = "z"
-
-[dev-dependencies]
-temp_testdir = "0.2.3"
