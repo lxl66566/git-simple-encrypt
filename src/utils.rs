@@ -32,6 +32,18 @@ impl AppendExt for PathBuf {
     }
 }
 
+pub trait BetterStripPrefix {
+    fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self;
+}
+impl BetterStripPrefix for PathBuf {
+    fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self {
+        if let Ok(res) = self.strip_prefix(prefix) {
+            *self = res.to_path_buf();
+        }
+        self
+    }
+}
+
 /// (written by GPT) append str to the end of file. If file is not ends with
 /// '\n', just add it.
 pub fn append_line_to_file(path: impl AsRef<Path>, line: &str) -> io::Result<()> {

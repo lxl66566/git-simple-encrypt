@@ -9,10 +9,10 @@ pub static CLI: Lazy<Cli> = Lazy::new(Cli::default);
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
-git se set 123456       # set password as `123456`
-git se e                # encrypt current repo with all marked files
-git se d                # decrypt current repo
-git se add file.txt     # mark `file.txt` as need-to-be-crypted
+git-se set 123456       # set password as `123456`
+git-se e                # encrypt current repo with all marked files
+git-se d                # decrypt current repo
+git-se add file.txt     # mark `file.txt` as need-to-be-crypted
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {

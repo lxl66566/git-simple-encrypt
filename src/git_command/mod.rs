@@ -1,106 +1,67 @@
+mod binding;
+
 use crate::cli::CLI;
 use crate::crypt::{decrypt_file, encrypt_file, ENCRYPTED_EXTENSION};
 use crate::utils::{append_line_to_file, bytes2path, AppendExt, END_OF_LINE};
 use anyhow::Ok;
+pub use binding::{add_all, need_crypt, set_key, KEY, REPO};
 use colored::Colorize;
-use die_exit::{die, Die, DieWith};
-use futures_util::future::join_all;
-use git2::{AttrCheckFlags, IndexAddOption, Repository};
-use log::debug;
+use die_exit::{die, Die};
+use futures_util::stream::FuturesOrdered;
+use futures_util::StreamExt;
 use regex::Regex;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock as Lazy, Mutex};
+use std::sync::LazyLock as Lazy;
 
 const KEY_NAME: &str = "simple-git-encrypt.key";
 const ATTR_NAME: &str = "crypt";
-pub static REPO: Lazy<Mutex<Repository>> = Lazy::new(|| {
-    let repo = Repository::open(
-        #[cfg(not(test))]
-        &CLI.repo,
-        #[cfg(test)]
-        ".",
-    )
-    .die_with(|e| format!("Failed to open repository: {e}"));
-    Mutex::new(repo)
-});
 static GIT_ATTRIBUTES: Lazy<PathBuf> = Lazy::new(|| CLI.repo.join(".gitattributes"));
-
-#[cfg(not(test))]
-pub static KEY: Lazy<String> = Lazy::new(|| {
-    use die_exit::Die;
-    REPO.lock()
-        .unwrap()
-        .config()
-        .die("Cannot get config from this repo.")
-        .get_string(KEY_NAME)
-        .die_with(|e| format!("KEY is empty: {e}"))
-});
-#[cfg(test)]
-pub static KEY: Lazy<String> = Lazy::new(|| "123".into());
-
-pub fn set_key(key: &str) -> anyhow::Result<()> {
-    REPO.lock().unwrap().config()?.set_str(KEY_NAME, key)?;
-    Ok(())
-}
-
-#[inline]
-fn add_all() -> anyhow::Result<()> {
-    let mut index = REPO.lock().unwrap().index()?;
-    index.add_all(["*"].iter(), IndexAddOption::DEFAULT, None)?;
-    index.write()?;
-    Ok(())
-}
-
-fn need_crypt(path: PathBuf) -> anyhow::Result<Option<PathBuf>> {
-    debug!("checking file: {:?}", path);
-    Ok(REPO
-        .lock()
-        .unwrap()
-        .get_attr_bytes(&path, ATTR_NAME, AttrCheckFlags::default())?
-        .map(|_| path))
-}
 
 pub async fn encrypt_repo() -> anyhow::Result<()> {
     add_all()?;
     let lock = REPO.lock().unwrap().index()?;
-    let encrypt_futures = lock
+    let mut encrypt_futures = lock
         .iter()
         .map(|x| CLI.repo.join(bytes2path(&x.path)))
+        .filter(|x| x.is_file())
         .filter_map(|x| need_crypt(x).ok().flatten())
-        .map(encrypt_file);
-    join_all(encrypt_futures).await.into_iter().for_each(|x| {
-        if let Err(err) = x {
+        .map(encrypt_file)
+        .collect::<FuturesOrdered<_>>();
+    while let Some(ret) = encrypt_futures.next().await {
+        ret.unwrap_or_else(|err| {
             eprintln!(
                 "{}",
                 format!("warning: failed to encrypt file: {}", err).yellow()
             )
-        }
-    });
+        });
+    }
     add_all()?;
     Ok(())
 }
 
 pub async fn decrypt_repo() -> anyhow::Result<()> {
     let lock = REPO.lock().unwrap().index()?;
-    let decrypt_futures = lock
+    let mut decrypt_futures = lock
         .iter()
         .map(|x| CLI.repo.join(bytes2path(&x.path)))
         .filter(|x| x.extension().unwrap_or_default() == ENCRYPTED_EXTENSION)
+        .filter(|x| x.is_file())
         .filter_map(|x| {
             need_crypt(x.with_extension(""))
                 .ok()
                 .flatten()
                 .map(|x| x.append_ext())
         })
-        .map(decrypt_file);
-    join_all(decrypt_futures).await.into_iter().for_each(|x| {
-        if let Err(err) = x {
+        .map(decrypt_file)
+        .collect::<FuturesOrdered<_>>();
+    while let Some(ret) = decrypt_futures.next().await {
+        ret.unwrap_or_else(|err| {
             eprintln!(
                 "{}",
                 format!("warning: failed to decrypt file: {}", err).yellow()
             )
-        }
-    });
+        });
+    }
     Ok(())
 }
 
@@ -152,27 +113,22 @@ pub fn remove_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     ))
     .expect("builtin regex should be valid.");
     let index = content_vec.iter().position(|line| re.is_match(line));
-    let mut removed_attr = None;
+    let removed_attr: &str;
     if let Some(i) = index {
-        removed_attr = Some(content_vec.remove(i));
+        removed_attr = content_vec.remove(i);
     } else {
         die!("Cannot find the match attribute. You can delete this attribute by editing `.gitattributes`.")
     }
+    content_vec.pop_if(|line| line.trim().is_empty());
     std::fs::write(GIT_ATTRIBUTES.as_path(), content_vec.join(END_OF_LINE))?;
     debug_assert!(need_crypt(path.as_ref().to_owned())?.is_none());
-    println!("Removed attribute: `{}`", removed_attr.unwrap().red());
+    println!("Removed attribute: `{}`", removed_attr.red());
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[compio::test]
-    async fn test_need_crypt() {
-        let file = PathBuf::from(".").join("tests/test.txt");
-        std::assert!(need_crypt(file.clone()).unwrap().is_some());
-    }
 
     #[test]
     fn test_add_remove_attr() -> anyhow::Result<()> {

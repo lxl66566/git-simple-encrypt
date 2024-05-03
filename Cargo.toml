@@ -3,10 +3,11 @@ name = "git-simple-encrypt"
 authors = ["lxl66566 <lxl66566@gmail.com>"]
 description = "Encrypt/decrypt files in git repo using one password"
 homepage = "https://github.com/lxl66566/git-simple-encrypt"
+repository = "https://github.com/lxl66566/git-simple-encrypt"
 license = "MIT"
 version = "0.1.0"
 edition = "2021"
-readme = "README.md"
+readme = "./README.md"
 categories = ["cryptography"]
 keywords = ["git", "encryption"]
 
@@ -23,6 +24,7 @@ futures-util = "0.3.30"
 git2 = "0.18.3"
 log = "0.4.21"
 regex = "1.10.4"
+same-file = "1.0.6"
 sha3 = "0.10.8"
 tap = "1.0.1"
 # tokio = { version = "1.37.0", features = ["macros", "fs", "rt-multi-thread"] }

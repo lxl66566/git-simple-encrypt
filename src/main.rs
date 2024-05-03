@@ -1,4 +1,6 @@
 #![feature(lazy_cell)]
+#![feature(vec_pop_if)]
+#![warn(clippy::nursery, clippy::cargo)]
 
 mod cli;
 mod crypt;
