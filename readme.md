@@ -38,6 +38,10 @@ git-se d                    # Decrypt...
 git-se add file.txt         # Add `file.txt` to the need-to-be-encrypted list.
 ```
 
+## Caution
+
+- `git add -A` is automatically executed when encrypting, so make sure that `.gitignore` is handled properly.
+
 ## Algorithm
 
 ```mermaid

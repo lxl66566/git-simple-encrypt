@@ -38,6 +38,10 @@ git-se d                # 解密...
 git-se add file.txt     # 将 `file.txt` 添加到加密列表
 ```
 
+## 注意事项
+
+- 加密时会自动执行 `git add -A`，请确保已妥善处理 `.gitignore`。
+
 ## 原理
 
 ```mermaid

@@ -103,22 +103,3 @@ jobs:
           tar: unix
           zip: windows
           token: ${{ secrets.GH_TOKEN }}
-
-  publish:
-    needs:
-      - release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup Rust toolchain
-        # uses: dtolnay/rust-toolchain@nightly
-        uses: actions-rs/toolchain@v1
-        with:
-          toolchain: nightly
-          override: true
-      - name: Install openssl
-        if: startsWith(matrix.os, 'ubuntu')
-        run: sudo apt install pkg-config libssl-dev
-      - uses: katyo/publish-crates@v2
-        with:
-          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
