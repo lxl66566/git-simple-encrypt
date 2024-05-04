@@ -20,9 +20,10 @@ async fn main() -> Result<()> {
     match &CLI.command {
         SubCommand::Encrypt => encrypt_repo().await?,
         SubCommand::Decrypt => decrypt_repo().await?,
-        SubCommand::Set { field, value } => config::set(field, value)?,
+        SubCommand::SetKey { key } => config::set_key(key)?,
         SubCommand::Add { path } => add_crypt_attributes(path)?,
         SubCommand::Remove { path } => remove_crypt_attributes(path)?,
+        SubCommand::Set { field, value } => config::set(field.name(), value)?,
     }
     Ok(())
 }

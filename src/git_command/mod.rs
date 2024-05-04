@@ -2,6 +2,7 @@ mod binding;
 pub mod config;
 
 use std::{
+    fs::OpenOptions,
     path::{Path, PathBuf},
     sync::LazyLock as Lazy,
 };
@@ -22,7 +23,7 @@ use crate::{
 };
 
 const ATTR_NAME: &str = "crypt";
-static GIT_ATTRIBUTES: Lazy<PathBuf> = Lazy::new(|| CLI.repo.join(".gitattributes"));
+pub static GIT_ATTRIBUTES: Lazy<PathBuf> = Lazy::new(|| CLI.repo.join(".gitattributes"));
 
 pub async fn encrypt_repo() -> anyhow::Result<()> {
     add_all()?;
@@ -73,6 +74,11 @@ pub async fn decrypt_repo() -> anyhow::Result<()> {
 
 /// add file/folder to .gitattributes, means it needs encrypt.
 pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(GIT_ATTRIBUTES.as_path())?;
     let mut test_path = path.as_ref().to_owned();
     if test_path.is_dir() {
         test_path.push("any");

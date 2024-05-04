@@ -12,12 +12,16 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(any(test, debug_assertions))]
 use colored::Colorize;
 use log::{debug, info};
+use same_file::is_same_file;
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
 #[cfg(any(test, debug_assertions))]
 use crate::utils::format_hex;
-use crate::{git_command::CONFIG, utils::AppendExt};
+use crate::{
+    git_command::{CONFIG, GIT_ATTRIBUTES},
+    utils::AppendExt,
+};
 
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
 pub static ENCRYPTED_EXTENSION: &str = "enc";
@@ -125,16 +129,25 @@ fn try_decompress(bytes: &[u8], path: PathBuf) -> anyhow::Result<(Vec<u8>, PathB
 
 /// encrypt file, and unlink it.
 pub async fn encrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
-    info!("Encrypting file: {:?}", file.as_ref());
-    let bytes = compio::fs::read(file.as_ref())
+    let file = file.as_ref();
+    debug_assert!(file.is_file());
+    let new_file = file.to_owned();
+    if is_same_file(file, GIT_ATTRIBUTES.as_path())? {
+        println!(
+            "{}",
+            "Warning: cannot encrypt `.gitattributes` file.".yellow()
+        );
+        return Ok(new_file);
+    }
+    info!("Encrypting file: {:?}", file);
+    let bytes = compio::fs::read(file)
         .await
-        .with_context(|| format!("{:?}", file.as_ref()))?;
-    let new_file = file.as_ref().to_owned();
+        .with_context(|| format!("{:?}", file))?;
     let (compressed, new_file) = try_compress(&bytes, new_file)?;
     let (encrypted, new_file) = encrypt_change_path(CONFIG.key.as_bytes(), &compressed, new_file)?;
     compio::fs::write(&new_file, encrypted).await.0?;
     debug!("Encrypted filename: {:?}", new_file);
-    compio::fs::remove_file(file.as_ref()).await?;
+    compio::fs::remove_file(file).await?;
     Ok(new_file)
 }
 

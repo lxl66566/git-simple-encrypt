@@ -73,10 +73,6 @@ pub fn check_attr(path: impl AsRef<Path>) -> anyhow::Result<bool> {
 pub fn need_encrypt(path: impl AsRef<Path>) -> anyhow::Result<bool> {
     let path = path.as_ref();
     if path.exists() && is_same_file(path, GIT_ATTRIBUTES.as_path())? {
-        println!(
-            "{}",
-            "Warning: cannot encrypt `.gitattributes` file.".yellow()
-        );
         return Ok(false);
     }
     let path = path.patch();

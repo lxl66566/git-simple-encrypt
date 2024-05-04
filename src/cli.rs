@@ -2,6 +2,8 @@ use std::{path::PathBuf, sync::LazyLock as Lazy};
 
 use clap::{Parser, Subcommand};
 
+use crate::git_command::config::ConfigField;
+
 #[cfg(not(test))]
 pub static CLI: Lazy<Cli> = Lazy::new(Cli::parse);
 #[cfg(test)]
@@ -9,10 +11,10 @@ pub static CLI: Lazy<Cli> = Lazy::new(Cli::default);
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
-git-se set 123456       # set password as `123456`
+git-se set-key 123456   # set password as `123456`
+git-se add file.txt     # mark `file.txt` as need-to-be-crypted
 git-se e                # encrypt current repo with all marked files
 git-se d                # decrypt current repo
-git-se add file.txt     # mark `file.txt` as need-to-be-crypted
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {
@@ -48,5 +50,7 @@ pub enum SubCommand {
     /// Cancel mark of file or folder.
     Remove { path: PathBuf },
     /// Set password (KEY) for encrypting.
-    Set { field: String, value: String },
+    SetKey { key: String },
+    /// Set other config items.
+    Set { field: ConfigField, value: String },
 }

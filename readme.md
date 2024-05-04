@@ -33,9 +33,9 @@ There are several different ways to install it, you can choose **any** of them.
 
 ```sh
 git-se set 123456           # Set the password to `123456`.
+git-se add file.txt         # Add `file.txt` to the need-to-be-encrypted list.
 git-se e                    # Encrypt files in list in the current repository.
 git-se d                    # Decrypt...
-git-se add file.txt         # Add `file.txt` to the need-to-be-encrypted list.
 ```
 
 ## Caution
