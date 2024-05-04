@@ -1,5 +1,6 @@
 mod binding;
 pub mod config;
+mod manual_craft;
 
 use std::{
     fs::OpenOptions,
@@ -8,17 +9,20 @@ use std::{
 };
 
 use anyhow::Ok;
-pub use binding::{add_all, need_encrypt, REPO};
+pub use binding::{add_all, REPO};
 use colored::Colorize;
 pub use config::CONFIG;
 use die_exit::{die, Die};
 use futures_util::{stream::FuturesOrdered, StreamExt};
+use log::debug;
 use regex::Regex;
+use same_file::is_same_file;
 
-use self::binding::need_decrypt;
+use self::manual_craft::check_attr;
 use crate::{
     cli::CLI,
     crypt::{decrypt_file, encrypt_file, COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION},
+    git_command::binding::Git2Patch,
     utils::{append_line_to_file, bytes2path, END_OF_LINE},
 };
 
@@ -73,6 +77,35 @@ pub async fn decrypt_repo() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn need_encrypt(path: impl AsRef<Path>) -> anyhow::Result<bool> {
+    let path = path.as_ref();
+    if path.exists() && is_same_file(path, GIT_ATTRIBUTES.as_path())? {
+        return Ok(false);
+    }
+    debug!("checking whether `{:?}` needs encrypt", path);
+    check_attr(path)
+}
+
+/// If file extension matches, check recursively; Otherwise check once.
+pub fn need_decrypt(path: impl AsRef<Path>) -> anyhow::Result<bool> {
+    let path = path.as_ref();
+    debug!("checking whether `{:?}` needs decrypt", path);
+    match path.extension() {
+        Some(ext)
+            if [ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION]
+                .into_iter()
+                .any(|x| x == ext) =>
+        {
+            if check_attr(path)? {
+                Ok(true)
+            } else {
+                need_decrypt(path.with_extension(""))
+            }
+        }
+        _ => check_attr(path),
+    }
+}
+
 /// add file/folder to .gitattributes, means it needs encrypt.
 pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     OpenOptions::new()
@@ -84,7 +117,7 @@ pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     if test_path.is_dir() {
         test_path.push("any");
     }
-    if need_encrypt(test_path)? {
+    if need_encrypt(&test_path)? {
         println!("`{:?}` is already marked as encrypt-needed.", path.as_ref());
         #[cfg(not(test))]
         std::process::exit(0);
@@ -98,7 +131,7 @@ pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     let mut content_to_write = path.to_str().die("Invalid path.").replace('\\', "/");
     content_to_write.push_str(&format!(" {}=1", ATTR_NAME));
     append_line_to_file(GIT_ATTRIBUTES.as_path(), &content_to_write)?;
-    debug_assert!(need_encrypt(path)?);
+    debug_assert!(need_encrypt(test_path)?);
     println!("Added attribute: {}", &content_to_write.green());
     Ok(())
 }
@@ -148,6 +181,16 @@ pub fn remove_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[compio::test]
+    async fn test_need_encrypt() {
+        let file = PathBuf::from(".").join("tests/test.txt");
+        std::assert!(need_encrypt(file).unwrap());
+        let file = PathBuf::from(".").join("tests");
+        std::assert!(!need_encrypt(file).unwrap());
+        let file = PathBuf::from(".").join("tests").join("any");
+        std::assert!(!need_encrypt(file).unwrap());
+    }
 
     #[test]
     fn test_add_remove_attr() -> anyhow::Result<()> {

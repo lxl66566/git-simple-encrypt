@@ -30,7 +30,6 @@ impl AppendExt for PathBuf {
         self.tap_mut(|p| p.as_mut_os_string().push(format!(".{ext}")))
     }
 }
-
 pub trait BetterStripPrefix {
     fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self;
 }
@@ -40,6 +39,14 @@ impl BetterStripPrefix for PathBuf {
             *self = res.to_path_buf();
         }
         self
+    }
+}
+pub trait ToUnixStyle {
+    fn to_unix_style(&self) -> PathBuf;
+}
+impl ToUnixStyle for PathBuf {
+    fn to_unix_style(&self) -> PathBuf {
+        self.to_string_lossy().replace('\\', "/").into()
     }
 }
 
