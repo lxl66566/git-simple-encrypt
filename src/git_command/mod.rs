@@ -69,6 +69,7 @@ pub async fn decrypt_repo() -> anyhow::Result<()> {
             )
         }
     }
+    add_all()?;
     Ok(())
 }
 

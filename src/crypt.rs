@@ -9,7 +9,6 @@ use aes_gcm_siv::{
     Aes128GcmSiv, Nonce,
 };
 use anyhow::{anyhow, Context, Result};
-#[cfg(any(test, debug_assertions))]
 use colored::Colorize;
 use log::{debug, info};
 use same_file::is_same_file;
@@ -139,30 +138,39 @@ pub async fn encrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
         );
         return Ok(new_file);
     }
-    info!("Encrypting file: {:?}", file);
+    if file.extension() == Some(ENCRYPTED_EXTENSION.as_ref()) {
+        println!(
+            "{}",
+            "Warning: file has been encrypted, do not encrypt.".yellow()
+        )
+    }
+    println!("Encrypting file: `{}`", format!("{:?}", file).green());
     let bytes = compio::fs::read(file)
         .await
         .with_context(|| format!("{:?}", file))?;
     let (compressed, new_file) = try_compress(&bytes, new_file)?;
     let (encrypted, new_file) = encrypt_change_path(CONFIG.key.as_bytes(), &compressed, new_file)?;
     compio::fs::write(&new_file, encrypted).await.0?;
-    debug!("Encrypted filename: {:?}", new_file);
     compio::fs::remove_file(file).await?;
+    debug!("Encrypted filename: {:?}", new_file);
     Ok(new_file)
 }
 
 /// decrypt file, and unlink it.
 pub async fn decrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
-    info!("Decrypting file: {:?}", file.as_ref());
+    println!(
+        "Decrypting file: `{}`",
+        format!("{:?}", file.as_ref()).green()
+    );
     let new_file = file.as_ref().to_owned();
     let bytes = compio::fs::read(&file)
         .await
         .with_context(|| format!("{:?}", file.as_ref()))?;
     let (decrypted, new_file) = try_decrypt_change_path(CONFIG.key.as_bytes(), &bytes, new_file)?;
     let (decompressed, new_file) = try_decompress(&decrypted, new_file)?;
-    debug!("Decrypted filename: {:?}", new_file);
     compio::fs::write(&new_file, decompressed).await.0?;
     compio::fs::remove_file(&file).await?;
+    debug!("Decrypted filename: {:?}", new_file);
     Ok(new_file)
 }
 

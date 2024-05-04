@@ -4,7 +4,6 @@ use std::{
 };
 
 use anyhow::Ok;
-use colored::Colorize;
 use die_exit::DieWith;
 use git2::{AttrCheckFlags, IndexAddOption, Repository};
 use log::debug;
