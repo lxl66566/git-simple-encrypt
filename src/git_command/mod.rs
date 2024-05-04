@@ -1,19 +1,25 @@
 mod binding;
 pub mod config;
 
-use crate::cli::CLI;
-use crate::crypt::{decrypt_file, encrypt_file, ENCRYPTED_EXTENSION};
-use crate::utils::{append_line_to_file, bytes2path, AppendExt, END_OF_LINE};
+use std::{
+    path::{Path, PathBuf},
+    sync::LazyLock as Lazy,
+};
+
 use anyhow::Ok;
-pub use binding::{add_all, need_crypt, REPO};
+pub use binding::{add_all, need_encrypt, REPO};
 use colored::Colorize;
-pub use config::{ConfigValue, CONFIG};
+pub use config::CONFIG;
 use die_exit::{die, Die};
-use futures_util::stream::FuturesOrdered;
-use futures_util::StreamExt;
+use futures_util::{stream::FuturesOrdered, StreamExt};
 use regex::Regex;
-use std::path::{Path, PathBuf};
-use std::sync::LazyLock as Lazy;
+
+use self::binding::need_decrypt;
+use crate::{
+    cli::CLI,
+    crypt::{decrypt_file, encrypt_file, COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION},
+    utils::{append_line_to_file, bytes2path, END_OF_LINE},
+};
 
 const ATTR_NAME: &str = "crypt";
 static GIT_ATTRIBUTES: Lazy<PathBuf> = Lazy::new(|| CLI.repo.join(".gitattributes"));
@@ -25,16 +31,16 @@ pub async fn encrypt_repo() -> anyhow::Result<()> {
         .iter()
         .map(|x| CLI.repo.join(bytes2path(&x.path)))
         .filter(|x| x.is_file())
-        .filter_map(|x| need_crypt(x).ok().flatten())
+        .filter(|x| need_encrypt(x).unwrap_or(false))
         .map(encrypt_file)
         .collect::<FuturesOrdered<_>>();
     while let Some(ret) = encrypt_futures.next().await {
-        ret.unwrap_or_else(|err| {
+        if let Err(err) = ret {
             eprintln!(
                 "{}",
                 format!("warning: failed to encrypt file: {}", err).yellow()
             )
-        });
+        }
     }
     add_all()?;
     Ok(())
@@ -45,23 +51,22 @@ pub async fn decrypt_repo() -> anyhow::Result<()> {
     let mut decrypt_futures = lock
         .iter()
         .map(|x| CLI.repo.join(bytes2path(&x.path)))
-        .filter(|x| x.extension().unwrap_or_default() == ENCRYPTED_EXTENSION)
-        .filter(|x| x.is_file())
-        .filter_map(|x| {
-            need_crypt(x.with_extension(""))
-                .ok()
-                .flatten()
-                .map(|x| x.append_ext())
+        .filter(|x| {
+            [ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION]
+                .into_iter()
+                .any(|y| y == x.extension().unwrap_or_default())
         })
+        .filter(|x| x.is_file())
+        .filter(|x| need_decrypt(x).unwrap_or(false))
         .map(decrypt_file)
         .collect::<FuturesOrdered<_>>();
     while let Some(ret) = decrypt_futures.next().await {
-        ret.unwrap_or_else(|err| {
+        if let Err(err) = ret {
             eprintln!(
                 "{}",
                 format!("warning: failed to decrypt file: {}", err).yellow()
             )
-        });
+        }
     }
     Ok(())
 }
@@ -72,7 +77,7 @@ pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     if test_path.is_dir() {
         test_path.push("any");
     }
-    if need_crypt(test_path)?.is_some() {
+    if need_encrypt(test_path)? {
         println!("`{:?}` is already marked as encrypt-needed.", path.as_ref());
         #[cfg(not(test))]
         std::process::exit(0);
@@ -86,7 +91,7 @@ pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     let mut content_to_write = path.to_str().die("Invalid path.").replace('\\', "/");
     content_to_write.push_str(&format!(" {}=1", ATTR_NAME));
     append_line_to_file(GIT_ATTRIBUTES.as_path(), &content_to_write)?;
-    debug_assert!(need_crypt(path)?.is_some());
+    debug_assert!(need_encrypt(path)?);
     println!("Added attribute: {}", &content_to_write.green());
     Ok(())
 }
@@ -96,12 +101,18 @@ pub fn remove_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     if test_path.is_dir() {
         test_path.push("any");
     }
-    if need_crypt(test_path)?.is_none() {
-        println!("`{:?}` is not marked as encrypt-needed.", path.as_ref());
+    if !need_encrypt(test_path)? {
+        println!(
+            "`{:?}` is already not marked as encrypt-needed.",
+            path.as_ref()
+        );
         #[cfg(not(test))]
         std::process::exit(0);
         #[cfg(test)]
-        anyhow::bail!("`{:?}` is not marked as encrypt-needed.", path.as_ref());
+        anyhow::bail!(
+            "`{:?}` is already not marked as encrypt-needed.",
+            path.as_ref()
+        );
     }
     let content = std::fs::read_to_string(GIT_ATTRIBUTES.as_path())?;
     let mut content_vec: Vec<&str> = content.split('\n').collect();
@@ -122,7 +133,7 @@ pub fn remove_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     }
     content_vec.pop_if(|line| line.trim().is_empty());
     std::fs::write(GIT_ATTRIBUTES.as_path(), content_vec.join(END_OF_LINE))?;
-    debug_assert!(need_crypt(path.as_ref().to_owned())?.is_none());
+    debug_assert!(!need_encrypt(path)?);
     println!("Removed attribute: `{}`", removed_attr.red());
     Ok(())
 }

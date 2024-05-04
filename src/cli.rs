@@ -1,6 +1,6 @@
+use std::{path::PathBuf, sync::LazyLock as Lazy};
+
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
-use std::sync::LazyLock as Lazy;
 
 #[cfg(not(test))]
 pub static CLI: Lazy<Cli> = Lazy::new(Cli::parse);

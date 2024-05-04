@@ -1,5 +1,6 @@
 #![feature(lazy_cell)]
 #![feature(vec_pop_if)]
+#![feature(let_chains)]
 #![warn(clippy::nursery, clippy::cargo)]
 
 mod cli;

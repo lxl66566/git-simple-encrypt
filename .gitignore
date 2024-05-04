@@ -1,2 +1,4 @@
 /target
 /tests/test.txt.enc
+/tests/test.txt.zst.enc
+/tests/test.zst.enc

@@ -41,12 +41,15 @@ git-se add file.txt     # 将 `file.txt` 添加到加密列表
 ## 注意事项
 
 - 加密时会自动执行 `git add -A`，请确保已妥善处理 `.gitignore`。
+- 请不要将 `.zst`, `.enc` 后缀的文件以及包含它们的文件夹添加到加密列表中。
 
 ## 原理
 
 ```mermaid
 graph TD;
-    A[Key: 123] -- SHA3_224 --> 602bdc204140db016bee5374895e5568ce422fabe17e064061d80097 -- CUT --> 602bdc204140db016bee5374895e5568 --cipher--> Aes128GcmSiv  -- output--> 86e900edb10f6d7d1a3b148538134412447be036b6806704b6ff526babe62c
-    B[Text: 123456] --zstd--> 28b52ffd0060310000313233343536 --content--> Aes128GcmSiv
+    A[Key: 123] -- SHA3_224 --> 602bdc204140db016bee5374895e5568ce422fabe17e064061d80097 -- CUT --> 602bdc204140db016bee5374895e5568 --cipher--> Aes128GcmSiv  -- output--> 14a7dd2666afd854788c80f5518fea892491f23e72798d2fbc67bfc6259610d6f4
+    B[Text: '6' * 60] --zstd--> 28b52ffd006045000010363601003f0116 --content--> Aes128GcmSiv
     CONST --NONCE--> Aes128GcmSiv
 ```
+
+- 如果 zstd 压缩后具有反效果，则跳过压缩。

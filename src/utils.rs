@@ -1,9 +1,9 @@
-use crate::crypt::ENCRYPTED_EXTENSION;
 use std::{
     fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
+
 use tap::Tap;
 
 #[cfg(unix)]
@@ -13,8 +13,7 @@ pub const END_OF_LINE: &str = "\r\n";
 
 #[cfg(unix)]
 pub fn bytes2path(b: &[u8]) -> &Path {
-    use std::ffi::OsStr;
-    use std::os::unix::ffi::OsStrExt;
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     Path::new(OsStr::from_bytes(b))
 }
 #[cfg(windows)]
@@ -24,11 +23,11 @@ pub fn bytes2path(b: &[u8]) -> &Path {
 }
 
 pub trait AppendExt {
-    fn append_ext(self) -> PathBuf;
+    fn append_ext(self, ext: &str) -> PathBuf;
 }
 impl AppendExt for PathBuf {
-    fn append_ext(self) -> PathBuf {
-        self.tap_mut(|p| p.as_mut_os_string().push(format!(".{ENCRYPTED_EXTENSION}")))
+    fn append_ext(self, ext: &str) -> PathBuf {
+        self.tap_mut(|p| p.as_mut_os_string().push(format!(".{ext}")))
     }
 }
 
@@ -80,15 +79,21 @@ pub fn append_line_to_file(path: impl AsRef<Path>, line: &str) -> io::Result<()>
 
 #[cfg(any(test, debug_assertions))]
 pub fn format_hex(value: &[u8]) -> String {
-    value.iter().map(|b| format!("{:02x}", b)).collect()
+    use std::fmt::Write;
+    value.iter().fold(String::new(), |mut output, b| {
+        let _ = write!(output, "{b:02x}");
+        output
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use anyhow::Ok;
     use std::fs;
+
+    use anyhow::Ok;
     use temp_testdir::TempDir;
+
+    use super::*;
 
     #[test]
     fn test_append_line_to_file() -> anyhow::Result<()> {

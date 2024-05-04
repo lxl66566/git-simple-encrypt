@@ -1,6 +1,8 @@
-use super::REPO;
-use die_exit::{die, Die};
 use std::sync::LazyLock as Lazy;
+
+use die_exit::{die, Die};
+
+use super::REPO;
 
 const FIELD: &str = "simple-git-encrypt";
 
@@ -40,6 +42,7 @@ impl Default for Config {
 }
 
 impl Config {
+    #[cfg(not(test))]
     pub fn read() -> Self {
         let config = REPO
             .lock()
