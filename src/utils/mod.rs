@@ -1,54 +1,17 @@
+pub mod pathutils;
+
 use std::{
     fs::OpenOptions,
     io::{self, Read, Seek, SeekFrom, Write},
-    path::{Path, PathBuf},
+    path::Path,
 };
 
-use tap::Tap;
+pub use pathutils::*;
 
 #[cfg(unix)]
 pub const END_OF_LINE: &str = "\n";
 #[cfg(windows)]
 pub const END_OF_LINE: &str = "\r\n";
-
-#[cfg(unix)]
-pub fn bytes2path(b: &[u8]) -> &Path {
-    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
-    Path::new(OsStr::from_bytes(b))
-}
-#[cfg(windows)]
-pub fn bytes2path(b: &[u8]) -> &Path {
-    use std::str;
-    Path::new(str::from_utf8(b).unwrap())
-}
-
-pub trait AppendExt {
-    fn append_ext(self, ext: &str) -> PathBuf;
-}
-impl AppendExt for PathBuf {
-    fn append_ext(self, ext: &str) -> PathBuf {
-        self.tap_mut(|p| p.as_mut_os_string().push(format!(".{ext}")))
-    }
-}
-pub trait BetterStripPrefix {
-    fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self;
-}
-impl BetterStripPrefix for PathBuf {
-    fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self {
-        if let Ok(res) = self.strip_prefix(prefix) {
-            *self = res.to_path_buf();
-        }
-        self
-    }
-}
-pub trait ToUnixStyle {
-    fn to_unix_style(&self) -> PathBuf;
-}
-impl ToUnixStyle for PathBuf {
-    fn to_unix_style(&self) -> PathBuf {
-        self.to_string_lossy().replace('\\', "/").into()
-    }
-}
 
 /// (written by GPT) append str to the end of file. If file is not ends with
 /// '\n', just add it.

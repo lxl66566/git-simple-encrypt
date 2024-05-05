@@ -1,4 +1,4 @@
 /target
-/tests/test.txt.enc
-/tests/test.txt.zst.enc
-/tests/test.zst.enc
+/test_assets/test.txt.enc
+/test_assets/test.txt.zst.enc
+/test_assets/test.zst.enc

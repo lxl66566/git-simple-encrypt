@@ -1,7 +1,7 @@
 //! The code of git2_rs bindings.
 
 use std::{
-    path::{Path, PathBuf},
+    path::{Path},
     sync::{LazyLock as Lazy, Mutex},
 };
 
@@ -12,30 +12,13 @@ use log::debug;
 use tap::Tap;
 
 use super::ATTR_NAME;
-use crate::{cli::CLI, utils::BetterStripPrefix};
+use crate::{cli::CLI, utils::Git2Patch};
 
 pub static REPO: Lazy<Mutex<Repository>> = Lazy::new(|| {
     let repo = Repository::open(&CLI.repo).die_with(|e| format!("Failed to open repository: {e}"));
     debug!("Opened repository: {:?}", repo.path());
     Mutex::new(repo)
 });
-
-/// tracking https://github.com/rust-lang/git2-rs/issues/1048
-pub trait Git2Patch {
-    fn patch(&self) -> PathBuf;
-}
-impl<T: AsRef<Path>> Git2Patch for T {
-    fn patch(&self) -> PathBuf {
-        self.as_ref()
-            .to_path_buf()
-            .tap_mut(|x| {
-                x.strip_prefix_better("./");
-            })
-            .tap_mut(|x| {
-                x.strip_prefix_better(".\\");
-            })
-    }
-}
 
 #[inline]
 pub fn add_all() -> anyhow::Result<()> {

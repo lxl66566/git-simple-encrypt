@@ -12,7 +12,7 @@ use anyhow::Ok;
 pub use binding::{add_all, REPO};
 use colored::Colorize;
 pub use config::CONFIG;
-use die_exit::{die, Die};
+use die_exit::die;
 use futures_util::{stream::FuturesOrdered, StreamExt};
 use log::debug;
 use regex::Regex;
@@ -22,8 +22,8 @@ use self::manual_craft::check_attr;
 use crate::{
     cli::CLI,
     crypt::{decrypt_file, encrypt_file, COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION},
-    git_command::binding::Git2Patch,
-    utils::{append_line_to_file, bytes2path, END_OF_LINE},
+    git_command::manual_craft::{add_attr, remove_attr},
+    utils::{Git2Patch, PathFromBytes, PathToUnixStyle, END_OF_LINE},
 };
 
 const ATTR_NAME: &str = "crypt";
@@ -34,7 +34,7 @@ pub async fn encrypt_repo() -> anyhow::Result<()> {
     let lock = REPO.lock().unwrap().index()?;
     let mut encrypt_futures = lock
         .iter()
-        .map(|x| CLI.repo.join(bytes2path(&x.path)))
+        .map(|x| CLI.repo.join(PathBuf::from_bytes(&x.path)))
         .filter(|x| x.is_file())
         .filter(|x| need_encrypt(x).unwrap_or(false))
         .map(encrypt_file)
@@ -55,7 +55,7 @@ pub async fn decrypt_repo() -> anyhow::Result<()> {
     let lock = REPO.lock().unwrap().index()?;
     let mut decrypt_futures = lock
         .iter()
-        .map(|x| CLI.repo.join(bytes2path(&x.path)))
+        .map(|x| CLI.repo.join(PathBuf::from_bytes(&x.path)))
         .filter(|x| {
             [ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION]
                 .into_iter()
@@ -124,15 +124,12 @@ pub fn add_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
         #[cfg(test)]
         anyhow::bail!("`{:?}` is already marked as encrypt-needed.", path.as_ref());
     }
-    let mut path = path.as_ref().to_path_buf();
+    let mut path = path.as_ref().patch();
     if path.is_dir() {
         path.push("**");
     }
-    let mut content_to_write = path.to_str().die("Invalid path.").replace('\\', "/");
-    content_to_write.push_str(&format!(" {}=1", ATTR_NAME));
-    append_line_to_file(GIT_ATTRIBUTES.as_path(), &content_to_write)?;
+    add_attr(path)?;
     debug_assert!(need_encrypt(test_path)?);
-    println!("Added attribute: {}", &content_to_write.green());
     Ok(())
 }
 
@@ -158,16 +155,15 @@ pub fn remove_crypt_attributes(path: impl AsRef<Path>) -> anyhow::Result<()> {
     let mut content_vec: Vec<&str> = content.split('\n').collect();
     let re = Regex::new(&format!(
         r#"^(./)?{}(/\*\*)?\s"#,
-        path.as_ref()
-            .to_str()
-            .die("Invalid path.")
-            .replace('\\', "/"),
+        path.as_ref().to_unix_style().to_string_lossy()
     ))
     .expect("builtin regex should be valid.");
     let index = content_vec.iter().position(|line| re.is_match(line));
     let removed_attr: &str;
     if let Some(i) = index {
+        let str_to_remove = content_vec[i].split_once(' ').unwrap().0.trim();
         removed_attr = content_vec.remove(i);
+        remove_attr(str_to_remove);
     } else {
         die!("Cannot find the match attribute. You can delete this attribute by editing `.gitattributes`.")
     }
@@ -184,7 +180,7 @@ mod tests {
 
     #[compio::test]
     async fn test_need_encrypt() {
-        let file = PathBuf::from(".").join("tests/test.txt");
+        let file = PathBuf::from(".").join("test_assets/test.txt");
         std::assert!(need_encrypt(file).unwrap());
         let file = PathBuf::from(".").join("tests");
         std::assert!(!need_encrypt(file).unwrap());
@@ -194,6 +190,7 @@ mod tests {
 
     #[test]
     fn test_add_remove_attr() -> anyhow::Result<()> {
+        env_logger::init();
         let read = || {
             // sleep, otherwise the read() access will be denied. (git2_rs call has delay)
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -202,9 +199,9 @@ mod tests {
         let origin_git_attributes = read();
 
         // dir test
-        add_crypt_attributes("tests")?;
+        add_crypt_attributes("target")?;
         dbg!(read());
-        remove_crypt_attributes("tests")?;
+        remove_crypt_attributes("target")?;
         assert_eq!(read().trim(), origin_git_attributes.trim());
 
         // file test

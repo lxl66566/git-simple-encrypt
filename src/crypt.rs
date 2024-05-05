@@ -19,7 +19,7 @@ use tap::Tap;
 use crate::utils::format_hex;
 use crate::{
     git_command::{CONFIG, GIT_ATTRIBUTES},
-    utils::AppendExt,
+    utils::PathAppendExt,
 };
 
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
