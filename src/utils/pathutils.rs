@@ -52,13 +52,11 @@ pub trait Git2Patch {
 }
 impl<T: AsRef<Path>> Git2Patch for T {
     fn patch(&self) -> PathBuf {
-        self.as_ref()
-            .to_path_buf()
-            .tap_mut(|x| {
-                x.strip_prefix_better("./");
-            })
-            .tap_mut(|x| {
-                x.strip_prefix_better(".\\");
-            })
+        self.as_ref().to_path_buf().tap_mut(|x| {
+            #[cfg(target_family = "unix")]
+            x.strip_prefix_better("./");
+            #[cfg(target_family = "windows")]
+            x.strip_prefix_better(".\\");
+        })
     }
 }

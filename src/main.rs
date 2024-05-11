@@ -1,7 +1,8 @@
-use git_simple_encrypt::{run, CLI};
+use clap::Parser;
+use git_simple_encrypt::{run, Cli};
 
 #[compio::main]
 async fn main() -> anyhow::Result<()> {
     env_logger::init();
-    run(&CLI.command).await
+    run(&Cli::parse()).await
 }

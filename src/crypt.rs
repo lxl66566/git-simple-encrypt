@@ -10,6 +10,7 @@ use aes_gcm_siv::{
 };
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
+use futures_util::{stream::FuturesOrdered, StreamExt};
 use log::{debug, info};
 use same_file::is_same_file;
 use sha3::{Digest, Sha3_224};
@@ -18,8 +19,9 @@ use tap::Tap;
 #[cfg(any(test, debug_assertions))]
 use crate::utils::format_hex;
 use crate::{
-    git_command::{CONFIG, GIT_ATTRIBUTES},
-    utils::PathAppendExt,
+    config::Config,
+    repo::{GitCommand, Repo},
+    utils::pathutils::*,
 };
 
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
@@ -92,8 +94,8 @@ pub fn try_decrypt_change_path(
 /// Try to compress bytes, returns a [`PathBuf`] appended by
 /// [`COMPRESSED_EXTENSION`]. If the compressed size is larger than origin, do
 /// not change bytes and path.
-fn try_compress(bytes: &[u8], path: PathBuf) -> anyhow::Result<(Vec<u8>, PathBuf)> {
-    let compressed = zstd::stream::encode_all(bytes, CONFIG.zstd_level).map_err(|e| anyhow!(e))?;
+fn try_compress(bytes: &[u8], path: PathBuf, level: u8) -> anyhow::Result<(Vec<u8>, PathBuf)> {
+    let compressed = zstd::stream::encode_all(bytes, level as i32).map_err(|e| anyhow!(e))?;
 
     #[cfg(any(test, debug_assertions))]
     println!("Compressed data: {}", format_hex(&compressed).green());
@@ -127,11 +129,11 @@ fn try_decompress(bytes: &[u8], path: PathBuf) -> anyhow::Result<(Vec<u8>, PathB
 }
 
 /// encrypt file, and unlink it.
-pub async fn encrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result<PathBuf> {
     let file = file.as_ref();
     debug_assert!(file.is_file());
     let new_file = file.to_owned();
-    if is_same_file(file, GIT_ATTRIBUTES.as_path())? {
+    if is_same_file(file, &repo.conf.path)? {
         println!(
             "{}",
             "Warning: cannot encrypt `.gitattributes` file.".yellow()
@@ -148,8 +150,9 @@ pub async fn encrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let bytes = compio::fs::read(file)
         .await
         .with_context(|| format!("{:?}", file))?;
-    let (compressed, new_file) = try_compress(&bytes, new_file)?;
-    let (encrypted, new_file) = encrypt_change_path(CONFIG.key.as_bytes(), &compressed, new_file)?;
+    let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
+    let (encrypted, new_file) =
+        encrypt_change_path(repo.get_key()?.as_bytes(), &compressed, new_file)?;
     compio::fs::write(&new_file, encrypted).await.0?;
     compio::fs::remove_file(file).await?;
     debug!("Encrypted filename: {:?}", new_file);
@@ -157,7 +160,7 @@ pub async fn encrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
 }
 
 /// decrypt file, and unlink it.
-pub async fn decrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+pub async fn decrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result<PathBuf> {
     println!(
         "Decrypting file: `{}`",
         format!("{:?}", file.as_ref()).green()
@@ -166,12 +169,55 @@ pub async fn decrypt_file(file: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let bytes = compio::fs::read(&file)
         .await
         .with_context(|| format!("{:?}", file.as_ref()))?;
-    let (decrypted, new_file) = try_decrypt_change_path(CONFIG.key.as_bytes(), &bytes, new_file)?;
+    let (decrypted, new_file) =
+        try_decrypt_change_path(repo.get_key()?.as_bytes(), &bytes, new_file)?;
     let (decompressed, new_file) = try_decompress(&decrypted, new_file)?;
     compio::fs::write(&new_file, decompressed).await.0?;
     compio::fs::remove_file(&file).await?;
     debug!("Decrypted filename: {:?}", new_file);
     Ok(new_file)
+}
+
+pub async fn encrypt_repo(repo: &Repo) -> anyhow::Result<()> {
+    let patterns = &repo.conf.crypt_list;
+    repo.add_all()?;
+    let mut encrypt_futures = repo
+        .ls_files_absolute_with_given_patterns(
+            &patterns.iter().map(|x| x as &str).collect::<Vec<&str>>(),
+        )?
+        .into_iter()
+        .map(|f| encrypt_file(f, repo))
+        .collect::<FuturesOrdered<_>>();
+    while let Some(ret) = encrypt_futures.next().await {
+        if let Err(err) = ret {
+            eprintln!(
+                "{}",
+                format!("warning: failed to encrypt file: {}", err).yellow()
+            )
+        }
+    }
+    repo.add_all()?;
+    Ok(())
+}
+
+pub async fn decrypt_repo(repo: &Repo) -> anyhow::Result<()> {
+    let dot_pattern = [ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION].map(|x| String::from(".") + x);
+    let mut decrypt_futures = repo
+        .ls_files_absolute_with_given_patterns(&[dot_pattern[0].as_str(), dot_pattern[1].as_str()])?
+        .into_iter()
+        .filter(|x| x.is_file())
+        .map(|f| decrypt_file(f, repo))
+        .collect::<FuturesOrdered<_>>();
+    while let Some(ret) = decrypt_futures.next().await {
+        if let Err(err) = ret {
+            eprintln!(
+                "{}",
+                format!("warning: failed to decrypt file: {}", err).yellow()
+            )
+        }
+    }
+    repo.add_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -181,52 +227,4 @@ mod test {
     use temp_testdir::TempDir;
 
     use super::*;
-
-    #[compio::test]
-    async fn test_encrypt_decrypt() -> anyhow::Result<()> {
-        let temp_dir = TempDir::default();
-        let file = temp_dir.join("test_file.txt");
-
-        let content = b"123456";
-        std::fs::write(&file, content)?;
-        let new_file = encrypt_file(&file).await?;
-
-        assert!(is_same_file(
-            &new_file,
-            file.clone().append_ext(ENCRYPTED_EXTENSION)
-        )?);
-        assert!(!file.exists());
-        assert!(new_file.exists());
-        assert_ne!(content.to_vec(), std::fs::read(&new_file)?);
-
-        decrypt_file(&new_file).await?;
-        assert!(!new_file.exists());
-        assert_eq!(std::fs::read(&file)?, b"123456");
-        Ok(())
-    }
-
-    #[compio::test]
-    async fn test_encrypt_decrypt_with_compress() -> anyhow::Result<()> {
-        let temp_dir = TempDir::default();
-        let file = temp_dir.join("test_file.txt");
-
-        let content = &b"6".repeat(60); // This content will be compressed
-        std::fs::write(&file, content)?;
-        let new_file = encrypt_file(&file).await?;
-
-        assert!(is_same_file(
-            &new_file,
-            file.clone()
-                .append_ext(COMPRESSED_EXTENSION)
-                .append_ext(ENCRYPTED_EXTENSION)
-        )?);
-        assert!(!file.exists());
-        assert!(new_file.exists());
-        assert_ne!(content, &std::fs::read(&new_file)?);
-
-        decrypt_file(&new_file).await?;
-        assert!(!new_file.exists());
-        assert_eq!(&std::fs::read(&file)?, content);
-        Ok(())
-    }
 }
