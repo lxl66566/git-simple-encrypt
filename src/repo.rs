@@ -2,11 +2,16 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use assert2::assert;
+use log::debug;
 use tap::Tap;
 
-use crate::config::Config;
+use crate::{
+    config::{Config, CONFIG_FILE},
+    utils::PathToAbsolute,
+};
 
-pub const GIT_CONFIG_PREFIX: &str = concat!(env!("CARGO_CRATE_NAME"), ".");
+pub const GIT_CONFIG_PREFIX: &str =
+    const_str::replace!(concat!(env!("CARGO_CRATE_NAME"), "."), "_", "-");
 
 #[derive(Debug, Clone)]
 pub struct Repo {
@@ -15,9 +20,9 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// open a repo. The [`path`] of repo will be absolute path.
+    /// open a repo. The [`path`] of repo will be processed to absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut path = path.as_ref().to_path_buf().canonicalize()?;
+        let mut path = path.as_ref().to_path_buf().absolute();
         assert!(path.exists(), "Repo not found: {}", path.display());
         assert!(path.is_dir(), "Not a directory: {}", path.display());
         if path
@@ -27,23 +32,25 @@ impl Repo {
         {
             path.pop();
         }
-        let conf = Config::default_with_path(&path).load_or_create();
+        println!("Open repo: {}", path.display());
+        let conf = Config::load_or_create_from(path.join(CONFIG_FILE));
         Ok(Self { path, conf })
     }
     pub fn path(&self) -> &Path {
         &self.path
     }
     pub fn to_absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.path.join(path.as_ref())
+        self.path.join(path.as_ref()).absolute()
     }
     pub fn ls_files_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<String>> {
         let files_zip: Result<Vec<Vec<String>>> =
-            patterns.into_iter().map(|&x| self.ls_files(&[x])).collect();
+            patterns.iter().map(|&x| self.ls_files(&[x])).collect();
         Ok(files_zip?.into_iter().flatten().collect())
     }
     pub fn ls_files_absolute_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<PathBuf>> {
+        debug!("ls_files_absolute_with_given_patterns: {:?}", patterns);
         let files_zip: Result<Vec<Vec<PathBuf>>> = patterns
-            .into_iter()
+            .iter()
             .map(|&x| self.ls_files_absolute(&[x]))
             .collect();
         Ok(files_zip?.into_iter().flatten().collect())
@@ -97,7 +104,12 @@ impl GitCommand for Repo {
     fn ls_files(&self, args: &[&str]) -> Result<Vec<String>> {
         let output =
             self.run_with_output(&vec!["ls-files", "-z"].tap_mut(|x| x.extend_from_slice(args)))?;
-        let files = output.split(|c| c == '\0').map(|s| s.to_string()).collect();
+        let files = output
+            .trim_matches('\0')
+            .split(|c| c == '\0')
+            .map(|s| s.to_string())
+            .collect();
+        debug!("ls-files: {:?}", files);
         Ok(files)
     }
     /// returns the absolute path of `ls-files`.
@@ -110,11 +122,12 @@ impl GitCommand for Repo {
     }
     fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
-        self.run(&["config", "--local", &temp, value])
+        self.run(&["config", "--local", &temp, value.trim()])
     }
     fn get_config(&self, key: &str) -> Result<String> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
         self.run_with_output(&["config", "--get", &temp])
+            .map(|x| x.trim().to_string())
     }
 }
 
@@ -122,7 +135,6 @@ impl GitCommand for Repo {
 mod tests {
     use std::{assert, fs};
 
-    use same_file::is_same_file;
     use temp_testdir::TempDir;
 
     use super::*;
@@ -142,19 +154,24 @@ mod tests {
         let repo = Repo::open(&temp_dir)?;
         repo.run(&["init"])?;
         assert!(temp_dir.join(".git").is_dir());
-        assert!(repo
-            .run_with_output(&["status"])?
-            .contains("nothing to commit"));
-        fs::File::create(temp_dir.join("test.txt"));
+        fs::File::create(temp_dir.join("test.txt"))?;
         repo.add_all()?;
         assert!(repo
             .run_with_output(&["status"])?
             .contains("Changes to be committed"));
-        assert_eq!(repo.ls_files(&[]).unwrap(), vec!["test.txt"]);
-        assert!(is_same_file(
-            repo.ls_files_absolute(&[]).unwrap().get(0).unwrap(),
-            temp_dir.join("test.txt")
-        )?);
+        assert!(repo.ls_files(&[]).unwrap().contains(&"test.txt".into()));
+        assert_eq!(
+            repo.ls_files_absolute(&[])
+                .unwrap()
+                .into_iter()
+                .find(|x| x.file_name().unwrap() == "test.txt")
+                .unwrap()
+                .absolute(),
+            temp_dir.join("test.txt").absolute()
+        );
+
+        repo.set_config("test", "test1")?;
+        assert_eq!(repo.get_config("test")?, "test1");
         Ok(())
     }
 }

@@ -1,12 +1,16 @@
-use std::path::{Path, PathBuf};
+use std::{
+    io,
+    path::{Path, PathBuf},
+};
 
 use tap::Tap;
 
-pub trait PathFromBytes {
+#[allow(unused)]
+pub trait FromBytes {
     fn from_bytes(b: &[u8]) -> Self;
 }
 
-impl PathFromBytes for PathBuf {
+impl FromBytes for PathBuf {
     #[cfg(unix)]
     fn from_bytes(b: &[u8]) -> Self {
         use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
@@ -57,6 +61,20 @@ impl<T: AsRef<Path>> Git2Patch for T {
             x.strip_prefix_better("./");
             #[cfg(target_family = "windows")]
             x.strip_prefix_better(".\\");
+        })
+    }
+}
+
+pub trait PathToAbsolute {
+    fn absolute(&self) -> PathBuf;
+}
+impl<T: AsRef<Path>> PathToAbsolute for T {
+    fn absolute(&self) -> PathBuf {
+        std::path::absolute(self).unwrap_or_else(|e| {
+            panic!(
+                "Error in getting absolute path of `{:?}`: {e}",
+                self.as_ref()
+            )
         })
     }
 }

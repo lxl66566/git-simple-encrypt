@@ -1,12 +1,9 @@
-use std::{path::PathBuf, sync::LazyLock as Lazy};
+use std::path::PathBuf;
 
 use assert2::assert;
 use clap::{Parser, Subcommand};
 
-use crate::{
-    config::Config,
-    repo::{GitCommand, Repo},
-};
+use crate::repo::{GitCommand, Repo};
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
@@ -45,7 +42,7 @@ pub enum SubCommand {
     #[clap(alias("d"))]
     Decrypt,
     /// Mark files or folders as need-to-be-crypted.
-    Add { path: Vec<PathBuf> },
+    Add { path: Vec<String> },
     /// Set key or other config items.
     Set { field: SetField, value: String },
 }
@@ -76,7 +73,7 @@ impl SetField {
                 let temp = value.parse::<u8>();
                 assert!(temp.is_ok(), "value should be a number");
                 let temp = temp.unwrap();
-                assert!(temp >= 1 && temp <= 22, "value should be 1-22");
+                assert!((1..=22).contains(&temp), "value should be 1-22");
                 repo.conf.zstd_level = temp;
             }
         };

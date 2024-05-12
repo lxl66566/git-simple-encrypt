@@ -19,7 +19,6 @@ use tap::Tap;
 #[cfg(any(test, debug_assertions))]
 use crate::utils::format_hex;
 use crate::{
-    config::Config,
     repo::{GitCommand, Repo},
     utils::pathutils::*,
 };
@@ -131,6 +130,8 @@ fn try_decompress(bytes: &[u8], path: PathBuf) -> anyhow::Result<(Vec<u8>, PathB
 /// encrypt file, and unlink it.
 pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result<PathBuf> {
     let file = file.as_ref();
+    debug!("encrypt_file accept: {:?}", file);
+    debug_assert!(file.exists());
     debug_assert!(file.is_file());
     let new_file = file.to_owned();
     if is_same_file(file, &repo.conf.path)? {
@@ -146,7 +147,7 @@ pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
             "Warning: file has been encrypted, do not encrypt.".yellow()
         )
     }
-    println!("Encrypting file: `{}`", format!("{:?}", file).green());
+    println!("Encrypting file: {}", format!("{:?}", file).green());
     let bytes = compio::fs::read(file)
         .await
         .with_context(|| format!("{:?}", file))?;
@@ -162,7 +163,7 @@ pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
 /// decrypt file, and unlink it.
 pub async fn decrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result<PathBuf> {
     println!(
-        "Decrypting file: `{}`",
+        "Decrypting file: {}",
         format!("{:?}", file.as_ref()).green()
     );
     let new_file = file.as_ref().to_owned();
@@ -222,9 +223,18 @@ pub async fn decrypt_repo(repo: &Repo) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use anyhow::Ok;
-    use same_file::is_same_file;
-    use temp_testdir::TempDir;
+    use anyhow::Result;
 
     use super::*;
+
+    #[test]
+    fn test_encrypt_decrypt() -> Result<()> {
+        let key = b"123456";
+        let content = b"456789";
+        let encrypted_content = encrypt(key, content).unwrap();
+        assert_ne!(content.to_vec(), encrypted_content);
+        let decrypted_content = decrypt(key, &encrypted_content).unwrap();
+        assert_eq!(content.to_vec(), decrypted_content);
+        Ok(())
+    }
 }
