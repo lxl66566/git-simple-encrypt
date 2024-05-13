@@ -14,7 +14,6 @@ mod utils;
 use anyhow::{Ok, Result};
 use crypt::{decrypt_repo, encrypt_repo};
 use repo::Repo;
-use utils::{Git2Patch, PathToUnixStyle};
 
 pub use crate::cli::{Cli, SetField, SubCommand};
 

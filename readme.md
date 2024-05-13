@@ -32,8 +32,9 @@ There are several different ways to install it, you can choose **any** of them.
 ## Usage
 
 ```sh
-git-se set 123456           # Set the password to `123456`.
+git-se set key 123456       # Set the password to `123456`.
 git-se add file.txt         # Add `file.txt` to the need-to-be-encrypted list.
+git-se add mydir            # Add `mydir` to the need-to-be-encrypted list.
 git-se e                    # Encrypt files in list in the current repository.
 git-se d                    # Decrypt...
 ```
@@ -42,6 +43,7 @@ git-se d                    # Decrypt...
 
 - `git add -A` is automatically executed when encrypting, so make sure that `.gitignore` is handled properly.
 - Do not add files with `.zst`, `.enc` suffixes and folders containing them to the encrypted list.
+- To delete file/dir from encrypt list, edit `git_simple_encrypt.toml`.
 
 ## Algorithm
 
@@ -53,3 +55,4 @@ graph TD;
 ```
 
 - If zstd compression has the opposite effect, skip compression.
+- Decrypt all files with extension `.enc`, `.zst.enc`.

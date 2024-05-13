@@ -47,7 +47,7 @@ pub enum SubCommand {
     Set { field: SetField, value: String },
 }
 
-#[derive(Debug, Clone, Copy, clap::ValueEnum, enum_tools::EnumTools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, enum_tools::EnumTools)]
 #[enum_tools(as_str, from_str)]
 #[repr(i8)]
 #[allow(non_camel_case_types)]
@@ -59,7 +59,6 @@ pub enum SetField {
 
 impl SetField {
     pub fn set(&self, repo: &mut Repo, value: &str) -> anyhow::Result<()> {
-        // check input
         match self {
             Self::key => repo.set_config(self.as_str(), value)?,
             Self::enable_zstd => {
@@ -77,6 +76,10 @@ impl SetField {
                 repo.conf.zstd_level = temp;
             }
         };
+        println!("`{}` set to `{}`", self.as_str(), value);
+        if self != &Self::key {
+            repo.conf.save()?;
+        }
         Ok(())
     }
 }

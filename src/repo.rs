@@ -104,8 +104,11 @@ impl GitCommand for Repo {
     fn ls_files(&self, args: &[&str]) -> Result<Vec<String>> {
         let output =
             self.run_with_output(&vec!["ls-files", "-z"].tap_mut(|x| x.extend_from_slice(args)))?;
-        let files = output
-            .trim_matches('\0')
+        let output_processed = output.trim().trim_matches('\0');
+        if output_processed.is_empty() {
+            return Ok(vec![]);
+        }
+        let files = output_processed
             .split(|c| c == '\0')
             .map(|s| s.to_string())
             .collect();
@@ -154,6 +157,8 @@ mod tests {
         let repo = Repo::open(&temp_dir)?;
         repo.run(&["init"])?;
         assert!(temp_dir.join(".git").is_dir());
+        let temp = repo.ls_files(&[])?;
+        assert!(temp.is_empty(), "repo not empty: {:?}", temp);
         fs::File::create(temp_dir.join("test.txt"))?;
         repo.add_all()?;
         assert!(repo

@@ -32,8 +32,9 @@
 ## 使用
 
 ```sh
-git-se set 123456       # 设置密码为 `123456`
+git-se set key 123456   # 设置密码为 `123456`
 git-se add file.txt     # 将 `file.txt` 添加到加密列表
+git-se add mydir        # 将 `mydir` 添加到加密列表
 git-se e                # 加密当前仓库所有列表内的文件
 git-se d                # 解密...
 ```
@@ -42,6 +43,7 @@ git-se d                # 解密...
 
 - 加密时会自动执行 `git add -A`，请确保已妥善处理 `.gitignore`。
 - 请不要将 `.zst`, `.enc` 后缀的文件以及包含它们的文件夹添加到加密列表中。
+- 如果您需要从加密列表中删除文件(夹)，请手动编辑 `git_simple_encrypt.toml`。
 
 ## 原理
 
@@ -53,3 +55,4 @@ graph TD;
 ```
 
 - 如果 zstd 压缩后具有反效果，则跳过压缩。
+- 解密时对所有 `.enc`, `.zst.enc` 进行解密。

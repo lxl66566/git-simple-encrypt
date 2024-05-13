@@ -12,7 +12,6 @@ use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
 use futures_util::{stream::FuturesOrdered, StreamExt};
 use log::{debug, info};
-use same_file::is_same_file;
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
@@ -134,18 +133,16 @@ pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
     debug_assert!(file.exists());
     debug_assert!(file.is_file());
     let new_file = file.to_owned();
-    if is_same_file(file, &repo.conf.path)? {
-        println!(
+    if file.extension() == Some(ENCRYPTED_EXTENSION.as_ref()) {
+        info!(
             "{}",
-            "Warning: cannot encrypt `.gitattributes` file.".yellow()
+            format!(
+                "Warning: file has been encrypted, do not encrypt: {:?}",
+                file
+            )
+            .yellow()
         );
         return Ok(new_file);
-    }
-    if file.extension() == Some(ENCRYPTED_EXTENSION.as_ref()) {
-        println!(
-            "{}",
-            "Warning: file has been encrypted, do not encrypt.".yellow()
-        )
     }
     println!("Encrypting file: {}", format!("{:?}", file).green());
     let bytes = compio::fs::read(file)
@@ -202,9 +199,9 @@ pub async fn encrypt_repo(repo: &Repo) -> anyhow::Result<()> {
 }
 
 pub async fn decrypt_repo(repo: &Repo) -> anyhow::Result<()> {
-    let dot_pattern = [ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION].map(|x| String::from(".") + x);
+    let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
     let mut decrypt_futures = repo
-        .ls_files_absolute_with_given_patterns(&[dot_pattern[0].as_str(), dot_pattern[1].as_str()])?
+        .ls_files_absolute_with_given_patterns(&[dot_pattern.as_str()])?
         .into_iter()
         .filter(|x| x.is_file())
         .map(|f| decrypt_file(f, repo))

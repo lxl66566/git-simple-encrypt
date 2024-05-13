@@ -1,7 +1,4 @@
-use std::{
-    io,
-    path::{Path, PathBuf},
-};
+use std::path::{Path, PathBuf};
 
 use tap::Tap;
 
@@ -41,6 +38,7 @@ impl PathStripPrefix for PathBuf {
         self
     }
 }
+#[allow(unused)]
 pub trait PathToUnixStyle {
     fn to_unix_style(&self) -> PathBuf;
 }
@@ -51,6 +49,7 @@ impl<T: AsRef<Path>> PathToUnixStyle for T {
 }
 
 /// tracking https://github.com/rust-lang/git2-rs/issues/1048
+#[allow(unused)]
 pub trait Git2Patch {
     fn patch(&self) -> PathBuf;
 }
