@@ -23,6 +23,7 @@ die-exit = { version = "0.5.0", features = ["red"] }
 enum-tools = "0.5.3"
 env_logger = "0.11.3"
 futures-util = "0.3.30"
+glob = "0.3.1"
 log = "0.4.21"
 regex = "1.10.4"
 same-file = "1.0.6"

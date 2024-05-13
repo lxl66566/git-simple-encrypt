@@ -2,7 +2,7 @@
 
 English | [简体中文](./docs/README_zh-CN.md)
 
-A **very simple and easy to use** git file encryption tool that encrypts/decrypts your git repositories on any device with one **single password**.
+A **very simple and easy to use** git encryption tool that encrypts/decrypts your git repositories on any device with one **single password**. Supports partial file encryption, incremental encryption.
 
 - Why not use [`git-crypt`](https://github.com/AGWA/git-crypt)?
   - **This project is more focused on ease of use than security.** Single-password symmetric encryption is my bottom line.

@@ -50,7 +50,8 @@ impl Config {
         })?;
         Ok(toml::from_str(&content)?)
     }
-    pub fn save(&self) -> anyhow::Result<()> {
+    pub fn save(&mut self) -> anyhow::Result<()> {
+        self.crypt_list.dedup();
         let content = toml::to_string_pretty(self)?;
         std::fs::write(&self.path, content)?;
         Ok(())
@@ -58,7 +59,7 @@ impl Config {
     fn _load_or_create_inner(path: impl AsRef<Path>, loaded: anyhow::Result<Self>) -> Self {
         loaded.unwrap_or_else(|e| {
             eprintln!("{e}{}", ", use default config...".yellow());
-            let config = Self::default_with_path(path);
+            let mut config = Self::default_with_path(path);
             config
                 .save()
                 .unwrap_or_else(|e| die!("Failed to save config file: {}", e));
@@ -94,6 +95,10 @@ impl Config {
             .parent()
             .expect("parent dir of config file must exist")
             .join(path);
+        debug_assert!(
+            joined_path.is_absolute(),
+            "internal error: joined path not absolute, please open an issue to report."
+        );
         assert2::assert!(joined_path.exists(), "file not exist: {:?}", joined_path);
         assert2::assert!(
             !is_same_file(&joined_path, self.path.as_path())
@@ -106,10 +111,30 @@ impl Config {
         );
         self.crypt_list
             .push(path.to_string() + if joined_path.is_dir() { "/**" } else { "" });
+
+        // check extension
+        if joined_path.is_dir() {
+            if let Ok(glob_result) = glob::glob(joined_path.join("**/*").to_string_lossy().as_ref())
+            {
+                glob_result.filter_map(|p| p.ok()).for_each(|p| {
+                    if let Some(ext) = p.extension().and_then(|ext| ext.to_str())
+                        && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
+                    {
+                        eprintln!(
+                            "{}",
+                            format!(
+                                "Warning: adding dir that contains file with no-good extension: {:?}",
+                                p
+                            )
+                            .yellow()
+                        )
+                    }
+                });
+            }
+        }
     }
     pub fn add_to_crypt_list(&mut self, paths: &[&str]) -> anyhow::Result<()> {
         paths.iter().for_each(|x| self.add_to_crypt_list_one(x));
-        self.crypt_list.dedup();
         self.save()
     }
 }
@@ -127,7 +152,7 @@ mod tests {
     fn test_save_load() -> anyhow::Result<()> {
         let temp_dir = TempDir::default();
         let file_path = temp_dir.join("test");
-        let config = Config::default_with_path(&file_path);
+        let mut config = Config::default_with_path(&file_path);
         config.save()?;
         assert!(file_path.exists());
         let config_load = Config::load_from(file_path);
