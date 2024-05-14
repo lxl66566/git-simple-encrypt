@@ -10,6 +10,7 @@ use aes_gcm_siv::{
 };
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
+use die_exit::die;
 use futures_util::{stream::FuturesOrdered, StreamExt};
 use log::{debug, info};
 use sha3::{Digest, Sha3_224};
@@ -150,7 +151,7 @@ pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
         .with_context(|| format!("{:?}", file))?;
     let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
     let (encrypted, new_file) =
-        encrypt_change_path(repo.get_key()?.as_bytes(), &compressed, new_file)?;
+        encrypt_change_path(repo.get_key().as_bytes(), &compressed, new_file)?;
     compio::fs::write(&new_file, encrypted).await.0?;
     compio::fs::remove_file(file).await?;
     debug!("Encrypted filename: {:?}", new_file);
@@ -168,7 +169,7 @@ pub async fn decrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
         .await
         .with_context(|| format!("{:?}", file.as_ref()))?;
     let (decrypted, new_file) =
-        try_decrypt_change_path(repo.get_key()?.as_bytes(), &bytes, new_file)?;
+        try_decrypt_change_path(repo.get_key().as_bytes(), &bytes, new_file)?;
     let (decompressed, new_file) = try_decompress(&decrypted, new_file)?;
     compio::fs::write(&new_file, decompressed).await.0?;
     compio::fs::remove_file(&file).await?;
@@ -177,7 +178,11 @@ pub async fn decrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
 }
 
 pub async fn encrypt_repo(repo: &Repo) -> anyhow::Result<()> {
+    assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let patterns = &repo.conf.crypt_list;
+    if patterns.is_empty() {
+        die!("No file to encrypt, please exec `git-se add <FILE>` first.");
+    }
     repo.add_all()?;
     let mut encrypt_futures = repo
         .ls_files_absolute_with_given_patterns(
@@ -199,6 +204,7 @@ pub async fn encrypt_repo(repo: &Repo) -> anyhow::Result<()> {
 }
 
 pub async fn decrypt_repo(repo: &Repo) -> anyhow::Result<()> {
+    assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
     let mut decrypt_futures = repo
         .ls_files_absolute_with_given_patterns(&[dot_pattern.as_str()])?

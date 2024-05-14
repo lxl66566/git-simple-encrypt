@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use assert2::assert;
+use die_exit::Die;
 use log::debug;
 use tap::Tap;
 
@@ -55,8 +56,9 @@ impl Repo {
             .collect();
         Ok(files_zip?.into_iter().flatten().collect())
     }
-    pub fn get_key(&self) -> Result<String> {
+    pub fn get_key(&self) -> String {
         self.get_config("key")
+            .die("Key not found, please exec `git-se set key <KEY>` first.")
     }
 }
 
