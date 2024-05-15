@@ -8,7 +8,7 @@ use colored::Colorize;
 use git_simple_encrypt::*;
 use temp_testdir::TempDir;
 
-#[tokio::test]
+#[compio::test]
 async fn test() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let _lock = TempDir::default();
@@ -96,7 +96,7 @@ async fn test() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[compio::test]
 async fn test_reencrypt() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let _lock = TempDir::default();

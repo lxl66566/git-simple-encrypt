@@ -148,18 +148,18 @@ pub async fn encrypt_file(
         return Ok(new_file);
     }
     println!("Encrypting file: {}", format!("{:?}", file).green());
-    let bytes = tokio::fs::read(file)
+    let bytes = compio::fs::read(file)
         .await
         .with_context(|| format!("{:?}", file))?;
 
-    let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
+    let (encrypted, new_file) = compio::runtime::spawn_blocking(move || {
         let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
         encrypt_change_path(repo.get_key().as_bytes(), &compressed, new_file)
     })
-    .await??;
+    .await?;
 
-    tokio::fs::write(&new_file, encrypted).await?;
-    tokio::fs::remove_file(file).await?;
+    compio::fs::write(&new_file, encrypted).await.0?;
+    compio::fs::remove_file(file).await?;
     debug!("Encrypted filename: {:?}", new_file);
     Ok(new_file)
 }
@@ -174,19 +174,19 @@ pub async fn decrypt_file(
         format!("{:?}", file.as_ref()).green()
     );
     let new_file = file.as_ref().to_owned();
-    let bytes = tokio::fs::read(&file)
+    let bytes = compio::fs::read(&file)
         .await
         .with_context(|| format!("{:?}", file.as_ref()))?;
 
-    let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
+    let (decompressed, new_file) = compio::runtime::spawn_blocking(move || {
         let (decrypted, new_file) =
             try_decrypt_change_path(repo.get_key().as_bytes(), &bytes, new_file)?;
         try_decompress(&decrypted, new_file)
     })
-    .await??;
+    .await?;
 
-    tokio::fs::write(&new_file, decompressed).await?;
-    tokio::fs::remove_file(&file).await?;
+    compio::fs::write(&new_file, decompressed).await.0?;
+    compio::fs::remove_file(&file).await?;
     debug!("Decrypted filename: {:?}", new_file);
     Ok(new_file)
 }
@@ -209,10 +209,10 @@ pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
         )?
         .into_iter()
         .map(|f| encrypt_file(f, repo))
-        .map(tokio::task::spawn)
+        .map(compio::runtime::spawn)
         .collect::<Vec<_>>();
     for ret in encrypt_futures {
-        if let Err(err) = ret.await? {
+        if let Err(err) = ret.await {
             eprintln!(
                 "{}",
                 format!("warning: failed to encrypt file: {}", err).yellow()
@@ -231,10 +231,10 @@ pub async fn decrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
         .into_iter()
         .filter(|x| x.is_file())
         .map(|f| decrypt_file(f, repo))
-        .map(tokio::task::spawn)
+        .map(compio::runtime::spawn)
         .collect::<Vec<_>>();
     for ret in decrypt_futures {
-        if let Err(err) = ret.await? {
+        if let Err(err) = ret.await {
             eprintln!(
                 "{}",
                 format!("warning: failed to decrypt file: {}", err).yellow()
