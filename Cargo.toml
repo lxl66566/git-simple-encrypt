@@ -5,7 +5,7 @@ description = "Encrypt/decrypt files in git repo using one password"
 homepage = "https://github.com/lxl66566/git-simple-encrypt"
 repository = "https://github.com/lxl66566/git-simple-encrypt"
 license = "MIT"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 readme = "./README.md"
 categories = ["cryptography"]
@@ -17,12 +17,10 @@ anyhow = "1.0.82"
 assert2 = "0.3.14"
 clap = { version = "4.5.4", features = ["derive"] }
 colored = "2.1.0"
-compio = { version = "0.10.0", features = ["macros", "dispatcher"] }
 const-str = "0.5.7"
 die-exit = { version = "0.5.0", features = ["red"] }
 enum-tools = "0.5.3"
 env_logger = "0.11.3"
-futures-util = "0.3.30"
 glob = "0.3.1"
 log = "0.4.21"
 regex = "1.10.4"
@@ -30,6 +28,12 @@ same-file = "1.0.6"
 serde = { version = "1.0.201", features = ["derive"] }
 sha3 = "0.10.8"
 tap = "1.0.1"
+tokio = { version = "1.37.0", features = [
+  "macros",
+  "rt",
+  "rt-multi-thread",
+  "fs",
+] }
 toml = "0.8.12"
 zstd = "0.13.1"
 

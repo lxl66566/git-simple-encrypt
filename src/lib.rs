@@ -18,14 +18,15 @@ use repo::Repo;
 pub use crate::cli::{Cli, SetField, SubCommand};
 
 pub async fn run(cli: &Cli) -> Result<()> {
-    let mut repo = Repo::open(&cli.repo)?;
+    let repo = Repo::open(&cli.repo)?;
+    let repo = Box::leak(Box::new(repo));
     match &cli.command {
-        SubCommand::Encrypt => encrypt_repo(&repo).await?,
-        SubCommand::Decrypt => decrypt_repo(&repo).await?,
+        SubCommand::Encrypt => encrypt_repo(repo).await?,
+        SubCommand::Decrypt => decrypt_repo(repo).await?,
         SubCommand::Add { path } => repo
             .conf
             .add_to_crypt_list(&path.iter().map(|s| s.as_ref()).collect::<Vec<_>>())?,
-        SubCommand::Set { field, value } => field.set(&mut repo, value)?,
+        SubCommand::Set { field, value } => field.set(repo, value)?,
     }
     Ok(())
 }

@@ -11,7 +11,6 @@ use aes_gcm_siv::{
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
 use die_exit::die;
-use futures_util::{stream::FuturesOrdered, StreamExt};
 use log::{debug, info};
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
@@ -128,7 +127,10 @@ fn try_decompress(bytes: &[u8], path: PathBuf) -> anyhow::Result<(Vec<u8>, PathB
 }
 
 /// encrypt file, and unlink it.
-pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result<PathBuf> {
+pub async fn encrypt_file(
+    file: impl AsRef<Path> + Send + Sync,
+    repo: &'static Repo,
+) -> anyhow::Result<PathBuf> {
     let file = file.as_ref();
     debug!("encrypt_file accept: {:?}", file);
     debug_assert!(file.exists());
@@ -146,53 +148,71 @@ pub async fn encrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result
         return Ok(new_file);
     }
     println!("Encrypting file: {}", format!("{:?}", file).green());
-    let bytes = compio::fs::read(file)
+    let bytes = tokio::fs::read(file)
         .await
         .with_context(|| format!("{:?}", file))?;
-    let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
-    let (encrypted, new_file) =
-        encrypt_change_path(repo.get_key().as_bytes(), &compressed, new_file)?;
-    compio::fs::write(&new_file, encrypted).await.0?;
-    compio::fs::remove_file(file).await?;
+
+    let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
+        let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
+        encrypt_change_path(repo.get_key().as_bytes(), &compressed, new_file)
+    })
+    .await??;
+
+    tokio::fs::write(&new_file, encrypted).await?;
+    tokio::fs::remove_file(file).await?;
     debug!("Encrypted filename: {:?}", new_file);
     Ok(new_file)
 }
 
 /// decrypt file, and unlink it.
-pub async fn decrypt_file(file: impl AsRef<Path>, repo: &Repo) -> anyhow::Result<PathBuf> {
+pub async fn decrypt_file(
+    file: impl AsRef<Path> + Send + Sync,
+    repo: &'static Repo,
+) -> anyhow::Result<PathBuf> {
     println!(
         "Decrypting file: {}",
         format!("{:?}", file.as_ref()).green()
     );
     let new_file = file.as_ref().to_owned();
-    let bytes = compio::fs::read(&file)
+    let bytes = tokio::fs::read(&file)
         .await
         .with_context(|| format!("{:?}", file.as_ref()))?;
-    let (decrypted, new_file) =
-        try_decrypt_change_path(repo.get_key().as_bytes(), &bytes, new_file)?;
-    let (decompressed, new_file) = try_decompress(&decrypted, new_file)?;
-    compio::fs::write(&new_file, decompressed).await.0?;
-    compio::fs::remove_file(&file).await?;
+
+    let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
+        let (decrypted, new_file) =
+            try_decrypt_change_path(repo.get_key().as_bytes(), &bytes, new_file)?;
+        try_decompress(&decrypted, new_file)
+    })
+    .await??;
+
+    tokio::fs::write(&new_file, decompressed).await?;
+    tokio::fs::remove_file(&file).await?;
     debug!("Decrypted filename: {:?}", new_file);
     Ok(new_file)
 }
 
-pub async fn encrypt_repo(repo: &Repo) -> anyhow::Result<()> {
+/// Encrypt all repo.
+///
+/// 1. add all (for the `ls-files` operation)
+/// 2. encrypt_file
+/// 3. add all
+pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let patterns = &repo.conf.crypt_list;
     if patterns.is_empty() {
         die!("No file to encrypt, please exec `git-se add <FILE>` first.");
     }
     repo.add_all()?;
-    let mut encrypt_futures = repo
+    let encrypt_futures = repo
         .ls_files_absolute_with_given_patterns(
             &patterns.iter().map(|x| x as &str).collect::<Vec<&str>>(),
         )?
         .into_iter()
         .map(|f| encrypt_file(f, repo))
-        .collect::<FuturesOrdered<_>>();
-    while let Some(ret) = encrypt_futures.next().await {
-        if let Err(err) = ret {
+        .map(tokio::task::spawn)
+        .collect::<Vec<_>>();
+    for ret in encrypt_futures {
+        if let Err(err) = ret.await? {
             eprintln!(
                 "{}",
                 format!("warning: failed to encrypt file: {}", err).yellow()
@@ -203,17 +223,18 @@ pub async fn encrypt_repo(repo: &Repo) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn decrypt_repo(repo: &Repo) -> anyhow::Result<()> {
+pub async fn decrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
-    let mut decrypt_futures = repo
+    let decrypt_futures = repo
         .ls_files_absolute_with_given_patterns(&[dot_pattern.as_str()])?
         .into_iter()
         .filter(|x| x.is_file())
         .map(|f| decrypt_file(f, repo))
-        .collect::<FuturesOrdered<_>>();
-    while let Some(ret) = decrypt_futures.next().await {
-        if let Err(err) = ret {
+        .map(tokio::task::spawn)
+        .collect::<Vec<_>>();
+    for ret in decrypt_futures {
+        if let Err(err) = ret.await? {
             eprintln!(
                 "{}",
                 format!("warning: failed to decrypt file: {}", err).yellow()
