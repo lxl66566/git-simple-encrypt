@@ -27,24 +27,16 @@ impl PathAppendExt for PathBuf {
         self.tap_mut(|p| p.as_mut_os_string().push(format!(".{ext}")))
     }
 }
-pub trait PathStripPrefix {
-    fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self;
-}
-impl PathStripPrefix for PathBuf {
-    fn strip_prefix_better(&mut self, prefix: impl AsRef<Path>) -> &mut Self {
-        if let Ok(res) = self.strip_prefix(prefix) {
-            *self = res.to_path_buf();
-        }
-        self
-    }
-}
 #[allow(unused)]
 pub trait PathToUnixStyle {
     fn to_unix_style(&self) -> PathBuf;
 }
 impl<T: AsRef<Path>> PathToUnixStyle for T {
     fn to_unix_style(&self) -> PathBuf {
-        self.as_ref().to_string_lossy().replace('\\', "/").into()
+        #[cfg(not(unix))]
+        return self.as_ref().to_string_lossy().replace('\\', "/").into();
+        #[cfg(unix)]
+        return self.as_ref().to_path_buf();
     }
 }
 
@@ -55,12 +47,22 @@ pub trait Git2Patch {
 }
 impl<T: AsRef<Path>> Git2Patch for T {
     fn patch(&self) -> PathBuf {
-        self.as_ref().to_path_buf().tap_mut(|x| {
-            #[cfg(target_family = "unix")]
-            x.strip_prefix_better("./");
-            #[cfg(target_family = "windows")]
-            x.strip_prefix_better(".\\");
-        })
+        let path = self.as_ref().to_path_buf();
+
+        #[cfg(target_family = "unix")]
+        let mut prefix = "./".to_string();
+        #[cfg(target_family = "windows")]
+        let mut prefix = ".\\".to_string();
+
+        let res = path.strip_prefix(&prefix);
+        if let Ok(mut ok_stripped) = res {
+            prefix.remove(0);
+            while let Ok(stripped_again) = ok_stripped.strip_prefix(&prefix) {
+                ok_stripped = stripped_again;
+            }
+            return ok_stripped.to_path_buf();
+        }
+        path
     }
 }
 
@@ -75,5 +77,32 @@ impl<T: AsRef<Path>> PathToAbsolute for T {
                 self.as_ref()
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(target_family = "unix")]
+    fn test_patch() {
+        let patched = Path::new("src/utils/pathutils.rs");
+        assert_eq!(patched.patch(), patched);
+        let p = Path::new("./src/utils/pathutils.rs");
+        assert_eq!(p.patch(), patched);
+        let p = Path::new(".////src/utils/pathutils.rs");
+        assert_eq!(p.patch(), patched);
+    }
+
+    #[test]
+    #[cfg(target_family = "windows")]
+    fn test_patch() {
+        let patched = Path::new("src\\utils\\pathutils.rs");
+        assert_eq!(patched.patch(), patched);
+        let p = Path::new(".\\src\\utils\\pathutils.rs");
+        assert_eq!(p.patch(), patched);
+        let p = Path::new(".\\\\\\\\src\\utils\\pathutils.rs");
+        assert_eq!(p.patch(), patched);
     }
 }

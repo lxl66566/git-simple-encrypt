@@ -1,9 +1,15 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use anyhow::{anyhow, Result};
 use assert2::assert;
+#[cfg(any(test, debug_assertions))]
+use colored::Colorize;
 use die_exit::Die;
 use log::debug;
+use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
 use crate::{
@@ -14,10 +20,11 @@ use crate::{
 pub const GIT_CONFIG_PREFIX: &str =
     const_str::replace!(concat!(env!("CARGO_CRATE_NAME"), "."), "_", "-");
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Repo {
     pub path: PathBuf,
     pub conf: Config,
+    pub key_sha: OnceLock<Box<[u8]>>,
 }
 
 impl Repo {
@@ -35,7 +42,11 @@ impl Repo {
         }
         println!("Open repo: {}", path.display());
         let conf = Config::load_or_create_from(path.join(CONFIG_FILE));
-        Ok(Self { path, conf })
+        Ok(Self {
+            path,
+            conf,
+            key_sha: OnceLock::new(),
+        })
     }
     pub fn path(&self) -> &Path {
         &self.path
@@ -59,6 +70,32 @@ impl Repo {
     pub fn get_key(&self) -> String {
         self.get_config("key")
             .die("Key not found, please exec `git-se set key <KEY>` first.")
+    }
+
+    /// returns the first 16 bytes of sha3-224 of the key.
+    /// The sha result will only be calculated once in the lifetime of the
+    /// object.
+    pub fn get_key_sha(&self) -> &[u8] {
+        self.key_sha.get_or_init(|| {
+            let key = self.get_key();
+            #[cfg(any(test, debug_assertions))]
+            println!("Key: {}", key.green());
+            let mut hasher = Sha3_224::default();
+            hasher.update(key);
+            let hash_result = hasher.finalize();
+            let hash_result_slice = hash_result.as_slice();
+            let hash_result_slice_cut = &hash_result_slice[..16];
+            #[cfg(any(test, debug_assertions))]
+            {
+                use crate::utils::format_hex;
+                println!("Hash result: {}", format_hex(hash_result_slice).green());
+                println!(
+                    "Hash Cut result: {}",
+                    format_hex(hash_result_slice_cut).green()
+                );
+            }
+            hash_result_slice_cut.into()
+        })
     }
 }
 

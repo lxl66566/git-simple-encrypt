@@ -12,7 +12,6 @@ use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
 use die_exit::die;
 use log::{debug, info};
-use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
 #[cfg(any(test, debug_assertions))]
@@ -27,22 +26,7 @@ pub static ENCRYPTED_EXTENSION: &str = "enc";
 pub static COMPRESSED_EXTENSION: &str = "zst";
 
 pub fn encrypt(key: &[u8], text: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
-    #[cfg(any(test, debug_assertions))]
-    println!("Key: {}", String::from_utf8_lossy(key).green());
-    let mut hasher = Sha3_224::default();
-    hasher.update(key);
-    let hash_result = hasher.finalize();
-    let hash_result_slice = hash_result.as_slice();
-    #[cfg(any(test, debug_assertions))]
-    {
-        println!("Hash result: {}", format_hex(hash_result_slice).green());
-        println!(
-            "Hash Cut result: {}",
-            format_hex(&hash_result_slice[..16]).green()
-        );
-    }
-    let cipher =
-        Aes128GcmSiv::new_from_slice(&hash_result_slice[..16]).expect("cipher key length error.");
+    let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
     let encrypted = cipher.encrypt(NONCE.deref(), text)?;
 
     #[cfg(any(test, debug_assertions))]
@@ -52,10 +36,7 @@ pub fn encrypt(key: &[u8], text: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm_
 }
 
 pub fn decrypt(key: &[u8], text: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
-    let mut hasher = Sha3_224::default();
-    hasher.update(key);
-    let cipher = Aes128GcmSiv::new_from_slice(&hasher.finalize().as_slice()[..16])
-        .expect("cipher key length error.");
+    let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
     let plaintext = cipher.decrypt(NONCE.deref(), text)?;
     Ok(plaintext)
 }
@@ -154,7 +135,7 @@ pub async fn encrypt_file(
 
     let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
         let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
-        encrypt_change_path(repo.get_key().as_bytes(), &compressed, new_file)
+        encrypt_change_path(repo.get_key_sha(), &compressed, new_file)
     })
     .await??;
 
@@ -179,8 +160,7 @@ pub async fn decrypt_file(
         .with_context(|| format!("{:?}", file.as_ref()))?;
 
     let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
-        let (decrypted, new_file) =
-            try_decrypt_change_path(repo.get_key().as_bytes(), &bytes, new_file)?;
+        let (decrypted, new_file) = try_decrypt_change_path(repo.get_key_sha(), &bytes, new_file)?;
         try_decompress(&decrypted, new_file)
     })
     .await??;
@@ -253,7 +233,7 @@ mod test {
 
     #[test]
     fn test_encrypt_decrypt() -> Result<()> {
-        let key = b"123456";
+        let key = b"602bdc204140db0a";
         let content = b"456789";
         let encrypted_content = encrypt(key, content).unwrap();
         assert_ne!(content.to_vec(), encrypted_content);
