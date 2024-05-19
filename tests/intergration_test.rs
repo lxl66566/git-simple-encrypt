@@ -13,8 +13,8 @@ use rand::seq::SliceRandom;
 use tap::Tap;
 use temp_testdir::TempDir;
 
-#[tokio::test]
-async fn test() -> anyhow::Result<()> {
+#[test]
+fn test() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let _lock = TempDir::default();
     let temp_dir = &_lock;
@@ -28,8 +28,7 @@ async fn test() -> anyhow::Result<()> {
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
-            })
-            .await?;
+            })?;
         };
     }
 
@@ -101,8 +100,8 @@ async fn test() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_reencrypt() -> anyhow::Result<()> {
+#[test]
+fn test_reencrypt() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let _lock = TempDir::default();
     let temp_dir = &_lock;
@@ -116,8 +115,7 @@ async fn test_reencrypt() -> anyhow::Result<()> {
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
-            })
-            .await?;
+            })?;
         };
     }
 
@@ -176,9 +174,9 @@ async fn test_reencrypt() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
+#[test]
 #[ignore = "This test takes too long to run, and it's not necessary to run it every time. You can run it manually if you want."]
-async fn test_many_files() -> anyhow::Result<()> {
+fn test_many_files() -> anyhow::Result<()> {
     let _lock = TempDir::default();
     let temp_dir = &_lock;
     let exec = |cmd: &str| -> std::io::Result<Output> {
@@ -191,8 +189,7 @@ async fn test_many_files() -> anyhow::Result<()> {
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
-            })
-            .await?;
+            })?;
         };
     }
 
@@ -232,8 +229,8 @@ async fn test_many_files() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_partial_decrypt() -> anyhow::Result<()> {
+#[test]
+fn test_partial_decrypt() -> anyhow::Result<()> {
     let _ = env_logger::try_init();
     let temp_dir = &TempDir::default();
     let exec = |cmd: &str| -> std::io::Result<Output> {
@@ -246,8 +243,7 @@ async fn test_partial_decrypt() -> anyhow::Result<()> {
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
-            })
-            .await?;
+            })?;
         };
     }
 

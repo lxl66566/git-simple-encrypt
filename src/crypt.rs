@@ -26,9 +26,9 @@ static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
 pub static ENCRYPTED_EXTENSION: &str = "enc";
 pub static COMPRESSED_EXTENSION: &str = "zst";
 
-pub fn encrypt(key: &[u8], text: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
+pub fn encrypt(key: &[u8], text: Box<[u8]>) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
     let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
-    let encrypted = cipher.encrypt(NONCE.deref(), text)?;
+    let encrypted = cipher.encrypt(NONCE.deref(), text.as_ref())?;
 
     #[cfg(any(test, debug_assertions))]
     println!("Encrypted data: {}", format_hex(&encrypted).green());
@@ -36,13 +36,17 @@ pub fn encrypt(key: &[u8], text: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm_
     Ok(encrypted)
 }
 
-pub fn decrypt(key: &[u8], text: &[u8]) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
+pub fn decrypt(key: &[u8], text: Box<[u8]>) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
     let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
-    let plaintext = cipher.decrypt(NONCE.deref(), text)?;
+    let plaintext = cipher.decrypt(NONCE.deref(), text.as_ref())?;
     Ok(plaintext)
 }
 
-pub fn encrypt_change_path(key: &[u8], text: &[u8], path: PathBuf) -> Result<(Vec<u8>, PathBuf)> {
+pub fn encrypt_change_path(
+    key: &[u8],
+    text: Box<[u8]>,
+    path: PathBuf,
+) -> Result<(Vec<u8>, PathBuf)> {
     Ok((
         encrypt(key, text).map_err(|e| anyhow!("`{:?}`: {e}", path))?,
         path.append_ext(ENCRYPTED_EXTENSION),
@@ -52,7 +56,7 @@ pub fn encrypt_change_path(key: &[u8], text: &[u8], path: PathBuf) -> Result<(Ve
 /// Try to decrypt bytes only if path ends with [`ENCRYPTED_EXTENSION`].
 pub fn try_decrypt_change_path(
     key: &[u8],
-    text: &[u8],
+    text: Box<[u8]>,
     path: PathBuf,
 ) -> Result<(Vec<u8>, PathBuf)> {
     if let Some(ext) = path.extension()
@@ -67,15 +71,16 @@ pub fn try_decrypt_change_path(
             "Extension of file `{:?}` does not match, do not decrypt",
             path
         );
-        Ok((text.to_vec(), path))
+        Ok((text.into_vec(), path))
     }
 }
 
 /// Try to compress bytes, returns a [`PathBuf`] appended by
 /// [`COMPRESSED_EXTENSION`]. If the compressed size is larger than origin, do
 /// not change bytes and path.
-fn try_compress(bytes: &[u8], path: PathBuf, level: u8) -> anyhow::Result<(Vec<u8>, PathBuf)> {
-    let compressed = zstd::stream::encode_all(bytes, level as i32).map_err(|e| anyhow!(e))?;
+fn try_compress(bytes: Box<[u8]>, path: PathBuf, level: u8) -> anyhow::Result<(Vec<u8>, PathBuf)> {
+    let compressed =
+        zstd::stream::encode_all(bytes.as_ref(), level as i32).map_err(|e| anyhow!(e))?;
 
     #[cfg(any(test, debug_assertions))]
     println!("Compressed data: {}", format_hex(&compressed).green());
@@ -88,23 +93,23 @@ fn try_compress(bytes: &[u8], path: PathBuf, level: u8) -> anyhow::Result<(Vec<u
         ))
     } else {
         info!("Compressed data size is larger than origin, do not compress.");
-        Ok((bytes.to_vec(), path))
+        Ok((bytes.into_vec(), path))
     }
 }
 
 /// Try to decompress bytes only if path ends with [`COMPRESSED_EXTENSION`].
-fn try_decompress(bytes: &[u8], path: PathBuf) -> anyhow::Result<(Vec<u8>, PathBuf)> {
+fn try_decompress(bytes: Box<[u8]>, path: PathBuf) -> anyhow::Result<(Vec<u8>, PathBuf)> {
     if let Some(ext) = path.extension()
         && ext.to_str() == Some(COMPRESSED_EXTENSION)
     {
-        let decompressed = zstd::stream::decode_all(bytes).map_err(|e| anyhow!(e))?;
+        let decompressed = zstd::stream::decode_all(bytes.as_ref()).map_err(|e| anyhow!(e))?;
         Ok((decompressed, path.with_extension("")))
     } else {
         debug!(
             "Extension of file `{:?}` does not match, do not decompress",
             path
         );
-        Ok((bytes.to_vec(), path))
+        Ok((bytes.into_vec(), path))
     }
 }
 
@@ -135,8 +140,9 @@ pub async fn encrypt_file(
         .with_context(|| format!("{:?}", file))?;
 
     let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
-        let (compressed, new_file) = try_compress(&bytes, new_file, repo.conf.zstd_level)?;
-        encrypt_change_path(repo.get_key_sha(), &compressed, new_file)
+        let (compressed, new_file) =
+            try_compress(bytes.into_boxed_slice(), new_file, repo.conf.zstd_level)?;
+        encrypt_change_path(repo.get_key_sha(), compressed.into_boxed_slice(), new_file)
     })
     .await??;
 
@@ -161,8 +167,9 @@ pub async fn decrypt_file(
         .with_context(|| format!("{:?}", file.as_ref()))?;
 
     let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
-        let (decrypted, new_file) = try_decrypt_change_path(repo.get_key_sha(), &bytes, new_file)?;
-        try_decompress(&decrypted, new_file)
+        let (decrypted, new_file) =
+            try_decrypt_change_path(repo.get_key_sha(), bytes.into_boxed_slice(), new_file)?;
+        try_decompress(decrypted.into_boxed_slice(), new_file)
     })
     .await??;
 
@@ -263,9 +270,9 @@ mod test {
     fn test_encrypt_decrypt() -> Result<()> {
         let key = b"602bdc204140db0a";
         let content = b"456789";
-        let encrypted_content = encrypt(key, content).unwrap();
+        let encrypted_content = encrypt(key, Box::new(*content)).unwrap();
         assert_ne!(content.to_vec(), encrypted_content);
-        let decrypted_content = decrypt(key, &encrypted_content).unwrap();
+        let decrypted_content = decrypt(key, encrypted_content.into()).unwrap();
         assert_eq!(content.to_vec(), decrypted_content);
         Ok(())
     }

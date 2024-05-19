@@ -410,6 +410,7 @@ dependencies = [
  "glob",
  "libz-sys",
  "log",
+ "num_cpus",
  "openssl",
  "rand",
  "regex",
