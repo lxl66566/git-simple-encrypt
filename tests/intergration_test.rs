@@ -53,7 +53,7 @@ async fn test() -> anyhow::Result<()> {
 
     // Add file
     run!(SubCommand::Add {
-        path: ["t1.txt", "t2.txt", "dir"]
+        paths: ["t1.txt", "t2.txt", "dir"]
             .map(ToString::to_string)
             .to_vec(),
     });
@@ -73,7 +73,7 @@ async fn test() -> anyhow::Result<()> {
     assert!(!temp_dir.join("dir/t4.txt").exists());
 
     // Decrypt
-    run!(SubCommand::Decrypt);
+    run!(SubCommand::Decrypt { path: None });
     println!("{}", "After Decrypt".green());
 
     // Test
@@ -134,7 +134,7 @@ async fn test_reencrypt() -> anyhow::Result<()> {
 
     // Add file
     run!(SubCommand::Add {
-        path: ["t1.txt", "dir"].map(ToString::to_string).to_vec(),
+        paths: ["t1.txt", "dir"].map(ToString::to_string).to_vec(),
     });
 
     // Encrypt multiple times
@@ -154,7 +154,7 @@ async fn test_reencrypt() -> anyhow::Result<()> {
     assert!(!temp_dir.join("dir/t4.txt").exists());
 
     // Decrypt
-    run!(SubCommand::Decrypt);
+    run!(SubCommand::Decrypt { path: None });
     println!("{}", "After Decrypt".green());
 
     // Test
@@ -214,13 +214,13 @@ async fn test_many_files() -> anyhow::Result<()> {
 
     // Add file
     run!(SubCommand::Add {
-        path: vec!["dir".into()]
+        paths: vec!["dir".into()]
     });
 
     // Encrypt
     run!(SubCommand::Encrypt);
     // Decrypt
-    run!(SubCommand::Decrypt);
+    run!(SubCommand::Decrypt { path: None });
 
     // Test
     for _ in 1..10 {
@@ -228,6 +228,74 @@ async fn test_many_files() -> anyhow::Result<()> {
         println!("Testing file: {}", file_name.display());
         assert_eq!(std::fs::read_to_string(file_name)?, "Hello");
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_partial_decrypt() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let temp_dir = &TempDir::default();
+    let exec = |cmd: &str| -> std::io::Result<Output> {
+        let mut temp = cmd.split_whitespace();
+        let mut command = Command::new(temp.next().unwrap());
+        command.args(temp).current_dir(temp_dir).output()
+    };
+    macro_rules! run {
+        ($cmd:expr) => {
+            run(&Cli {
+                command: $cmd,
+                repo: temp_dir.to_path_buf(),
+            })
+            .await?;
+        };
+    }
+
+    exec("git init")?;
+    std::fs::create_dir(temp_dir.join("dir"))?;
+    std::fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
+    std::fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
+
+    // Set key
+    run!(SubCommand::Set {
+        field: SetField::key,
+        value: "123".to_owned(),
+    });
+
+    // Add file
+    run!(SubCommand::Add {
+        paths: ["t1.txt", "dir"].map(ToString::to_string).to_vec(),
+    });
+
+    // Encrypt
+    run!(SubCommand::Encrypt);
+
+    // Partial decrypt
+    run!(SubCommand::Decrypt {
+        path: Some("dir/**".into())
+    });
+
+    // Test
+    for entry in temp_dir.read_dir()? {
+        println!("{:?}", entry?);
+    }
+    assert!(temp_dir.join("t1.txt.enc").exists());
+    assert!(temp_dir.join("dir/t4.txt").exists());
+
+    // Reencrypt
+    run!(SubCommand::Encrypt);
+
+    // Partial decrypt
+    run!(SubCommand::Decrypt {
+        path: Some("t1.txt.enc".into())
+    });
+
+    // Test
+    for entry in temp_dir.read_dir()? {
+        println!("{:?}", entry?);
+    }
+    assert!(temp_dir.join("t1.txt").exists());
+    assert!(temp_dir.join("dir/t4.txt.enc").exists());
 
     Ok(())
 }

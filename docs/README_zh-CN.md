@@ -28,6 +28,10 @@
   ```sh
   cargo +nightly install git-simple-encrypt
   ```
+  或 [cargo-binstall](https://github.com/cargo-bins/cargo-binstall)：
+  ```sh
+  cargo binstall git-simple-encrypt
+  ```
 
 ## 使用
 
@@ -37,7 +41,10 @@ git-se add file.txt     # 将 `file.txt` 添加到加密列表
 git-se add mydir        # 将 `mydir` 添加到加密列表
 git-se e                # 加密当前仓库所有列表内的文件
 git-se d                # 解密...
+git-se d 'src/*'        # 部分解密
 ```
+
+`git-se -h` 和 `git-se [subcommand] -h` 查看更多帮助。
 
 ## 注意事项
 
@@ -56,3 +63,8 @@ graph TD;
 
 - 如果 zstd 压缩后具有反效果，则跳过压缩。
 - 解密时对所有 `.enc`, `.zst.enc` 进行解密。
+
+## TODO
+
+- [ ] zstd effect checking
+- [x] partial decrypt

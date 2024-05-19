@@ -22,10 +22,10 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let repo = Box::leak(Box::new(repo));
     match &cli.command {
         SubCommand::Encrypt => encrypt_repo(repo).await?,
-        SubCommand::Decrypt => decrypt_repo(repo).await?,
-        SubCommand::Add { path } => repo
+        SubCommand::Decrypt { path } => decrypt_repo(repo, path).await?,
+        SubCommand::Add { paths } => repo
             .conf
-            .add_to_crypt_list(&path.iter().map(|s| s.as_ref()).collect::<Vec<_>>())?,
+            .add_to_crypt_list(&paths.iter().map(|s| s.as_ref()).collect::<Vec<_>>())?,
         SubCommand::Set { field, value } => field.set(repo, value)?,
     }
     Ok(())

@@ -11,6 +11,7 @@ git-se set key 123456   # set password as `123456`
 git-se add file.txt     # mark `file.txt` as need-to-be-crypted
 git-se e                # encrypt current repo with all marked files
 git-se d                # decrypt current repo
+git-se d 'src/*'        # decrypt all encrypted files in `src` folder
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {
@@ -40,9 +41,15 @@ pub enum SubCommand {
     Encrypt,
     /// Decrypt all files with crypt attr and `.enc` extension.
     #[clap(alias("d"))]
-    Decrypt,
+    Decrypt {
+        /// The files or folders to be decrypted, use wildcard matches.
+        path: Option<String>,
+    },
     /// Mark files or folders as need-to-be-crypted.
-    Add { path: Vec<String> },
+    Add {
+        #[clap(required = true)]
+        paths: Vec<String>,
+    },
     /// Set key or other config items.
     Set { field: SetField, value: String },
 }

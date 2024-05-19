@@ -10,7 +10,8 @@ use aes_gcm_siv::{
 };
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
-use die_exit::die;
+use die_exit::{die, DieWith};
+use glob::Pattern;
 use log::{debug, info};
 use tap::Tap;
 
@@ -203,13 +204,40 @@ pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn decrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
+pub async fn decrypt_repo(repo: &'static Repo, path: &Option<String>) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
+
+    // partial decrypt filter
+    let pattern: Option<Pattern> = path.as_ref().map(|x| {
+        glob::Pattern::new(
+            repo.path
+                .join(Path::new(x.as_str()).patch())
+                .to_string_lossy()
+                .as_ref()
+                .tap(|x| println!("Decrypting with pattern: {}", x.green())),
+        )
+        .die_with(|e| format!("Invalid pattern: {e}"))
+    });
+    let decrypt_path_filter: Box<dyn Fn(&PathBuf) -> bool> = if path.is_some() {
+        Box::new(|path: &PathBuf| -> bool {
+            // SAFETY: pattern is always Some in this case
+            unsafe {
+                pattern
+                    .as_ref()
+                    .unwrap_unchecked()
+                    .matches(path.to_string_lossy().as_ref())
+            }
+        })
+    } else {
+        Box::new(|_: &PathBuf| -> bool { true })
+    };
+
     let decrypt_futures = repo
         .ls_files_absolute_with_given_patterns(&[dot_pattern.as_str()])?
         .into_iter()
         .filter(|x| x.is_file())
+        .filter(decrypt_path_filter)
         .map(|f| decrypt_file(f, repo))
         .map(tokio::task::spawn)
         .collect::<Vec<_>>();

@@ -28,6 +28,10 @@ There are several different ways to install it, you can choose **any** of them.
   ```sh
   cargo +nightly install git-simple-encrypt
   ```
+  or [cargo-binstall](https://github.com/cargo-bins/cargo-binstall):
+  ```sh
+  cargo binstall git-simple-encrypt
+  ```
 
 ## Usage
 
@@ -36,8 +40,11 @@ git-se set key 123456       # Set the password to `123456`.
 git-se add file.txt         # Add `file.txt` to the need-to-be-encrypted list.
 git-se add mydir            # Add `mydir` to the need-to-be-encrypted list.
 git-se e                    # Encrypt files in list in the current repository.
-git-se d                    # Decrypt...
+git-se d                    # Decrypt all files with extension `.enc`, `.zst.enc`.
+git-se d 'src/*'            # Decrypt all encrypted files in `src` folder.
 ```
+
+Type `git-se -h` and `git-se [subcommand] -h` to get more information.
 
 ## Caution
 
@@ -56,3 +63,8 @@ graph TD;
 
 - If zstd compression has the opposite effect, skip compression.
 - Decrypt all files with extension `.enc`, `.zst.enc`.
+
+## TODO
+
+- [ ] zstd effect checking
+- [x] partial decrypt
