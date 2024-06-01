@@ -38,9 +38,6 @@ tokio = { version = "1.37.0", features = [
 toml = "0.8.12"
 zstd = "0.13.1"
 
-[target.'cfg(not(target_os = "windows"))'.dependencies]
-openssl = { version = "0.10", features = ["vendored"] }
-
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 libz-sys = { version = "1.1.16", features = ["static"] }
 

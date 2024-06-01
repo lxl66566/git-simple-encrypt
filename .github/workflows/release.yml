@@ -76,17 +76,18 @@ jobs:
       - run: sudo apt install musl-tools
         if: startsWith(matrix.os, 'ubuntu')
 
-      - name: Install openssl on ubuntu
+      - name: Install openssl on ubuntu if needed
         if: startsWith(matrix.os, 'ubuntu')
-        run: grep -q 'openssl' 'Cargo.lock' && sudo apt install pkg-config libssl-dev
-
-      - name: Install openssl on macos
+        run: grep -q 'openssl' 'Cargo.lock' && sudo apt install pkg-config libssl-dev || true
+      - name: Install openssl on macos if needed
         if: startsWith(matrix.os, 'macos')
-        run: grep -q 'openssl' 'Cargo.lock' && brew install openssl
-
-      # - name: Install openssl on windows
-      #   if: startsWith(matrix.os, 'windows')
-      #   run: choco install openssl
+        run: grep -q 'openssl' 'Cargo.lock' && brew install openssl || true
+      # - name: Set Perl environment variables
+      #   if: runner.os == 'Windows'
+      #   run: |
+      #     # choco install openssl strawberryperl
+      #     echo "PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      #     echo "OPENSSL_SRC_PERL=$((where.exe perl)[0])" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: Build and Upload
         uses: taiki-e/upload-rust-binary-action@v1
