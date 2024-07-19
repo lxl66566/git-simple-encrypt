@@ -228,13 +228,10 @@ pub async fn decrypt_repo(repo: &'static Repo, path: &Option<String>) -> anyhow:
     });
     let decrypt_path_filter: Box<dyn Fn(&PathBuf) -> bool> = if path.is_some() {
         Box::new(|path: &PathBuf| -> bool {
-            // SAFETY: pattern is always Some in this case
-            unsafe {
-                pattern
-                    .as_ref()
-                    .unwrap_unchecked()
-                    .matches(path.to_string_lossy().as_ref())
-            }
+            pattern
+                .as_ref()
+                .expect("path must be Some in this case")
+                .matches(path.to_string_lossy().as_ref())
         })
     } else {
         Box::new(|_: &PathBuf| -> bool { true })

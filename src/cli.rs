@@ -2,12 +2,13 @@ use std::path::PathBuf;
 
 use assert2::assert;
 use clap::{Parser, Subcommand};
+use log::warn;
 
-use crate::repo::{GitCommand, Repo};
+use crate::repo::Repo;
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
-git-se set key 123456   # set password as `123456`
+git-se p                # set password
 git-se add file.txt     # mark `file.txt` as need-to-be-crypted
 git-se e                # encrypt current repo with all marked files
 git-se d                # decrypt current repo
@@ -52,6 +53,9 @@ pub enum SubCommand {
     },
     /// Set key or other config items.
     Set { field: SetField, value: String },
+    /// Set password interactively.
+    #[clap(alias("p"))]
+    Pwd,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, enum_tools::EnumTools)]
@@ -67,7 +71,9 @@ pub enum SetField {
 impl SetField {
     pub fn set(&self, repo: &mut Repo, value: &str) -> anyhow::Result<()> {
         match self {
-            Self::key => repo.set_config(self.as_str(), value)?,
+            Self::key => {
+                warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
+            }
             Self::enable_zstd => {
                 assert!(
                     ["true", "false", "1", "0"].contains(&value),

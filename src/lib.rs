@@ -1,7 +1,6 @@
 #![feature(lazy_cell)]
 #![feature(vec_pop_if)]
 #![feature(let_chains)]
-#![feature(absolute_path)]
 #![warn(clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
@@ -37,6 +36,7 @@ pub fn run(cli: &Cli) -> Result<()> {
                 .conf
                 .add_to_crypt_list(&paths.iter().map(|s| s.as_ref()).collect::<Vec<_>>())?,
             SubCommand::Set { field, value } => field.set(repo, value)?,
+            SubCommand::Pwd => repo.set_key_interactive()?,
         }
         anyhow::Ok::<()>(())
     })

@@ -8,13 +8,13 @@ use assert2::assert;
 #[cfg(any(test, debug_assertions))]
 use colored::Colorize;
 use die_exit::Die;
-use log::debug;
+use log::{debug, info};
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
 use crate::{
     config::{Config, CONFIG_FILE},
-    utils::PathToAbsolute,
+    utils::{prompt_password, PathToAbsolute},
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -96,6 +96,14 @@ impl Repo {
             }
             hash_result_slice_cut.into()
         })
+    }
+
+    /// set the key interactively
+    pub fn set_key_interactive(&self) -> Result<()> {
+        let key = prompt_password("Please input your key: ")?;
+        self.set_config("key", &key)?;
+        info!("Set key: `{}`", key);
+        Ok(())
     }
 }
 
