@@ -2,9 +2,13 @@ use std::path::PathBuf;
 
 use assert2::assert;
 use clap::{Parser, Subcommand};
+use config_file2::StoreConfigFile;
 use log::warn;
 
-use crate::repo::Repo;
+use crate::{
+    config::CONFIG_FILE_NAME,
+    repo::{GitCommand, Repo},
+};
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
@@ -73,6 +77,7 @@ impl SetField {
         match self {
             Self::key => {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
+                repo.set_config(self.as_str(), value)?;
             }
             Self::enable_zstd => {
                 assert!(
@@ -91,7 +96,7 @@ impl SetField {
         };
         println!("`{}` set to `{}`", self.as_str(), value);
         if self != &Self::key {
-            repo.conf.save()?;
+            repo.conf.store(CONFIG_FILE_NAME)?;
         }
         Ok(())
     }

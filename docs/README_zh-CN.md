@@ -36,7 +36,7 @@
 ## 使用
 
 ```sh
-git-se set key 123456   # 设置密码为 `123456`
+git-se p                # 设置密码
 git-se add file.txt     # 将 `file.txt` 添加到加密列表
 git-se add mydir        # 将 `mydir` 添加到加密列表
 git-se e                # 加密当前仓库所有列表内的文件

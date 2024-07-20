@@ -1,5 +1,5 @@
-#![feature(lazy_cell)]
 #![feature(vec_pop_if)]
+#![feature(lazy_cell)]
 #![feature(let_chains)]
 #![warn(clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]

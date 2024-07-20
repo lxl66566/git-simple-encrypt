@@ -43,6 +43,7 @@ impl<T: AsRef<Path>> PathToUnixStyle for T {
 /// tracking https://github.com/rust-lang/git2-rs/issues/1048
 #[allow(unused)]
 pub trait Git2Patch {
+    /// remove prefix "./" if it exists
     fn patch(&self) -> PathBuf;
 }
 impl<T: AsRef<Path>> Git2Patch for T {

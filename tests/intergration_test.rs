@@ -1,6 +1,3 @@
-#![crate_type = "proc-macro"]
-extern crate proc_macro;
-
 use std::{
     path::PathBuf,
     process::{Command, Output},
@@ -25,6 +22,7 @@ fn test() -> anyhow::Result<()> {
     };
     macro_rules! run {
         ($cmd:expr) => {
+            std::env::set_current_dir(temp_dir).unwrap();
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
@@ -112,6 +110,7 @@ fn test_reencrypt() -> anyhow::Result<()> {
     };
     macro_rules! run {
         ($cmd:expr) => {
+            std::env::set_current_dir(temp_dir).unwrap();
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
@@ -186,6 +185,7 @@ fn test_many_files() -> anyhow::Result<()> {
     };
     macro_rules! run {
         ($cmd:expr) => {
+            std::env::set_current_dir(temp_dir).unwrap();
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),
@@ -240,6 +240,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     };
     macro_rules! run {
         ($cmd:expr) => {
+            std::env::set_current_dir(temp_dir).unwrap();
             run(&Cli {
                 command: $cmd,
                 repo: temp_dir.to_path_buf(),

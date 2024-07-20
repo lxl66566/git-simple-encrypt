@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Context;
+use assert2::assert;
 use colored::Colorize;
-use die_exit::{die, Die};
-use same_file::is_same_file;
+use config_file2::StoreConfigFile;
+use log::{debug, info, warn};
+use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -11,20 +12,25 @@ use crate::{
     utils::{Git2Patch, PathToAbsolute},
 };
 
-pub const CONFIG_FILE: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
+pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    pub path: PathBuf,
+    /// **absolute path** of the repo
+    #[serde(skip)]
+    repo_path: PathBuf,
+    /// whether to use zstd
     pub use_zstd: bool,
+    /// zstd compression level (1-22).
     pub zstd_level: u8,
+    /// list of files (patterns) to encrypt
     pub crypt_list: Vec<String>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            path: PathBuf::from(CONFIG_FILE),
+            repo_path: PathBuf::from(".").absolute(),
             use_zstd: true,
             zstd_level: 15,
             crypt_list: vec![],
@@ -33,55 +39,30 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn with_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.path = path.as_ref().to_path_buf();
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        debug_assert!(path.is_absolute());
+        Self::default().with_repo_path(path)
+    }
+    pub fn with_repo_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.repo_path = path.into();
         self
     }
-    pub fn default_with_path(path: impl AsRef<Path>) -> Self {
-        Self::default().with_path(path)
+    /// The absolute path of the config file.
+    pub fn config_path(&self) -> PathBuf {
+        self.repo_path.join(CONFIG_FILE_NAME)
     }
-    pub fn load(&self) -> anyhow::Result<Self> {
-        Self::load_from(&self.path)
-    }
-    pub fn load_from(path: impl AsRef<Path>) -> anyhow::Result<Self> {
-        let path = path.as_ref();
-        let content = std::fs::read_to_string(path).with_context(|| {
-            format!("Warning: config not found in `{}`", path.display()).yellow()
-        })?;
-        Ok(toml::from_str(&content)?)
-    }
-    pub fn save(&mut self) -> anyhow::Result<()> {
-        self.crypt_list.dedup();
-        let content = toml::to_string_pretty(self)?;
-        std::fs::write(&self.path, content)?;
-        Ok(())
-    }
-    fn _load_or_create_inner(path: impl AsRef<Path>, loaded: anyhow::Result<Self>) -> Self {
-        loaded.unwrap_or_else(|e| {
-            eprintln!("{e}{}", ", use default config...".yellow());
-            let mut config = Self::default_with_path(path);
-            config
-                .save()
-                .unwrap_or_else(|e| die!("Failed to save config file: {}", e));
-            config
-        })
-    }
-    pub fn load_or_create(&self) -> Self {
-        Self::_load_or_create_inner(&self.path, self.load())
-    }
-    pub fn load_or_create_from(path: impl AsRef<Path>) -> Self {
-        Self::_load_or_create_inner(&path, Self::load_from(&path))
-    }
-    pub fn add_to_crypt_list_one(&mut self, path: &str) {
-        let p = Path::new(path).patch();
-        assert2::assert!(
-            !p.is_absolute(),
-            "Error: `{:?}`. Please use relative path.",
-            p
-        );
-        assert2::assert!(
+    /// Add one path to crypt list
+    ///
+    /// path: relative path to a file or dir.
+    pub fn add_one_file_to_crypt_list(&mut self, path: &str) {
+        // path is the relative path to the current dir (or absolute path)
+        let path = Path::new(path);
+        debug!("add_one_file_to_crypt_list: {:?}", path);
+        assert!(
             ![ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION].contains(
-                &p.extension()
+                &path
+                    .extension()
                     .unwrap_or_default()
                     .to_str()
                     .unwrap_or_default()
@@ -90,40 +71,38 @@ impl Config {
             ENCRYPTED_EXTENSION,
             COMPRESSED_EXTENSION
         );
-        let joined_path = self
-            .path
-            .parent()
-            .expect("parent dir of config file must exist")
-            .join(path);
-        debug_assert!(
-            joined_path.is_absolute(),
-            "internal error: joined path not absolute, please open an issue to report."
+        assert!(path.exists(), "file not exist: {:?}", path);
+
+        // path is the relative path to the repo
+        let path_relative_to_repo = diff_paths(path.absolute(), &self.repo_path)
+            .unwrap_or_else(|| path.to_path_buf())
+            .patch();
+        debug!("path diff: {:?} to {:?}", path.absolute(), self.repo_path);
+        assert!(
+            !path_relative_to_repo.is_absolute(),
+            "get absolute path `{:?}`, please use relative path instead",
+            path_relative_to_repo
         );
-        assert2::assert!(joined_path.exists(), "file not exist: {:?}", joined_path);
-        assert2::assert!(
-            !is_same_file(&joined_path, self.path.as_path())
-                .die("unexpected error happend in comparing same_file "),
-            "Cannot add config file to encrypt list."
+        info!(
+            "Add to crypt list: `{}`",
+            format!("{:?}", path_relative_to_repo).green()
         );
-        println!(
-            "Add to crypt list: {}",
-            format!("{:?}", joined_path.absolute()).green()
+        self.crypt_list.push(
+            (path_relative_to_repo.to_string_lossy() + if path.is_dir() { "/**" } else { "" })
+                .into(),
         );
-        self.crypt_list
-            .push(path.to_string() + if joined_path.is_dir() { "/**" } else { "" });
 
         // check extension
-        if joined_path.is_dir() {
-            if let Ok(glob_result) = glob::glob(joined_path.join("**/*").to_string_lossy().as_ref())
-            {
+        if path.is_dir() {
+            if let Ok(glob_result) = glob::glob(path.join("**").to_string_lossy().as_ref()) {
                 glob_result.filter_map(|p| p.ok()).for_each(|p| {
                     if let Some(ext) = p.extension().and_then(|ext| ext.to_str())
                         && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
                     {
-                        eprintln!(
+                        warn!(
                             "{}",
                             format!(
-                                "Warning: adding dir that contains file with no-good extension: {:?}",
+                                "adding dir that contains file with no-good extension: {:?}",
                                 p
                             )
                             .yellow()
@@ -134,49 +113,45 @@ impl Config {
         }
     }
     pub fn add_to_crypt_list(&mut self, paths: &[&str]) -> anyhow::Result<()> {
-        paths.iter().for_each(|x| self.add_to_crypt_list_one(x));
-        self.save()
+        paths
+            .iter()
+            .for_each(|x| self.add_one_file_to_crypt_list(x));
+        self.store(CONFIG_FILE_NAME).map_err(|e| anyhow::anyhow!(e))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
+    use std::{assert, fs};
 
     use anyhow::Ok;
+    use config_file2::LoadConfigFile;
     use temp_testdir::TempDir;
 
     use super::*;
 
-    #[test]
-    fn test_save_load() -> anyhow::Result<()> {
-        let temp_dir = TempDir::default();
-        let file_path = temp_dir.join("test");
-        let mut config = Config::default_with_path(&file_path);
-        config.save()?;
-        assert!(file_path.exists());
-        let config_load = Config::load_from(file_path);
-        assert!(config_load.is_ok());
-        Ok(())
+    fn init_logger() {
+        _ = env_logger::builder()
+            .filter_level(log::LevelFilter::Debug)
+            .format_target(false)
+            .format_timestamp(None)
+            .try_init();
     }
 
     #[test]
-    fn test() -> anyhow::Result<()> {
+    fn test_add_one_file_to_crypt_list() -> anyhow::Result<()> {
+        init_logger();
         let temp_dir = TempDir::default();
-        let file_path = temp_dir.join("test");
-        assert!(!&file_path.exists());
-        let mut config = Config::load_or_create_from(&file_path);
-        assert!(config.zstd_level == Config::default().zstd_level);
-        assert!(&file_path.exists());
+        let file_path = temp_dir.join("test.toml");
+        let mut config = Config::load_or_default(file_path)?.with_repo_path(&*temp_dir);
 
-        fs::create_dir(temp_dir.join("123"))?;
-        config.add_to_crypt_list_one("123");
-        config.save()?;
-
-        let config = Config::default_with_path(&file_path).load()?;
+        let path_to_add = temp_dir.join("testdir");
+        fs::create_dir(&path_to_add)?;
+        config.add_one_file_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref());
+        println!("{:?}", config.crypt_list.first());
         assert!(
             config.crypt_list[0].ends_with("/**"),
-            "needs to be dir pattern: {}",
+            "needs to be dir pattern: `{}`",
             config.crypt_list[0]
         );
         Ok(())
@@ -185,19 +160,21 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_add_enc_file() {
+        init_logger();
         let temp_dir = TempDir::default();
         std::fs::File::create(temp_dir.join("test.enc")).unwrap();
         let file_path = temp_dir.join("test");
-        let mut config = Config::load_or_create_from(file_path);
-        config.add_to_crypt_list_one("test.enc");
+        let mut config = Config::new(file_path);
+        config.add_one_file_to_crypt_list("test.enc");
     }
 
     #[test]
     #[should_panic]
     fn test_add_config_file() {
+        init_logger();
         let temp_dir = TempDir::default();
         let file_path = temp_dir.join("config.toml");
-        let mut config = Config::load_or_create_from(file_path);
-        config.add_to_crypt_list_one("config.toml");
+        let mut config = Config::load_or_default(file_path).unwrap();
+        config.add_one_file_to_crypt_list("config.toml");
     }
 }

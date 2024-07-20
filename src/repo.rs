@@ -7,13 +7,14 @@ use anyhow::{anyhow, Result};
 use assert2::assert;
 #[cfg(any(test, debug_assertions))]
 use colored::Colorize;
+use config_file2::LoadConfigFile;
 use die_exit::Die;
-use log::{debug, info};
+use log::{debug, info, warn};
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
 use crate::{
-    config::{Config, CONFIG_FILE},
+    config::{Config, CONFIG_FILE_NAME},
     utils::{prompt_password, PathToAbsolute},
 };
 
@@ -22,6 +23,7 @@ pub const GIT_CONFIG_PREFIX: &str =
 
 #[derive(Debug, Clone, Default)]
 pub struct Repo {
+    /// The absolute path of the opened repo.
     pub path: PathBuf,
     pub conf: Config,
     pub key_sha: OnceLock<Box<[u8]>>,
@@ -30,20 +32,35 @@ pub struct Repo {
 impl Repo {
     /// open a repo. The [`path`] of repo will be processed to absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut path = path.as_ref().to_path_buf().absolute();
-        assert!(path.exists(), "Repo not found: {}", path.display());
-        assert!(path.is_dir(), "Not a directory: {}", path.display());
-        if path
+        let mut repo_path = path.as_ref().to_path_buf().absolute();
+        assert!(
+            repo_path.exists(),
+            "Repo not found: {}",
+            repo_path.display()
+        );
+        assert!(
+            repo_path.is_dir(),
+            "Not a directory: {}",
+            repo_path.display()
+        );
+        if repo_path
             .file_name()
             .ok_or_else(|| anyhow!("Filename not found"))?
             == ".git"
         {
-            path.pop();
+            repo_path.pop();
         }
-        println!("Open repo: {}", path.display());
-        let conf = Config::load_or_create_from(path.join(CONFIG_FILE));
+        info!("Open repo: {}", repo_path.display());
+        let config_file_path = repo_path.join(CONFIG_FILE_NAME);
+        if !config_file_path.exists() {
+            warn!(
+                "Config file not found: `{}`, using default instead...",
+                config_file_path.display()
+            );
+        }
+        let conf = Config::load_or_default(config_file_path)?;
         Ok(Self {
-            path,
+            path: repo_path,
             conf,
             key_sha: OnceLock::new(),
         })
