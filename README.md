@@ -64,6 +64,10 @@ graph TD;
 - If zstd compression has the opposite effect, skip compression.
 - Decrypt all files with extension `.enc`, `.zst.enc`.
 
+## Develop
+
+- for testing, please use `cargo test -- --test-threads=1`
+
 ## TODO
 
 - [ ] zstd effect checking

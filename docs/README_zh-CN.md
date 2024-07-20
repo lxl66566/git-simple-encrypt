@@ -64,6 +64,10 @@ graph TD;
 - 如果 zstd 压缩后具有反效果，则跳过压缩。
 - 解密时对所有 `.enc`, `.zst.enc` 进行解密。
 
+## 贡献
+
+- 测试需要使用单线程：`cargo test -- --test-threads=1` （原因是会用到 `std::env::current_dir`）
+
 ## TODO
 
 - [ ] zstd effect checking

@@ -86,7 +86,7 @@ impl Repo {
     }
     pub fn get_key(&self) -> String {
         self.get_config("key")
-            .die("Key not found, please exec `git-se set key <KEY>` first.")
+            .die("Key not found, please exec `git-se p` first.")
     }
 
     /// returns the first 16 bytes of sha3-224 of the key.

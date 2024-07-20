@@ -83,8 +83,9 @@ impl Config {
             "get absolute path `{:?}`, please use relative path instead",
             path_relative_to_repo
         );
+        // there's no need to use ``, the output path has ""
         info!(
-            "Add to crypt list: `{}`",
+            "Add to crypt list: {}",
             format!("{:?}", path_relative_to_repo).green()
         );
         self.crypt_list.push(
