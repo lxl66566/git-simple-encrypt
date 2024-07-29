@@ -250,9 +250,9 @@ dependencies = [
 
 [[package]]
 name = "config-file2"
-version = "0.3.1"
+version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b9b7ecbc4eb96201d15a97c58b5a49c02a9378895d094bd3c4f6c6e6eb7a611"
+checksum = "3484e7f30a878294028bd275339732eb6854da636852a608589ea0c134b56a6c"
 dependencies = [
  "serde",
  "thiserror",
