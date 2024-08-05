@@ -37,7 +37,7 @@ tokio = { version = "1.39.2", features = [
   "rt-multi-thread",
   "fs",
 ] }
-toml = "0.8.16"
+toml = "0.8.19"
 zstd = "0.13.2"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
