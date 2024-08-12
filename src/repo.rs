@@ -149,10 +149,14 @@ impl GitCommand for Repo {
         Ok(())
     }
     fn run_with_output(&self, args: &[&str]) -> Result<String> {
-        let output = std::process::Command::new("git")
-            .current_dir(&self.path)
-            .args(args)
-            .output()?;
+        let mut cmd = std::process::Command::new("git");
+
+        // we need to check English output in test
+        if cfg!(test) {
+            cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
+        }
+
+        let output = cmd.current_dir(&self.path).args(args).output()?;
         if !output.status.success() {
             return Err(anyhow!(
                 "Git command failed: {}",
@@ -173,7 +177,7 @@ impl GitCommand for Repo {
             return Ok(vec![]);
         }
         let files = output_processed
-            .split(|c| c == '\0')
+            .split('\0')
             .map(|s| s.to_string())
             .collect();
         debug!("ls-files: {:?}", files);
