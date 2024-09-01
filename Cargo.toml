@@ -28,7 +28,7 @@ num_cpus = "1.16.0"
 pathdiff = "0.2.1"
 regex = "1.10.6"
 same-file = "1.0.6"
-serde = { version = "1.0.204", features = ["derive"] }
+serde = { version = "1.0.209", features = ["derive"] }
 sha3 = "0.10.8"
 tap = "1.0.1"
 tokio = { version = "1.39.2", features = [
