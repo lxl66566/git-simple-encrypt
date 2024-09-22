@@ -6,6 +6,7 @@ use anyhow::Result;
 use assert2::assert;
 pub use pathutils::*;
 
+/// Format a byte array into a hex string
 #[cfg(any(test, debug_assertions))]
 pub fn format_hex(value: &[u8]) -> String {
     use std::fmt::Write;

@@ -19,6 +19,8 @@ impl FromBytes for PathBuf {
         Self::from(str::from_utf8(b).unwrap())
     }
 }
+
+/// Append an extension to the path and return a new PathBuf.
 pub trait PathAppendExt {
     fn append_ext(self, ext: &str) -> PathBuf;
 }
@@ -27,6 +29,8 @@ impl PathAppendExt for PathBuf {
         self.tap_mut(|p| p.as_mut_os_string().push(format!(".{ext}")))
     }
 }
+
+/// Convert path to unix style, replace `\` to `/`.
 #[allow(unused)]
 pub trait PathToUnixStyle {
     fn to_unix_style(&self) -> PathBuf;
