@@ -10,10 +10,14 @@ use aes_gcm_siv::{
 };
 use anyhow::{anyhow, Context, Result};
 use colored::Colorize;
+use copy_metadata::copy_metadata;
 use die_exit::{die, DieWith};
 use glob::Pattern;
 use log::{debug, info};
+use sha3::{Digest, Sha3_224};
 use tap::Tap;
+
+extern crate test;
 
 #[cfg(any(test, debug_assertions))]
 use crate::utils::format_hex;
@@ -25,6 +29,15 @@ use crate::{
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
 pub static ENCRYPTED_EXTENSION: &str = "enc";
 pub static COMPRESSED_EXTENSION: &str = "zst";
+
+pub fn calculate_key_sha(key: String) -> Vec<u8> {
+    let mut hasher = Sha3_224::default();
+    hasher.update(key);
+    let hash_result = hasher.finalize();
+    let hash_result_slice = hash_result.as_slice();
+    let hash_result_slice_cut = &hash_result_slice[..16];
+    hash_result_slice_cut.to_vec()
+}
 
 pub fn encrypt(key: &[u8], text: Box<[u8]>) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
     let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
@@ -116,7 +129,8 @@ fn try_decompress(bytes: Box<[u8]>, path: PathBuf) -> anyhow::Result<(Vec<u8>, P
 /// encrypt file, and unlink it.
 pub async fn encrypt_file(
     file: impl AsRef<Path> + Send + Sync,
-    repo: &'static Repo,
+    key: &'static [u8],
+    zstd_level: u8,
 ) -> anyhow::Result<PathBuf> {
     let file = file.as_ref();
     debug!("encrypt_file accept: {:?}", file);
@@ -140,13 +154,13 @@ pub async fn encrypt_file(
         .with_context(|| format!("{:?}", file))?;
 
     let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
-        let (compressed, new_file) =
-            try_compress(bytes.into_boxed_slice(), new_file, repo.conf.zstd_level)?;
-        encrypt_change_path(repo.get_key_sha(), compressed.into_boxed_slice(), new_file)
+        let (compressed, new_file) = try_compress(bytes.into_boxed_slice(), new_file, zstd_level)?;
+        encrypt_change_path(key, compressed.into_boxed_slice(), new_file)
     })
     .await??;
 
     tokio::fs::write(&new_file, encrypted).await?;
+    copy_metadata(&file, &new_file)?;
     tokio::fs::remove_file(file).await?;
     debug!("Encrypted filename: {:?}", new_file);
     Ok(new_file)
@@ -155,7 +169,7 @@ pub async fn encrypt_file(
 /// decrypt file, and unlink it.
 pub async fn decrypt_file(
     file: impl AsRef<Path> + Send + Sync,
-    repo: &'static Repo,
+    key: &'static [u8],
 ) -> anyhow::Result<PathBuf> {
     println!(
         "Decrypting file: {}",
@@ -168,12 +182,13 @@ pub async fn decrypt_file(
 
     let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
         let (decrypted, new_file) =
-            try_decrypt_change_path(repo.get_key_sha(), bytes.into_boxed_slice(), new_file)?;
+            try_decrypt_change_path(&key, bytes.into_boxed_slice(), new_file)?;
         try_decompress(decrypted.into_boxed_slice(), new_file)
     })
     .await??;
 
     tokio::fs::write(&new_file, decompressed).await?;
+    copy_metadata(&file, &new_file)?;
     tokio::fs::remove_file(&file).await?;
     debug!("Decrypted filename: {:?}", new_file);
     Ok(new_file)
@@ -196,7 +211,7 @@ pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
             &patterns.iter().map(|x| x as &str).collect::<Vec<&str>>(),
         )?
         .into_iter()
-        .map(|f| encrypt_file(f, repo))
+        .map(|f| encrypt_file(f, repo.get_key_sha(), repo.conf.zstd_level))
         .map(tokio::task::spawn)
         .collect::<Vec<_>>();
     for ret in encrypt_futures {
@@ -242,7 +257,7 @@ pub async fn decrypt_repo(repo: &'static Repo, path: &Option<String>) -> anyhow:
         .into_iter()
         .filter(|x| x.is_file())
         .filter(decrypt_path_filter)
-        .map(|f| decrypt_file(f, repo))
+        .map(|f| decrypt_file(f, &repo.get_key_sha()))
         .map(tokio::task::spawn)
         .collect::<Vec<_>>();
     for ret in decrypt_futures {
@@ -258,11 +273,13 @@ pub async fn decrypt_repo(repo: &'static Repo, path: &Option<String>) -> anyhow:
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
     use anyhow::Result;
+    use rand::{Rng, SeedableRng};
+    use test::Bencher;
 
     use super::*;
-
+    use crate::config::Config;
     #[test]
     fn test_encrypt_decrypt() -> Result<()> {
         let key = b"602bdc204140db0a";
@@ -271,6 +288,52 @@ mod test {
         assert_ne!(content.to_vec(), encrypted_content);
         let decrypted_content = decrypt(key, encrypted_content.into()).unwrap();
         assert_eq!(content.to_vec(), decrypted_content);
+        Ok(())
+    }
+
+    // region bench
+
+    const FILE_SIZE: usize = 100;
+
+    fn random_vec() -> Vec<u8> {
+        let mut rng =
+            rand::rngs::SmallRng::from_seed([0, 1].repeat(16).as_slice().try_into().unwrap());
+        let mut v = Vec::with_capacity(FILE_SIZE);
+        for _ in 0..FILE_SIZE {
+            v.push(rng.gen::<u8>());
+        }
+        v
+    }
+
+    #[bench]
+    fn bench_encrypt(b: &mut Bencher) -> Result<()> {
+        let key = &calculate_key_sha("602bdc204140db0a".to_owned());
+        let random_vec = random_vec();
+        b.iter(move || {
+            test::black_box(encrypt(key, random_vec.clone().into_boxed_slice()).unwrap());
+        });
+        Ok(())
+    }
+
+    #[bench]
+    fn bench_encrypt_file(b: &mut Bencher) -> Result<()> {
+        let key = calculate_key_sha("602bdc204140db0a".to_owned());
+        let key_static = Box::leak(Box::new(key.clone())).as_slice();
+        let random_vec = random_vec();
+        let tempfile = tempfile::NamedTempFile::new().unwrap();
+        let temp_path = tempfile.path();
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        b.iter(move || {
+            std::fs::write(&temp_path, random_vec.as_slice()).unwrap();
+            test::black_box(rt.block_on(async move {
+                encrypt_file(&temp_path, key_static, Config::default().zstd_level)
+                    .await
+                    .unwrap()
+            }));
+        });
         Ok(())
     }
 }

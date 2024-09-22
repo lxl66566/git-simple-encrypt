@@ -1,5 +1,6 @@
 #![feature(vec_pop_if)]
 #![feature(let_chains)]
+#![feature(test)]
 #![warn(clippy::nursery, clippy::cargo, clippy::pedantic)]
 #![allow(clippy::multiple_crate_versions)]
 

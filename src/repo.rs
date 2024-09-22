@@ -10,11 +10,11 @@ use colored::Colorize;
 use config_file2::LoadConfigFile;
 use die_exit::Die;
 use log::{debug, info, warn};
-use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
 use crate::{
     config::{Config, CONFIG_FILE_NAME},
+    crypt::calculate_key_sha,
     utils::{prompt_password, PathToAbsolute},
 };
 
@@ -97,21 +97,14 @@ impl Repo {
             let key = self.get_key();
             #[cfg(any(test, debug_assertions))]
             println!("Key: {}", key.green());
-            let mut hasher = Sha3_224::default();
-            hasher.update(key);
-            let hash_result = hasher.finalize();
+            let hash_result = calculate_key_sha(key);
             let hash_result_slice = hash_result.as_slice();
-            let hash_result_slice_cut = &hash_result_slice[..16];
             #[cfg(any(test, debug_assertions))]
             {
                 use crate::utils::format_hex;
-                println!("Hash result: {}", format_hex(hash_result_slice).green());
-                println!(
-                    "Hash Cut result: {}",
-                    format_hex(hash_result_slice_cut).green()
-                );
+                println!("Hash Cut result: {}", format_hex(hash_result_slice).green());
             }
-            hash_result_slice_cut.into()
+            hash_result_slice.into()
         })
     }
 
@@ -206,7 +199,7 @@ impl GitCommand for Repo {
 mod tests {
     use std::{assert, fs};
 
-    use temp_testdir::TempDir;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -221,7 +214,7 @@ mod tests {
 
     #[test]
     fn test_repo_gitcommand() -> Result<()> {
-        let temp_dir = TempDir::default();
+        let temp_dir = TempDir::new()?.into_path();
         let repo = Repo::open(&temp_dir)?;
         repo.run(&["init"])?;
         assert!(temp_dir.join(".git").is_dir());
