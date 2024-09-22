@@ -53,6 +53,10 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: "sccache"
     steps:
       - uses: actions/checkout@v4
 
@@ -72,6 +76,9 @@ jobs:
         with:
           toolchain: nightly
           override: true
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.5
 
       - run: sudo apt install musl-tools
         if: startsWith(matrix.os, 'ubuntu')

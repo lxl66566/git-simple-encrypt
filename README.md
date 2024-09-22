@@ -51,6 +51,7 @@ Type `git-se -h` and `git-se [subcommand] -h` to get more information.
 - `git add -A` is automatically executed when encrypting, so make sure that `.gitignore` is handled properly.
 - Do not add files with `.zst`, `.enc` suffixes and folders containing them to the encrypted list.
 - To delete file/dir from encrypt list, edit `git_simple_encrypt.toml`.
+- encrypt/decrypt will keep the file metadata unchanged (unix permission and timestamp).
 
 ## Algorithm
 
