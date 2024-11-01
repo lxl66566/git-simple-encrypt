@@ -32,7 +32,7 @@ same-file = "1.0.6"
 serde = { version = "1.0.210", features = ["derive"] }
 sha3 = "0.10.8"
 tap = "1.0.1"
-tokio = { version = "1.40.0", features = [
+tokio = { version = "1.41.0", features = [
   "macros",
   "rt",
   "rt-multi-thread",
