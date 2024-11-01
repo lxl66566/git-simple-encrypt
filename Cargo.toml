@@ -15,7 +15,7 @@ keywords = ["git", "encryption"]
 aes-gcm-siv = "0.11.1"
 anyhow = "1.0.89"
 assert2 = "0.3.15"
-clap = { version = "4.5.19", features = ["derive"] }
+clap = { version = "4.5.20", features = ["derive"] }
 colored = "2.1.0"
 config-file2 = "0.3.2"
 const-str = "0.5.7"
