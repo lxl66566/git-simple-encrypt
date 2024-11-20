@@ -171,7 +171,7 @@ impl GitCommand for Repo {
         }
         let files = output_processed
             .split('\0')
-            .map(|s| s.to_string())
+            .map(std::string::ToString::to_string)
             .collect();
         debug!("ls-files: {:?}", files);
         Ok(files)
@@ -219,7 +219,7 @@ mod tests {
         repo.run(&["init"])?;
         assert!(temp_dir.join(".git").is_dir());
         let temp = repo.ls_files(&[])?;
-        assert!(temp.is_empty(), "repo not empty: {:?}", temp);
+        assert!(temp.is_empty(), "repo not empty: {temp:?}");
         fs::File::create(temp_dir.join("test.txt"))?;
         repo.add_all()?;
         assert!(repo

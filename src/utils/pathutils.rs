@@ -20,7 +20,7 @@ impl FromBytes for PathBuf {
     }
 }
 
-/// Append an extension to the path and return a new PathBuf.
+/// Append an extension to the path and return a new `PathBuf`.
 pub trait PathAppendExt {
     fn append_ext(self, ext: &str) -> PathBuf;
 }
@@ -44,7 +44,7 @@ impl<T: AsRef<Path>> PathToUnixStyle for T {
     }
 }
 
-/// tracking https://github.com/rust-lang/git2-rs/issues/1048
+/// tracking <https://github.com/rust-lang/git2-rs/issues/1048>
 #[allow(unused)]
 pub trait Git2Patch {
     /// remove prefix "./" if it exists

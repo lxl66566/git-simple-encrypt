@@ -18,7 +18,7 @@ pub fn format_hex(value: &[u8]) -> String {
 
 /// Prompt the user for a password
 pub fn prompt_password(prompt: &str) -> Result<String> {
-    print!("{}", prompt);
+    print!("{prompt}");
     std::io::stdout().flush()?;
     let mut password = String::new();
     std::io::stdin().read_line(&mut password)?;

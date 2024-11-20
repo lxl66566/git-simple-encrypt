@@ -86,7 +86,7 @@ impl Config {
         // there's no need to use ``, the output path has ""
         info!(
             "Add to crypt list: {}",
-            format!("{:?}", path_relative_to_repo).green()
+            format!("{path_relative_to_repo:?}").green()
         );
         self.crypt_list.push(
             (path_relative_to_repo.to_string_lossy() + if path.is_dir() { "/**" } else { "" })
@@ -96,18 +96,17 @@ impl Config {
         // check extension
         if path.is_dir() {
             if let Ok(glob_result) = glob::glob(path.join("**").to_string_lossy().as_ref()) {
-                glob_result.filter_map(|p| p.ok()).for_each(|p| {
+                glob_result.filter_map(std::result::Result::ok).for_each(|p| {
                     if let Some(ext) = p.extension().and_then(|ext| ext.to_str())
                         && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
                     {
                         warn!(
                             "{}",
                             format!(
-                                "adding dir that contains file with no-good extension: {:?}",
-                                p
+                                "adding dir that contains file with no-good extension: {p:?}"
                             )
                             .yellow()
-                        )
+                        );
                     }
                 });
             }
@@ -127,21 +126,29 @@ mod tests {
 
     use anyhow::Ok;
     use config_file2::LoadConfigFile;
+    use log::LevelFilter;
     use tempfile::TempDir;
 
     use super::*;
 
-    fn init_logger() {
-        _ = env_logger::builder()
-            .filter_level(log::LevelFilter::Debug)
-            .format_target(false)
-            .format_timestamp(None)
+    #[inline]
+    pub fn log_init() {
+        log_init_with_default_level(LevelFilter::Info);
+    }
+
+    #[inline]
+    pub fn log_init_with_default_level(level: LevelFilter) {
+        _ = pretty_env_logger::formatted_builder()
+            .filter_level(level)
+            .format_timestamp_millis()
+            .filter_module("j4rs", LevelFilter::Info)
+            .parse_default_env()
             .try_init();
     }
 
     #[test]
     fn test_add_one_file_to_crypt_list() -> anyhow::Result<()> {
-        init_logger();
+        log_init();
         let temp_dir = TempDir::new()?.into_path();
         let file_path = temp_dir.join("test.toml");
         let mut config = Config::load_or_default(file_path)?.with_repo_path(&*temp_dir);
@@ -161,7 +168,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_add_enc_file() {
-        init_logger();
+        log_init();
         let temp_dir = TempDir::new().unwrap().into_path();
         std::fs::File::create(temp_dir.join("test.enc")).unwrap();
         let file_path = temp_dir.join("test");
@@ -172,7 +179,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_add_config_file() {
-        init_logger();
+        log_init();
         let temp_dir = TempDir::new().unwrap().into_path();
         let file_path = temp_dir.join("config.toml");
         let mut config = Config::load_or_default(file_path).unwrap();

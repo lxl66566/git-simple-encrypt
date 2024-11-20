@@ -35,7 +35,7 @@ fn bench_init() -> TempDir {
 }
 
 fn test_init() -> TempDir {
-    _ = env_logger::try_init();
+    _ = pretty_env_logger::try_init();
     bench_init()
 }
 

@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use assert2::assert;
 use clap::{Parser, Subcommand};
 use config_file2::StoreConfigFile;
 use log::{info, warn};
@@ -111,7 +110,7 @@ fn validate_zstd_level(value: &str) -> Result<u8, String> {
     if (1..=22_u8).contains(&value) {
         Ok(value)
     } else {
-        Err(format!("value should be 1-22"))
+        Err("value should be 1-22".to_string())
     }
 }
 

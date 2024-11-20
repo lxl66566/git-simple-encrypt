@@ -1,5 +1,4 @@
 use std::{
-    ops::Deref,
     path::{Path, PathBuf},
     sync::LazyLock as Lazy,
 };
@@ -23,7 +22,7 @@ extern crate test;
 use crate::utils::format_hex;
 use crate::{
     repo::{GitCommand, Repo},
-    utils::pathutils::*,
+    utils::pathutils::{Git2Patch, PathAppendExt},
 };
 
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
@@ -41,7 +40,7 @@ pub fn calculate_key_sha(key: String) -> Vec<u8> {
 
 pub fn encrypt(key: &[u8], text: Box<[u8]>) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
     let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
-    let encrypted = cipher.encrypt(NONCE.deref(), text.as_ref())?;
+    let encrypted = cipher.encrypt(*NONCE, text.as_ref())?;
 
     #[cfg(any(test, debug_assertions))]
     println!("Encrypted data: {}", format_hex(&encrypted).green());
@@ -51,7 +50,7 @@ pub fn encrypt(key: &[u8], text: Box<[u8]>) -> std::result::Result<Vec<u8>, aes_
 
 pub fn decrypt(key: &[u8], text: Box<[u8]>) -> std::result::Result<Vec<u8>, aes_gcm_siv::Error> {
     let cipher = Aes128GcmSiv::new_from_slice(key).expect("cipher key length error.");
-    let plaintext = cipher.decrypt(NONCE.deref(), text.as_ref())?;
+    let plaintext = cipher.decrypt(*NONCE, text.as_ref())?;
     Ok(plaintext)
 }
 
@@ -93,7 +92,7 @@ pub fn try_decrypt_change_path(
 /// not change bytes and path.
 fn try_compress(bytes: Box<[u8]>, path: PathBuf, level: u8) -> anyhow::Result<(Vec<u8>, PathBuf)> {
     let compressed =
-        zstd::stream::encode_all(bytes.as_ref(), level as i32).map_err(|e| anyhow!(e))?;
+        zstd::stream::encode_all(bytes.as_ref(), i32::from(level)).map_err(|e| anyhow!(e))?;
 
     #[cfg(any(test, debug_assertions))]
     println!("Compressed data: {}", format_hex(&compressed).green());
@@ -141,17 +140,16 @@ pub async fn encrypt_file(
         info!(
             "{}",
             format!(
-                "Warning: file has been encrypted, do not encrypt: {:?}",
-                file
+                "Warning: file has been encrypted, do not encrypt: {file:?}"
             )
             .yellow()
         );
         return Ok(new_file);
     }
-    println!("Encrypting file: {}", format!("{:?}", file).green());
+    println!("Encrypting file: {}", format!("{file:?}").green());
     let bytes = tokio::fs::read(file)
         .await
-        .with_context(|| format!("{:?}", file))?;
+        .with_context(|| format!("{file:?}"))?;
 
     let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
         let (compressed, new_file) = try_compress(bytes.into_boxed_slice(), new_file, zstd_level)?;
@@ -160,7 +158,7 @@ pub async fn encrypt_file(
     .await??;
 
     tokio::fs::write(&new_file, encrypted).await?;
-    copy_metadata(&file, &new_file)?;
+    copy_metadata(file, &new_file)?;
     tokio::fs::remove_file(file).await?;
     debug!("Encrypted filename: {:?}", new_file);
     Ok(new_file)
@@ -182,7 +180,7 @@ pub async fn decrypt_file(
 
     let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
         let (decrypted, new_file) =
-            try_decrypt_change_path(&key, bytes.into_boxed_slice(), new_file)?;
+            try_decrypt_change_path(key, bytes.into_boxed_slice(), new_file)?;
         try_decompress(decrypted.into_boxed_slice(), new_file)
     })
     .await??;
@@ -197,7 +195,7 @@ pub async fn decrypt_file(
 /// Encrypt all repo.
 ///
 /// 1. add all (for the `ls-files` operation)
-/// 2. encrypt_file
+/// 2. `encrypt_file`
 /// 3. add all
 pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
@@ -218,8 +216,8 @@ pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
         if let Err(err) = ret.await? {
             eprintln!(
                 "{}",
-                format!("warning: failed to encrypt file: {}", err).yellow()
-            )
+                format!("warning: failed to encrypt file: {err}").yellow()
+            );
         }
     }
     repo.add_all()?;
@@ -257,15 +255,15 @@ pub async fn decrypt_repo(repo: &'static Repo, path: &Option<String>) -> anyhow:
         .into_iter()
         .filter(|x| x.is_file())
         .filter(decrypt_path_filter)
-        .map(|f| decrypt_file(f, &repo.get_key_sha()))
+        .map(|f| decrypt_file(f, repo.get_key_sha()))
         .map(tokio::task::spawn)
         .collect::<Vec<_>>();
     for ret in decrypt_futures {
         if let Err(err) = ret.await? {
             eprintln!(
                 "{}",
-                format!("warning: failed to decrypt file: {}", err).yellow()
-            )
+                format!("warning: failed to decrypt file: {err}").yellow()
+            );
         }
     }
     repo.add_all()?;
@@ -318,7 +316,7 @@ mod tests {
     #[bench]
     fn bench_encrypt_file(b: &mut Bencher) -> Result<()> {
         let key = calculate_key_sha("602bdc204140db0a".to_owned());
-        let key_static = Box::leak(Box::new(key.clone())).as_slice();
+        let key_static = Box::leak(Box::new(key)).as_slice();
         let random_vec = random_vec();
         let tempfile = tempfile::NamedTempFile::new().unwrap();
         let temp_path = tempfile.path();
@@ -327,7 +325,7 @@ mod tests {
             .enable_all()
             .build()?;
         b.iter(move || {
-            std::fs::write(&temp_path, random_vec.as_slice()).unwrap();
+            std::fs::write(temp_path, random_vec.as_slice()).unwrap();
             test::black_box(rt.block_on(async move {
                 encrypt_file(&temp_path, key_static, Config::default().zstd_level)
                     .await

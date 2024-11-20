@@ -34,7 +34,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             SubCommand::Decrypt { path } => decrypt_repo(repo, path).await?,
             SubCommand::Add { paths } => repo
                 .conf
-                .add_to_crypt_list(&paths.iter().map(|s| s.as_ref()).collect::<Vec<_>>())?,
+                .add_to_crypt_list(&paths.iter().map(std::convert::AsRef::as_ref).collect::<Vec<_>>())?,
             SubCommand::Set { field } => field.set(repo)?,
             SubCommand::Pwd => repo.set_key_interactive()?,
         }

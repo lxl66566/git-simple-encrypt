@@ -1,11 +1,23 @@
 use clap::Parser;
 use git_simple_encrypt::{run, Cli};
+use log::LevelFilter;
 
 fn main() -> anyhow::Result<()> {
-    env_logger::builder()
-        .filter_level(log::LevelFilter::Info)
-        .format_target(false)
-        .format_timestamp(None)
-        .init();
+    log_init();
     run(&Cli::parse())
+}
+
+#[inline]
+pub fn log_init() {
+    log_init_with_default_level(LevelFilter::Info);
+}
+
+#[inline]
+pub fn log_init_with_default_level(level: LevelFilter) {
+    _ = pretty_env_logger::formatted_builder()
+        .filter_level(level)
+        .format_timestamp_millis()
+        .filter_module("j4rs", LevelFilter::Info)
+        .parse_default_env()
+        .try_init();
 }
