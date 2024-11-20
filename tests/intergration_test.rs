@@ -23,8 +23,9 @@ fn bench_init() -> TempDir {
     // Set key
     run(
         SubCommand::Set {
-            field: SetField::key,
-            value: "12345678910987654321".to_owned(),
+            field: SetField::Key {
+                value: "12345678910987654321".to_owned(),
+            },
         },
         pwd.path(),
     )

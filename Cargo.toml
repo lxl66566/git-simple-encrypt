@@ -13,9 +13,9 @@ keywords = ["git", "encryption"]
 
 [dependencies]
 aes-gcm-siv = "0.11.1"
-anyhow = "1.0.92"
+anyhow = "1.0.93"
 assert2 = "0.3.15"
-clap = { version = "4.5.20", features = ["derive"] }
+clap = { version = "4.5.21", features = ["derive"] }
 colored = "2.1.0"
 config-file2 = "0.3.2"
 const-str = "0.5.7"
@@ -27,18 +27,15 @@ glob = "0.3.1"
 log = "0.4.22"
 num_cpus = "1.16.0"
 pathdiff = "0.2.2"
-regex = "1.11.0"
-same-file = "1.0.6"
-serde = { version = "1.0.214", features = ["derive"] }
+serde = { version = "1.0.215", features = ["derive"] }
 sha3 = "0.10.8"
 tap = "1.0.1"
-tokio = { version = "1.41.0", features = [
+tokio = { version = "1.41.1", features = [
   "macros",
   "rt",
   "rt-multi-thread",
   "fs",
 ] }
-toml = "0.8.19"
 zstd = "0.13.2"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]

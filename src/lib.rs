@@ -35,7 +35,7 @@ pub fn run(cli: &Cli) -> Result<()> {
             SubCommand::Add { paths } => repo
                 .conf
                 .add_to_crypt_list(&paths.iter().map(|s| s.as_ref()).collect::<Vec<_>>())?,
-            SubCommand::Set { field, value } => field.set(repo, value)?,
+            SubCommand::Set { field } => field.set(repo)?,
             SubCommand::Pwd => repo.set_key_interactive()?,
         }
         anyhow::Ok::<()>(())

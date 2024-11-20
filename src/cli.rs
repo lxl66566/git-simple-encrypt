@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use assert2::assert;
 use clap::{Parser, Subcommand};
 use config_file2::StoreConfigFile;
-use log::warn;
+use log::{info, warn};
 
 use crate::{
     config::CONFIG_FILE_NAME,
@@ -56,48 +56,69 @@ pub enum SubCommand {
         paths: Vec<String>,
     },
     /// Set key or other config items.
-    Set { field: SetField, value: String },
+    Set {
+        #[clap(subcommand)]
+        field: SetField,
+    },
     /// Set password interactively.
     #[clap(alias("p"))]
     Pwd,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, enum_tools::EnumTools)]
-#[enum_tools(as_str, from_str)]
-#[repr(i8)]
-#[allow(non_camel_case_types)]
+#[derive(Debug, Subcommand, Clone)]
 pub enum SetField {
-    key,
-    enable_zstd,
-    zstd_level,
+    /// Set key
+    Key { value: String },
+    /// Set zstd compression level
+    ZstdLevel {
+        #[clap(value_parser = validate_zstd_level)]
+        value: u8,
+    },
+    /// Set zstd compression enable or not
+    EnableZstd {
+        #[clap(value_parser = validate_bool)]
+        value: bool,
+    },
 }
 
 impl SetField {
-    pub fn set(&self, repo: &mut Repo, value: &str) -> anyhow::Result<()> {
+    pub fn set(&self, repo: &mut Repo) -> anyhow::Result<()> {
         match self {
-            Self::key => {
+            Self::Key { value } => {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
-                repo.set_config(self.as_str(), value)?;
+                repo.set_config("key", value)?;
+                info!("key set to `{}`", value);
             }
-            Self::enable_zstd => {
-                assert!(
-                    ["true", "false", "1", "0"].contains(&value),
-                    "value should be `true`, `false`, `1` or `0`"
-                );
-                repo.conf.use_zstd = value == "true" || value == "1";
+            Self::EnableZstd { value } => {
+                repo.conf.use_zstd = *value;
+                info!("zstd compression enabled: {}", value);
             }
-            Self::zstd_level => {
-                let temp = value.parse::<u8>();
-                assert!(temp.is_ok(), "value should be a number");
-                let temp = temp.unwrap();
-                assert!((1..=22).contains(&temp), "value should be 1-22");
-                repo.conf.zstd_level = temp;
+            Self::ZstdLevel { value } => {
+                repo.conf.zstd_level = *value;
+                info!("zstd compression level set to {}", value);
             }
         };
-        println!("`{}` set to `{}`", self.as_str(), value);
-        if self != &Self::key {
-            repo.conf.store(CONFIG_FILE_NAME)?;
-        }
+        repo.conf.store(CONFIG_FILE_NAME)?;
+
         Ok(())
+    }
+}
+
+fn validate_zstd_level(value: &str) -> Result<u8, String> {
+    let value = value
+        .parse::<u8>()
+        .map_err(|_| "value should be a number")?;
+    if (1..=22_u8).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("value should be 1-22"))
+    }
+}
+
+fn validate_bool(value: &str) -> Result<bool, String> {
+    match value {
+        "true" | "1" => Ok(true),
+        "false" | "0" => Ok(false),
+        _ => Err("value should be `true`, `false`, `1` or `0`".into()),
     }
 }
