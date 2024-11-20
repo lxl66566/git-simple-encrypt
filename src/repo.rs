@@ -15,7 +15,7 @@ use tap::Tap;
 use crate::{
     config::{Config, CONFIG_FILE_NAME},
     crypt::calculate_key_sha,
-    utils::{prompt_password, PathToAbsolute},
+    utils::prompt_password,
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -32,7 +32,8 @@ pub struct Repo {
 impl Repo {
     /// open a repo. The [`path`] of repo will be processed to absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut repo_path = path.as_ref().to_path_buf().absolute();
+        let mut repo_path = path.as_ref().to_path_buf();
+        assert!(repo_path.is_absolute(), "given path must be absolute");
         assert!(
             repo_path.exists(),
             "Repo not found: {}",
@@ -54,11 +55,12 @@ impl Repo {
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
         if !config_file_path.exists() {
             warn!(
-                "Config file not found: `{}`, using default instead...",
+                "Config file not found: `{}`, using default config instead...",
                 config_file_path.display()
             );
         }
-        let conf = Config::load_or_default(config_file_path)?;
+        let mut conf = Config::load_or_default(config_file_path)?;
+        conf.repo_path.clone_from(&repo_path);
         Ok(Self {
             path: repo_path,
             conf,
@@ -69,7 +71,7 @@ impl Repo {
         &self.path
     }
     pub fn to_absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
-        self.path.join(path.as_ref()).absolute()
+        self.path.join(path.as_ref())
     }
     pub fn ls_files_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<String>> {
         let files_zip: Result<Vec<Vec<String>>> =
@@ -199,15 +201,16 @@ impl GitCommand for Repo {
 mod tests {
     use std::{assert, fs};
 
+    use path_absolutize::Absolutize;
     use tempfile::TempDir;
 
     use super::*;
 
     #[test]
     fn test_repo_open() -> Result<()> {
-        let repo = Repo::open(".")?;
+        let repo = Repo::open(Path::new(".").absolutize().unwrap())?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
-        let repo = Repo::open("./.git")?;
+        let repo = Repo::open(Path::new("./.git").absolutize().unwrap())?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
         Ok(())
     }
@@ -232,8 +235,14 @@ mod tests {
                 .into_iter()
                 .find(|x| x.file_name().unwrap() == "test.txt")
                 .unwrap()
-                .absolute(),
-            temp_dir.join("test.txt").absolute()
+                .absolutize()
+                .expect("path absolutize failed")
+                .as_ref(),
+            temp_dir
+                .join("test.txt")
+                .absolutize()
+                .expect("path absolutize failed")
+                .as_ref()
         );
 
         repo.set_config("test", "test1")?;

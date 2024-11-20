@@ -9,7 +9,10 @@ fn main() -> anyhow::Result<()> {
 
 #[inline]
 pub fn log_init() {
+    #[cfg(not(debug_assertions))]
     log_init_with_default_level(LevelFilter::Info);
+    #[cfg(debug_assertions)]
+    log_init_with_default_level(LevelFilter::Debug);
 }
 
 #[inline]

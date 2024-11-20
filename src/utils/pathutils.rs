@@ -71,20 +71,6 @@ impl<T: AsRef<Path>> Git2Patch for T {
     }
 }
 
-pub trait PathToAbsolute {
-    fn absolute(&self) -> PathBuf;
-}
-impl<T: AsRef<Path>> PathToAbsolute for T {
-    fn absolute(&self) -> PathBuf {
-        std::path::absolute(self).unwrap_or_else(|e| {
-            panic!(
-                "Error in getting absolute path of `{:?}`: {e}",
-                self.as_ref()
-            )
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

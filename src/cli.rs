@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use config_file2::StoreConfigFile;
@@ -22,10 +22,17 @@ pub struct Cli {
     /// Encrypt, Decrypt and Add
     #[command(subcommand)]
     pub command: SubCommand,
-    /// Repository path
+    /// Repository path, allow both relative and absolute path.
     #[arg(short, long, global = true)]
-    #[clap(default_value = ".")]
+    #[clap(value_parser = repo_path_parser, default_value = ".")]
     pub repo: PathBuf,
+}
+
+fn repo_path_parser(path: &str) -> Result<PathBuf, String> {
+    match path_absolutize::Absolutize::absolutize(Path::new(path)) {
+        Ok(p) => Ok(p.into_owned()),
+        Err(e) => Err(format!("{e}")),
+    }
 }
 
 impl Default for Cli {
@@ -81,6 +88,12 @@ pub enum SetField {
 }
 
 impl SetField {
+    /// Set a field.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fail to exec git command or fail to write to config
+    /// file.
     pub fn set(&self, repo: &mut Repo) -> anyhow::Result<()> {
         match self {
             Self::Key { value } => {

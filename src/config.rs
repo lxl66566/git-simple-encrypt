@@ -4,21 +4,23 @@ use assert2::assert;
 use colored::Colorize;
 use config_file2::StoreConfigFile;
 use log::{debug, info, warn};
+use path_absolutize::Absolutize;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     crypt::{COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION},
-    utils::{Git2Patch, PathToAbsolute},
+    utils::Git2Patch,
 };
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
-    /// **absolute path** of the repo
+    /// **absolute path** of the repo. This config item will not be ser/de from
+    /// file; instead, it will be set by cli param.
     #[serde(skip)]
-    repo_path: PathBuf,
+    pub repo_path: PathBuf,
     /// whether to use zstd
     pub use_zstd: bool,
     /// zstd compression level (1-22).
@@ -30,7 +32,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            repo_path: PathBuf::from(".").absolute(),
+            repo_path: PathBuf::from("."),
             use_zstd: true,
             zstd_level: 15,
             crypt_list: vec![],
@@ -41,7 +43,6 @@ impl Default for Config {
 impl Config {
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        debug_assert!(path.is_absolute());
         Self::default().with_repo_path(path)
     }
     pub fn with_repo_path(mut self, path: impl Into<PathBuf>) -> Self {
@@ -57,7 +58,10 @@ impl Config {
     /// path: relative path to a file or dir.
     pub fn add_one_file_to_crypt_list(&mut self, path: &str) {
         // path is the relative path to the current dir (or absolute path)
-        let path = Path::new(path);
+        let path = Path::new(path)
+            .absolutize()
+            .expect("path absolutize failed");
+
         debug!("add_one_file_to_crypt_list: {:?}", path);
         assert!(
             ![ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION].contains(
@@ -74,10 +78,10 @@ impl Config {
         assert!(path.exists(), "file not exist: {:?}", path);
 
         // path is the relative path to the repo
-        let path_relative_to_repo = diff_paths(path.absolute(), &self.repo_path)
+        let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
             .unwrap_or_else(|| path.to_path_buf())
             .patch();
-        debug!("path diff: {:?} to {:?}", path.absolute(), self.repo_path);
+        debug!("path diff: {:?} to {:?}", path, self.repo_path);
         assert!(
             !path_relative_to_repo.is_absolute(),
             "get absolute path `{:?}`, please use relative path instead",
@@ -96,19 +100,21 @@ impl Config {
         // check extension
         if path.is_dir() {
             if let Ok(glob_result) = glob::glob(path.join("**").to_string_lossy().as_ref()) {
-                glob_result.filter_map(std::result::Result::ok).for_each(|p| {
-                    if let Some(ext) = p.extension().and_then(|ext| ext.to_str())
-                        && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
-                    {
-                        warn!(
-                            "{}",
-                            format!(
-                                "adding dir that contains file with no-good extension: {p:?}"
-                            )
-                            .yellow()
-                        );
-                    }
-                });
+                glob_result
+                    .filter_map(std::result::Result::ok)
+                    .for_each(|p| {
+                        if let Some(ext) = p.extension().and_then(|ext| ext.to_str())
+                            && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
+                        {
+                            warn!(
+                                "{}",
+                                format!(
+                                    "adding dir that contains file with no-good extension: {p:?}"
+                                )
+                                .yellow()
+                            );
+                        }
+                    });
             }
         }
     }
@@ -133,7 +139,10 @@ mod tests {
 
     #[inline]
     pub fn log_init() {
+        #[cfg(not(debug_assertions))]
         log_init_with_default_level(LevelFilter::Info);
+        #[cfg(debug_assertions)]
+        log_init_with_default_level(LevelFilter::Debug);
     }
 
     #[inline]
