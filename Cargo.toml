@@ -35,7 +35,7 @@ tokio             = { version = "1.43.0", features = ["macros", "rt", "rt-multi-
 zstd              = "0.13.2"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-libz-sys = { version = "1.1.20", features = ["static"] }
+libz-sys = { version = "1.1.21", features = ["static"] }
 
 [dev-dependencies]
 rand     = { version = "0.8.5", features = ["small_rng"] }
