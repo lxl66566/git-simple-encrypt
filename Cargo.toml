@@ -2,44 +2,44 @@
 authors     = ["lxl66566 <lxl66566@gmail.com>"]
 categories  = ["cryptography"]
 description = "Encrypt/decrypt files in git repo using one password"
-edition     = "2021"
+edition     = "2024"
 homepage    = "https://github.com/lxl66566/git-simple-encrypt"
 keywords    = ["git", "encryption"]
 license     = "MIT"
 name        = "git-simple-encrypt"
 readme      = "./README.md"
 repository  = "https://github.com/lxl66566/git-simple-encrypt"
-version     = "1.4.0"
+version     = "1.4.1"
 
 [dependencies]
 aes-gcm-siv       = "0.11.1"
-anyhow            = "1.0.96"
+anyhow            = "1.0.97"
 assert2           = "0.3.15"
-clap              = { version = "4.5.31", features = ["derive"] }
+clap              = { version = "4.5.32", features = ["derive"] }
 colored           = "3.0.0"
 config-file2      = "0.4.0"
-const-str         = "0.5.7"
+const-str         = "0.6.2"
 copy-metadata     = "0.1.0"
 die-exit          = { version = "0.5.0", features = ["red"] }
-enum-tools        = "0.5.3"
-glob              = "0.3.1"
-log               = "0.4.22"
+enum-tools        = "0.5.5"
+glob              = "0.3.2"
+log               = "0.4.26"
 num_cpus          = "1.16.0"
 path-absolutize   = "3.1.1"
 pathdiff          = "0.2.3"
 pretty_env_logger = "0.5.0"
-serde             = { version = "1.0.218", features = ["derive"] }
+serde             = { version = "1.0.219", features = ["derive"] }
 sha3              = "0.10.8"
 tap               = "1.0.1"
-tokio             = { version = "1.43.0", features = ["macros", "rt", "rt-multi-thread", "fs"] }
+tokio             = { version = "1.44.1", features = ["macros", "rt", "rt-multi-thread", "fs"] }
 zstd              = "0.13.3"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
-libz-sys = { version = "1.1.21", features = ["static"] }
+libz-sys = { version = "1.1.22", features = ["static"] }
 
 [dev-dependencies]
-rand     = { version = "0.8.5", features = ["small_rng"] }
-tempfile = "3.14.0"
+rand     = { version = "0.9.0", features = ["small_rng"] }
+tempfile = "3.19.1"
 
 [[bin]]
 name = "git-se"

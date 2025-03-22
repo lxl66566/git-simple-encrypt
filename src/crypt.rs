@@ -139,10 +139,7 @@ pub async fn encrypt_file(
     if file.extension() == Some(ENCRYPTED_EXTENSION.as_ref()) {
         info!(
             "{}",
-            format!(
-                "Warning: file has been encrypted, do not encrypt: {file:?}"
-            )
-            .yellow()
+            format!("Warning: file has been encrypted, do not encrypt: {file:?}").yellow()
         );
         return Ok(new_file);
     }
@@ -171,12 +168,12 @@ pub async fn decrypt_file(
 ) -> anyhow::Result<PathBuf> {
     println!(
         "Decrypting file: {}",
-        format!("{:?}", file.as_ref()).green()
+        format!("{}", file.as_ref().display()).green()
     );
     let new_file = file.as_ref().to_owned();
     let bytes = tokio::fs::read(&file)
         .await
-        .with_context(|| format!("{:?}", file.as_ref()))?;
+        .with_context(|| format!("{}", file.as_ref().display()))?;
 
     let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
         let (decrypted, new_file) =
@@ -224,7 +221,7 @@ pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn decrypt_repo(repo: &'static Repo, path: &Option<String>) -> anyhow::Result<()> {
+pub async fn decrypt_repo(repo: &'static Repo, path: Option<&String>) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
 
@@ -279,14 +276,13 @@ mod tests {
     use super::*;
     use crate::config::Config;
     #[test]
-    fn test_encrypt_decrypt() -> Result<()> {
+    fn test_encrypt_decrypt() {
         let key = b"602bdc204140db0a";
         let content = b"456789";
         let encrypted_content = encrypt(key, Box::new(*content)).unwrap();
         assert_ne!(content.to_vec(), encrypted_content);
         let decrypted_content = decrypt(key, encrypted_content.into()).unwrap();
         assert_eq!(content.to_vec(), decrypted_content);
-        Ok(())
     }
 
     // region bench
@@ -298,19 +294,18 @@ mod tests {
             rand::rngs::SmallRng::from_seed([0, 1].repeat(16).as_slice().try_into().unwrap());
         let mut v = Vec::with_capacity(FILE_SIZE);
         for _ in 0..FILE_SIZE {
-            v.push(rng.gen::<u8>());
+            v.push(rng.random::<u8>());
         }
         v
     }
 
     #[bench]
-    fn bench_encrypt(b: &mut Bencher) -> Result<()> {
+    fn bench_encrypt(b: &mut Bencher) {
         let key = &calculate_key_sha("602bdc204140db0a".to_owned());
         let random_vec = random_vec();
         b.iter(move || {
             test::black_box(encrypt(key, random_vec.clone().into_boxed_slice()).unwrap());
         });
-        Ok(())
     }
 
     #[bench]

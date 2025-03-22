@@ -10,7 +10,7 @@ use std::{
 use anyhow::Ok;
 use colored::Colorize;
 use git_simple_encrypt::{Cli, SetField, SubCommand};
-use rand::{seq::SliceRandom, Rng, SeedableRng};
+use rand::{seq::IndexedRandom as _, Rng, SeedableRng};
 use tap::Tap;
 use tempfile::TempDir;
 use test::Bencher;
@@ -208,7 +208,7 @@ fn test_many_files() -> anyhow::Result<()> {
 
     // Test
     for _ in 1..10 {
-        let file_name = files.choose(&mut rand::thread_rng()).unwrap();
+        let file_name = files.choose(&mut rand::rng()).unwrap();
         println!("Testing file: {}", file_name.display());
         assert_eq!(std::fs::read_to_string(file_name)?, "Hello");
     }
@@ -286,7 +286,7 @@ fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
     let mut random_vec = || {
         let mut v = Vec::with_capacity(FILE_SIZE);
         for _ in 0..FILE_SIZE {
-            v.push(rng.gen::<u8>());
+            v.push(rng.random::<u8>());
         }
         v
     };

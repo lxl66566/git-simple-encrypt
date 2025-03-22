@@ -1,4 +1,3 @@
-#![feature(vec_pop_if)]
 #![feature(let_chains)]
 #![feature(test)]
 #![warn(clippy::nursery, clippy::cargo, clippy::pedantic)]
@@ -18,6 +17,7 @@ use tokio::runtime::Builder;
 
 pub use crate::cli::{Cli, SetField, SubCommand};
 
+#[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 pub fn run(cli: &Cli) -> Result<()> {
     let repo = Repo::open(&cli.repo)?;
     let repo = Box::leak(Box::new(repo));
@@ -31,10 +31,13 @@ pub fn run(cli: &Cli) -> Result<()> {
     rt.block_on(async {
         match &cli.command {
             SubCommand::Encrypt => encrypt_repo(repo).await?,
-            SubCommand::Decrypt { path } => decrypt_repo(repo, path).await?,
-            SubCommand::Add { paths } => repo
-                .conf
-                .add_to_crypt_list(&paths.iter().map(std::convert::AsRef::as_ref).collect::<Vec<_>>())?,
+            SubCommand::Decrypt { path } => decrypt_repo(repo, path.as_ref()).await?,
+            SubCommand::Add { paths } => repo.conf.add_to_crypt_list(
+                &paths
+                    .iter()
+                    .map(std::convert::AsRef::as_ref)
+                    .collect::<Vec<_>>(),
+            )?,
             SubCommand::Set { field } => field.set(repo)?,
             SubCommand::Pwd => repo.set_key_interactive()?,
         }

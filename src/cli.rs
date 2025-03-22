@@ -109,7 +109,7 @@ impl SetField {
                 repo.conf.zstd_level = *value;
                 info!("zstd compression level set to {}", value);
             }
-        };
+        }
         repo.conf.store(CONFIG_FILE_NAME)?;
 
         Ok(())
