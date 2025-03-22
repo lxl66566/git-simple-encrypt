@@ -93,8 +93,8 @@ impl Config {
             format!("{path_relative_to_repo:?}").green()
         );
         self.crypt_list.push(
-            (path_relative_to_repo.to_string_lossy() + if path.is_dir() { "/**" } else { "" })
-                .into(),
+            path_relative_to_repo.to_string_lossy().replace('\\', "/")
+                + if path.is_dir() { "/**" } else { "" },
         );
 
         // check extension
