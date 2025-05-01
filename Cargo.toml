@@ -17,7 +17,7 @@ anyhow            = "1.0.97"
 assert2           = "0.3.15"
 clap              = { version = "4.5.35", features = ["derive"] }
 colored           = "3.0.0"
-config-file2      = "0.4.0"
+config-file2      = "0.4.1"
 const-str         = "0.6.2"
 copy-metadata     = "0.1.0"
 die-exit          = { version = "0.5.0", features = ["red"] }
