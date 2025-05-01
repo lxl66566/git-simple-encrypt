@@ -99,15 +99,15 @@ impl SetField {
             Self::Key { value } => {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
                 repo.set_config("key", value)?;
-                info!("key set to `{}`", value);
+                info!("key set to `{value}`");
             }
             Self::EnableZstd { value } => {
                 repo.conf.use_zstd = *value;
-                info!("zstd compression enabled: {}", value);
+                info!("zstd compression enabled: {value}");
             }
             Self::ZstdLevel { value } => {
                 repo.conf.zstd_level = *value;
-                info!("zstd compression level set to {}", value);
+                info!("zstd compression level set to {value}");
             }
         }
         repo.conf.store(CONFIG_FILE_NAME)?;

@@ -79,7 +79,7 @@ impl Repo {
         Ok(files_zip?.into_iter().flatten().collect())
     }
     pub fn ls_files_absolute_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<PathBuf>> {
-        debug!("ls_files_absolute_with_given_patterns: {:?}", patterns);
+        debug!("ls_files_absolute_with_given_patterns: {patterns:?}");
         let files_zip: Result<Vec<Vec<PathBuf>>> = patterns
             .iter()
             .map(|&x| self.ls_files_absolute(&[x]))
@@ -114,7 +114,7 @@ impl Repo {
     pub fn set_key_interactive(&self) -> Result<()> {
         let key = prompt_password("Please input your key: ")?;
         self.set_config("key", &key)?;
-        info!("Set key: `{}`", key);
+        info!("Set key: `{key}`");
         Ok(())
     }
 }
@@ -175,7 +175,7 @@ impl GitCommand for Repo {
             .split('\0')
             .map(std::string::ToString::to_string)
             .collect();
-        debug!("ls-files: {:?}", files);
+        debug!("ls-files: {files:?}");
         Ok(files)
     }
     /// returns the absolute path of `ls-files`.

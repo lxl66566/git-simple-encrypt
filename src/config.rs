@@ -62,7 +62,7 @@ impl Config {
             .absolutize()
             .expect("path absolutize failed");
 
-        debug!("add_one_file_to_crypt_list: {:?}", path);
+        debug!("add_one_file_to_crypt_list: {}", path.display());
         assert!(
             ![ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION].contains(
                 &path
@@ -81,16 +81,20 @@ impl Config {
         let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
             .unwrap_or_else(|| path.to_path_buf())
             .patch();
-        debug!("path diff: {:?} to {:?}", path, self.repo_path);
+        debug!(
+            "path diff: {} to {}",
+            path.display(),
+            self.repo_path.display()
+        );
         assert!(
             !path_relative_to_repo.is_absolute(),
-            "get absolute path `{:?}`, please use relative path instead",
-            path_relative_to_repo
+            "get absolute path `{}`, please use relative path instead",
+            path_relative_to_repo.display()
         );
         // there's no need to use ``, the output path has ""
         info!(
             "Add to crypt list: {}",
-            format!("{path_relative_to_repo:?}").green()
+            format!("{}", path_relative_to_repo.display()).green()
         );
         self.crypt_list.push(
             path_relative_to_repo.to_string_lossy().replace('\\', "/")
@@ -109,7 +113,8 @@ impl Config {
                             warn!(
                                 "{}",
                                 format!(
-                                    "adding dir that contains file with no-good extension: {p:?}"
+                                    "adding dir that contains file with no-good extension: {}",
+                                    p.display()
                                 )
                                 .yellow()
                             );

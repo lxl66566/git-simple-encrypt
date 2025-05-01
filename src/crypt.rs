@@ -1,18 +1,20 @@
 use std::{
+    fs,
     path::{Path, PathBuf},
     sync::LazyLock as Lazy,
 };
 
 use aes_gcm_siv::{
-    aead::{Aead, KeyInit},
     Aes128GcmSiv, Nonce,
+    aead::{Aead, KeyInit},
 };
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use colored::Colorize;
 use copy_metadata::copy_metadata;
-use die_exit::{die, DieWith};
+use die_exit::{DieWith, die};
 use glob::Pattern;
 use log::{debug, info};
+use rayon::{iter::IntoParallelRefIterator, prelude::*};
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
 
@@ -80,8 +82,8 @@ pub fn try_decrypt_change_path(
         ))
     } else {
         debug!(
-            "Extension of file `{:?}` does not match, do not decrypt",
-            path
+            "Extension of file `{}` does not match, do not decrypt",
+            path.display()
         );
         Ok((text.into_vec(), path))
     }
@@ -101,7 +103,7 @@ fn try_compress(bytes: Box<[u8]>, path: PathBuf, level: u8) -> anyhow::Result<(V
         Ok((
             compressed,
             path.append_ext(COMPRESSED_EXTENSION)
-                .tap(|p| debug!("Compressed to: {:?}", p)),
+                .tap(|p| debug!("Compressed to: {}", p.display())),
         ))
     } else {
         info!("Compressed data size is larger than origin, do not compress.");
@@ -118,51 +120,52 @@ fn try_decompress(bytes: Box<[u8]>, path: PathBuf) -> anyhow::Result<(Vec<u8>, P
         Ok((decompressed, path.with_extension("")))
     } else {
         debug!(
-            "Extension of file `{:?}` does not match, do not decompress",
-            path
+            "Extension of file `{}` does not match, do not decompress",
+            path.display()
         );
         Ok((bytes.into_vec(), path))
     }
 }
 
 /// encrypt file, and unlink it.
-pub async fn encrypt_file(
+pub fn encrypt_file(
     file: impl AsRef<Path> + Send + Sync,
     key: &'static [u8],
     zstd_level: u8,
 ) -> anyhow::Result<PathBuf> {
     let file = file.as_ref();
-    debug!("encrypt_file accept: {:?}", file);
+    debug!("encrypt_file accept: {}", file.display());
     debug_assert!(file.exists());
     debug_assert!(file.is_file());
     let new_file = file.to_owned();
     if file.extension() == Some(ENCRYPTED_EXTENSION.as_ref()) {
         info!(
             "{}",
-            format!("Warning: file has been encrypted, do not encrypt: {file:?}").yellow()
+            format!(
+                "Warning: file has been encrypted, do not encrypt: {}",
+                file.display()
+            )
+            .yellow()
         );
         return Ok(new_file);
     }
-    println!("Encrypting file: {}", format!("{file:?}").green());
-    let bytes = tokio::fs::read(file)
-        .await
-        .with_context(|| format!("{file:?}"))?;
+    println!("Encrypting file: {}", format!("{}", file.display()).green());
+    let bytes = fs::read(file).with_context(|| format!("{}", file.display()))?;
 
-    let (encrypted, new_file) = tokio::task::spawn_blocking(move || {
+    let (encrypted, new_file) = {
         let (compressed, new_file) = try_compress(bytes.into_boxed_slice(), new_file, zstd_level)?;
         encrypt_change_path(key, compressed.into_boxed_slice(), new_file)
-    })
-    .await??;
+    }?;
 
-    tokio::fs::write(&new_file, encrypted).await?;
+    fs::write(&new_file, encrypted)?;
     copy_metadata(file, &new_file)?;
-    tokio::fs::remove_file(file).await?;
-    debug!("Encrypted filename: {:?}", new_file);
+    fs::remove_file(file)?;
+    debug!("Encrypted filename: {}", new_file.display());
     Ok(new_file)
 }
 
 /// decrypt file, and unlink it.
-pub async fn decrypt_file(
+pub fn decrypt_file(
     file: impl AsRef<Path> + Send + Sync,
     key: &'static [u8],
 ) -> anyhow::Result<PathBuf> {
@@ -171,21 +174,18 @@ pub async fn decrypt_file(
         format!("{}", file.as_ref().display()).green()
     );
     let new_file = file.as_ref().to_owned();
-    let bytes = tokio::fs::read(&file)
-        .await
-        .with_context(|| format!("{}", file.as_ref().display()))?;
+    let bytes = fs::read(&file).with_context(|| format!("{}", file.as_ref().display()))?;
 
-    let (decompressed, new_file) = tokio::task::spawn_blocking(move || {
+    let (decompressed, new_file) = {
         let (decrypted, new_file) =
             try_decrypt_change_path(key, bytes.into_boxed_slice(), new_file)?;
         try_decompress(decrypted.into_boxed_slice(), new_file)
-    })
-    .await??;
+    }?;
 
-    tokio::fs::write(&new_file, decompressed).await?;
+    fs::write(&new_file, decompressed)?;
     copy_metadata(&file, &new_file)?;
-    tokio::fs::remove_file(&file).await?;
-    debug!("Decrypted filename: {:?}", new_file);
+    fs::remove_file(&file)?;
+    debug!("Decrypted filename: {}", new_file.display());
     Ok(new_file)
 }
 
@@ -194,34 +194,33 @@ pub async fn decrypt_file(
 /// 1. add all (for the `ls-files` operation)
 /// 2. `encrypt_file`
 /// 3. add all
-pub async fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
+pub fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let patterns = &repo.conf.crypt_list;
     if patterns.is_empty() {
         die!("No file to encrypt, please exec `git-se add <FILE>` first.");
     }
     repo.add_all()?;
-    let encrypt_futures = repo
+    let encrypt_result = repo
         .ls_files_absolute_with_given_patterns(
             &patterns.iter().map(|x| x as &str).collect::<Vec<&str>>(),
         )?
-        .into_iter()
+        .par_iter()
         .map(|f| encrypt_file(f, repo.get_key_sha(), repo.conf.zstd_level))
-        .map(tokio::task::spawn)
         .collect::<Vec<_>>();
-    for ret in encrypt_futures {
-        if let Err(err) = ret.await? {
+    encrypt_result.par_iter().for_each(|ret| {
+        if let Err(err) = ret {
             eprintln!(
                 "{}",
                 format!("warning: failed to encrypt file: {err}").yellow()
             );
         }
-    }
+    });
     repo.add_all()?;
     Ok(())
 }
 
-pub async fn decrypt_repo(repo: &'static Repo, path: Option<&String>) -> anyhow::Result<()> {
+pub fn decrypt_repo(repo: &'static Repo, path: Option<&String>) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
 
@@ -236,40 +235,37 @@ pub async fn decrypt_repo(repo: &'static Repo, path: Option<&String>) -> anyhow:
         )
         .die_with(|e| format!("Invalid pattern: {e}"))
     });
-    let decrypt_path_filter: Box<dyn Fn(&PathBuf) -> bool> = if path.is_some() {
-        Box::new(|path: &PathBuf| -> bool {
-            pattern
-                .as_ref()
-                .expect("path must be Some in this case")
-                .matches(path.to_string_lossy().as_ref())
-        })
-    } else {
-        Box::new(|_: &PathBuf| -> bool { true })
-    };
 
     let decrypt_futures = repo
         .ls_files_absolute_with_given_patterns(&[dot_pattern.as_str()])?
-        .into_iter()
+        .par_iter()
         .filter(|x| x.is_file())
-        .filter(decrypt_path_filter)
+        .filter(|x| {
+            if path.is_some() {
+                pattern
+                    .as_ref()
+                    .expect("path must be Some in this case")
+                    .matches(x.to_string_lossy().as_ref())
+            } else {
+                true
+            }
+        })
         .map(|f| decrypt_file(f, repo.get_key_sha()))
-        .map(tokio::task::spawn)
         .collect::<Vec<_>>();
-    for ret in decrypt_futures {
-        if let Err(err) = ret.await? {
+    decrypt_futures.par_iter().for_each(|ret| {
+        if let Err(err) = ret {
             eprintln!(
                 "{}",
                 format!("warning: failed to decrypt file: {err}").yellow()
             );
         }
-    }
+    });
     repo.add_all()?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use anyhow::Result;
     use rand::{Rng, SeedableRng};
     use test::Bencher;
 
@@ -309,24 +305,18 @@ mod tests {
     }
 
     #[bench]
-    fn bench_encrypt_file(b: &mut Bencher) -> Result<()> {
+    fn bench_encrypt_file(b: &mut Bencher) {
         let key = calculate_key_sha("602bdc204140db0a".to_owned());
         let key_static = Box::leak(Box::new(key)).as_slice();
         let random_vec = random_vec();
         let tempfile = tempfile::NamedTempFile::new().unwrap();
         let temp_path = tempfile.path();
 
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?;
         b.iter(move || {
             std::fs::write(temp_path, random_vec.as_slice()).unwrap();
-            test::black_box(rt.block_on(async move {
-                encrypt_file(&temp_path, key_static, Config::default().zstd_level)
-                    .await
-                    .unwrap()
-            }));
+            test::black_box(
+                encrypt_file(temp_path, key_static, Config::default().zstd_level).unwrap(),
+            );
         });
-        Ok(())
     }
 }
