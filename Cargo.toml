@@ -38,7 +38,7 @@ zstd              = "0.13.3"
 libz-sys = { version = "1.1.22", features = ["static"] }
 
 [dev-dependencies]
-rand     = { version = "0.9.0", features = ["small_rng"] }
+rand     = { version = "0.9.1", features = ["small_rng"] }
 tempfile = "3.19.1"
 
 [[bin]]
