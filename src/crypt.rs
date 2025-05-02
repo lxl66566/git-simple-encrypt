@@ -11,8 +11,7 @@ use aes_gcm_siv::{
 use anyhow::{Context, Result, anyhow};
 use colored::Colorize;
 use copy_metadata::copy_metadata;
-use die_exit::{DieWith, die};
-use glob::Pattern;
+use die_exit::die;
 use log::{debug, info};
 use rayon::{iter::IntoParallelRefIterator, prelude::*};
 use sha3::{Digest, Sha3_224};
@@ -24,7 +23,7 @@ extern crate test;
 use crate::utils::format_hex;
 use crate::{
     repo::{GitCommand, Repo},
-    utils::pathutils::{Git2Patch, PathAppendExt},
+    utils::pathutils::PathAppendExt,
 };
 
 static NONCE: Lazy<&Nonce> = Lazy::new(|| Nonce::from_slice(b"samenonceplz"));
@@ -220,39 +219,28 @@ pub fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn decrypt_repo(repo: &'static Repo, path: Option<&String>) -> anyhow::Result<()> {
+pub fn decrypt_repo(repo: &'static Repo, path: Option<impl AsRef<Path>>) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
-    let dot_pattern = String::from("*.") + ENCRYPTED_EXTENSION;
 
-    // partial decrypt filter
-    let pattern: Option<Pattern> = path.as_ref().map(|x| {
-        glob::Pattern::new(
-            repo.path
-                .join(Path::new(x.as_str()).patch())
-                .to_string_lossy()
-                .as_ref()
-                .tap(|x| println!("Decrypting with pattern: {}", x.green())),
-        )
-        .die_with(|e| format!("Invalid pattern: {e}"))
-    });
-
-    let decrypt_futures = repo
-        .ls_files_absolute_with_given_patterns(&[dot_pattern.as_str()])?
+    let pattern = if let Some(path) = path {
+        let path = path.as_ref();
+        if path.is_dir() {
+            format!("{}/*.{ENCRYPTED_EXTENSION}", path.to_path_buf().display(),)
+        } else {
+            decrypt_file(path, repo.get_key_sha())?;
+            repo.add_all()?;
+            return Ok(());
+        }
+    } else {
+        format!("*.{ENCRYPTED_EXTENSION}")
+    };
+    let decrypt_results = repo
+        .ls_files_absolute_with_given_patterns(&[pattern.as_str()])?
         .par_iter()
         .filter(|x| x.is_file())
-        .filter(|x| {
-            if path.is_some() {
-                pattern
-                    .as_ref()
-                    .expect("path must be Some in this case")
-                    .matches(x.to_string_lossy().as_ref())
-            } else {
-                true
-            }
-        })
         .map(|f| decrypt_file(f, repo.get_key_sha()))
         .collect::<Vec<_>>();
-    decrypt_futures.par_iter().for_each(|ret| {
+    decrypt_results.par_iter().for_each(|ret| {
         if let Err(err) = ret {
             eprintln!(
                 "{}",

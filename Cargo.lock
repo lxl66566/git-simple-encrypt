@@ -392,6 +392,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "fuck-backslash"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e85622f154e07e30c696eac13b064cba35143d3831323adfd8a1cd96e6789c"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -426,7 +432,7 @@ dependencies = [
 
 [[package]]
 name = "git-simple-encrypt"
-version = "2.0.0"
+version = "1.5.0"
 dependencies = [
  "aes-gcm-siv",
  "anyhow",
@@ -438,7 +444,7 @@ dependencies = [
  "copy-metadata",
  "die-exit",
  "enum-tools",
- "glob",
+ "fuck-backslash",
  "libz-sys",
  "log",
  "num_cpus",
@@ -451,14 +457,9 @@ dependencies = [
  "sha3",
  "tap",
  "tempfile",
+ "walkdir",
  "zstd",
 ]
-
-[[package]]
-name = "glob"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8d1add55171497b4705a648c6b583acafb01d58050a51727785f0b2c8e0a2b2"
 
 [[package]]
 name = "hashbrown"
@@ -841,6 +842,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "same-file"
+version = "1.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
+dependencies = [
+ "winapi-util",
+]
+
+[[package]]
 name = "semver"
 version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1042,6 +1052,16 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
+
+[[package]]
+name = "walkdir"
+version = "2.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+dependencies = [
+ "same-file",
+ "winapi-util",
+]
 
 [[package]]
 name = "wasi"

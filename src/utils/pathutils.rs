@@ -30,20 +30,6 @@ impl PathAppendExt for PathBuf {
     }
 }
 
-/// Convert path to unix style, replace `\` to `/`.
-#[allow(unused)]
-pub trait PathToUnixStyle {
-    fn to_unix_style(&self) -> PathBuf;
-}
-impl<T: AsRef<Path>> PathToUnixStyle for T {
-    fn to_unix_style(&self) -> PathBuf {
-        #[cfg(not(unix))]
-        return self.as_ref().to_string_lossy().replace('\\', "/").into();
-        #[cfg(unix)]
-        return self.as_ref().to_path_buf();
-    }
-}
-
 /// tracking <https://github.com/rust-lang/git2-rs/issues/1048>
 #[allow(unused)]
 pub trait Git2Patch {

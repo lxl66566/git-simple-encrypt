@@ -10,7 +10,7 @@ use std::{
 use anyhow::Ok;
 use colored::Colorize;
 use git_simple_encrypt::{Cli, SetField, SubCommand};
-use rand::{seq::IndexedRandom as _, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, seq::IndexedRandom as _};
 use tap::Tap;
 use tempfile::TempDir;
 use test::Bencher;
@@ -48,7 +48,7 @@ fn exec(cmd: &str, pwd: impl AsRef<Path>) -> std::io::Result<Output> {
 fn run(cmd: SubCommand, pwd: impl Into<PathBuf>) -> anyhow::Result<()> {
     let pwd = pwd.into();
     std::env::set_current_dir(&pwd).unwrap();
-    git_simple_encrypt::run(&Cli {
+    git_simple_encrypt::run(Cli {
         command: cmd,
         repo: pwd,
     })?;
@@ -72,9 +72,7 @@ fn test() -> anyhow::Result<()> {
     // Add file
     run(
         SubCommand::Add {
-            paths: ["t1.txt", "t2.txt", "dir"]
-                .map(ToString::to_string)
-                .to_vec(),
+            paths: ["t1.txt", "t2.txt", "dir"].map(PathBuf::from).to_vec(),
         },
         temp_dir,
     )?;
@@ -134,7 +132,7 @@ fn test_reencrypt() -> anyhow::Result<()> {
     // Add file
     run(
         SubCommand::Add {
-            paths: ["t1.txt", "dir"].map(ToString::to_string).to_vec(),
+            paths: ["t1.txt", "dir"].map(PathBuf::from).to_vec(),
         },
         temp_dir,
     )?;
@@ -228,7 +226,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     // Add file
     run(
         SubCommand::Add {
-            paths: ["t1.txt", "dir"].map(ToString::to_string).to_vec(),
+            paths: ["t1.txt", "dir"].map(PathBuf::from).to_vec(),
         },
         temp_dir,
     )?;
@@ -239,7 +237,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     // Partial decrypt
     run(
         SubCommand::Decrypt {
-            path: Some("dir/**".into()),
+            path: Some("dir".into()),
         },
         temp_dir,
     )?;
@@ -296,7 +294,7 @@ fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
 
     run(
         SubCommand::Add {
-            paths: vec![inner_dir.to_string_lossy().to_string()],
+            paths: vec![inner_dir],
         },
         temp_dir,
     )?;

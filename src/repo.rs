@@ -3,17 +3,18 @@ use std::{
     sync::OnceLock,
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use assert2::assert;
 #[cfg(any(test, debug_assertions))]
 use colored::Colorize;
 use config_file2::LoadConfigFile;
 use die_exit::Die;
 use log::{debug, info, warn};
+use path_absolutize::Absolutize;
 use tap::Tap;
 
 use crate::{
-    config::{Config, CONFIG_FILE_NAME},
+    config::{CONFIG_FILE_NAME, Config},
     crypt::calculate_key_sha,
     utils::prompt_password,
 };
@@ -32,7 +33,11 @@ pub struct Repo {
 impl Repo {
     /// open a repo. The [`path`] of repo will be processed to absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut repo_path = path.as_ref().to_path_buf();
+        let mut repo_path = path
+            .as_ref()
+            .absolutize()
+            .expect("path absolutize failed")
+            .to_path_buf();
         assert!(repo_path.is_absolute(), "given path must be absolute");
         assert!(
             repo_path.exists(),
@@ -208,9 +213,9 @@ mod tests {
 
     #[test]
     fn test_repo_open() -> Result<()> {
-        let repo = Repo::open(Path::new(".").absolutize().unwrap())?;
+        let repo = Repo::open(Path::new("."))?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
-        let repo = Repo::open(Path::new("./.git").absolutize().unwrap())?;
+        let repo = Repo::open(Path::new("./.git"))?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
         Ok(())
     }
@@ -225,9 +230,10 @@ mod tests {
         assert!(temp.is_empty(), "repo not empty: {temp:?}");
         fs::File::create(temp_dir.join("test.txt"))?;
         repo.add_all()?;
-        assert!(repo
-            .run_with_output(&["status"])?
-            .contains("Changes to be committed"));
+        assert!(
+            repo.run_with_output(&["status"])?
+                .contains("Changes to be committed")
+        );
         assert!(repo.ls_files(&[]).unwrap().contains(&"test.txt".into()));
         assert_eq!(
             repo.ls_files_absolute(&[])

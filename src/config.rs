@@ -4,9 +4,10 @@ use assert2::assert;
 use colored::Colorize;
 use config_file2::StoreConfigFile;
 use log::{debug, info, warn};
-use path_absolutize::Absolutize;
+use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
+use walkdir::WalkDir;
 
 use crate::{
     crypt::{COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION},
@@ -41,12 +42,15 @@ impl Default for Config {
 }
 
 impl Config {
-    pub fn new(path: impl Into<PathBuf>) -> Self {
-        let path = path.into();
+    pub fn new(path: impl AsRef<Path>) -> Self {
         Self::default().with_repo_path(path)
     }
-    pub fn with_repo_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.repo_path = path.into();
+    pub fn with_repo_path(mut self, path: impl AsRef<Path>) -> Self {
+        self.repo_path = path
+            .as_ref()
+            .absolutize()
+            .expect("path absolutize failed")
+            .to_path_buf();
         self
     }
     /// The absolute path of the config file.
@@ -56,11 +60,9 @@ impl Config {
     /// Add one path to crypt list
     ///
     /// path: relative path to a file or dir.
-    pub fn add_one_file_to_crypt_list(&mut self, path: &str) {
+    pub fn add_one_file_to_crypt_list(&mut self, path: impl AsRef<Path>) {
         // path is the relative path to the current dir (or absolute path)
-        let path = Path::new(path)
-            .absolutize()
-            .expect("path absolutize failed");
+        let path = path.as_ref().absolutize().expect("path absolutize failed");
 
         debug!("add_one_file_to_crypt_list: {}", path.display());
         assert!(
@@ -96,37 +98,35 @@ impl Config {
             "Add to crypt list: {}",
             format!("{}", path_relative_to_repo.display()).green()
         );
-        self.crypt_list.push(
-            path_relative_to_repo.to_string_lossy().replace('\\', "/")
-                + if path.is_dir() { "/**" } else { "" },
-        );
+        self.crypt_list
+            .push(path_relative_to_repo.to_string_lossy().replace('\\', "/"));
 
         // check extension
         if path.is_dir() {
-            if let Ok(glob_result) = glob::glob(path.join("**").to_string_lossy().as_ref()) {
-                glob_result
-                    .filter_map(std::result::Result::ok)
-                    .for_each(|p| {
-                        if let Some(ext) = p.extension().and_then(|ext| ext.to_str())
-                            && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
-                        {
-                            warn!(
-                                "{}",
-                                format!(
-                                    "adding dir that contains file with no-good extension: {}",
-                                    p.display()
-                                )
-                                .yellow()
-                            );
-                        }
-                    });
+            for entry in WalkDir::new(path)
+                .into_iter()
+                .filter_map(std::result::Result::ok)
+            {
+                if let Some(ext) = entry.path().extension().and_then(|ext| ext.to_str())
+                    && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
+                {
+                    warn!(
+                        "{}",
+                        format!(
+                            "adding dir that contains file with no-good extension: {}",
+                            entry.path().display()
+                        )
+                        .yellow()
+                    );
+                }
             }
         }
     }
-    pub fn add_to_crypt_list(&mut self, paths: &[&str]) -> anyhow::Result<()> {
+
+    pub fn add_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {
         paths
             .iter()
-            .for_each(|x| self.add_one_file_to_crypt_list(x));
+            .for_each(|x| self.add_one_file_to_crypt_list(x.as_ref()));
         self.store(CONFIG_FILE_NAME).map_err(|e| anyhow::anyhow!(e))
     }
 }
@@ -170,11 +170,14 @@ mod tests {
         let path_to_add = temp_dir.join("testdir");
         fs::create_dir(&path_to_add)?;
         config.add_one_file_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref());
-        println!("{:?}", config.crypt_list.first());
+        println!("{:?}", config.crypt_list.first().unwrap());
         assert!(
-            config.crypt_list[0].ends_with("/**"),
-            "needs to be dir pattern: `{}`",
-            config.crypt_list[0]
+            config
+                .repo_path
+                .join(config.crypt_list.first().unwrap())
+                .is_dir(),
+            "needs to be dir: {}",
+            config.crypt_list.first().unwrap()
         );
         Ok(())
     }

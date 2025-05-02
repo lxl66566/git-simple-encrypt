@@ -54,12 +54,12 @@ pub enum SubCommand {
     #[clap(alias("d"))]
     Decrypt {
         /// The files or folders to be decrypted, use wildcard matches.
-        path: Option<String>,
+        path: Option<PathBuf>,
     },
     /// Mark files or folders as need-to-be-crypted.
     Add {
         #[clap(required = true)]
-        paths: Vec<String>,
+        paths: Vec<PathBuf>,
     },
     /// Set key or other config items.
     Set {

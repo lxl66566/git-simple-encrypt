@@ -4,7 +4,7 @@ use log::LevelFilter;
 
 fn main() -> anyhow::Result<()> {
     log_init();
-    run(&Cli::parse())
+    run(Cli::parse())
 }
 
 #[inline]
