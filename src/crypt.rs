@@ -11,8 +11,7 @@ use aes_gcm_siv::{
 use anyhow::{Context, Result, anyhow};
 use colored::Colorize;
 use copy_metadata::copy_metadata;
-use die_exit::die;
-use log::{debug, info};
+use log::{debug, info, warn};
 use rayon::{iter::IntoParallelRefIterator, prelude::*};
 use sha3::{Digest, Sha3_224};
 use tap::Tap;
@@ -102,10 +101,13 @@ fn try_compress(bytes: Box<[u8]>, path: PathBuf, level: u8) -> anyhow::Result<(V
         Ok((
             compressed,
             path.append_ext(COMPRESSED_EXTENSION)
-                .tap(|p| debug!("Compressed to: {}", p.display())),
+                .tap(|p| debug!("Compressed to: `{}`", p.display())),
         ))
     } else {
-        info!("Compressed data size is larger than origin, do not compress.");
+        info!(
+            "Compressed data size is larger than origin, do not compress `{}`.",
+            path.display()
+        );
         Ok((bytes.into_vec(), path))
     }
 }
@@ -148,7 +150,10 @@ pub fn encrypt_file(
         );
         return Ok(new_file);
     }
-    println!("Encrypting file: {}", format!("{}", file.display()).green());
+    info!(
+        "Encrypting file: `{}`",
+        format!("{}", file.display()).green()
+    );
     let bytes = fs::read(file).with_context(|| format!("{}", file.display()))?;
 
     let (encrypted, new_file) = {
@@ -168,10 +173,7 @@ pub fn decrypt_file(
     file: impl AsRef<Path> + Send + Sync,
     key: &'static [u8],
 ) -> anyhow::Result<PathBuf> {
-    println!(
-        "Decrypting file: {}",
-        format!("{}", file.as_ref().display()).green()
-    );
+    info!("Decrypting file: {}", file.as_ref().display());
     let new_file = file.as_ref().to_owned();
     let bytes = fs::read(&file).with_context(|| format!("{}", file.as_ref().display()))?;
 
@@ -196,9 +198,10 @@ pub fn decrypt_file(
 pub fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
     assert!(!repo.get_key().is_empty(), "Key must not be empty");
     let patterns = &repo.conf.crypt_list;
-    if patterns.is_empty() {
-        die!("No file to encrypt, please exec `git-se add <FILE>` first.");
-    }
+    assert!(
+        !patterns.is_empty(),
+        "No file to encrypt, please exec `git-se add <FILE>` first."
+    );
     repo.add_all()?;
     let encrypt_result = repo
         .ls_files_absolute_with_given_patterns(
@@ -209,10 +212,7 @@ pub fn encrypt_repo(repo: &'static Repo) -> anyhow::Result<()> {
         .collect::<Vec<_>>();
     encrypt_result.par_iter().for_each(|ret| {
         if let Err(err) = ret {
-            eprintln!(
-                "{}",
-                format!("warning: failed to encrypt file: {err}").yellow()
-            );
+            warn!("warning: failed to encrypt file: {err}");
         }
     });
     repo.add_all()?;
@@ -242,10 +242,7 @@ pub fn decrypt_repo(repo: &'static Repo, path: Option<impl AsRef<Path>>) -> anyh
         .collect::<Vec<_>>();
     decrypt_results.par_iter().for_each(|ret| {
         if let Err(err) = ret {
-            eprintln!(
-                "{}",
-                format!("warning: failed to decrypt file: {err}").yellow()
-            );
+            warn!("warning: failed to decrypt file: {err}");
         }
     });
     repo.add_all()?;

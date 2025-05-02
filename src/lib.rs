@@ -11,7 +11,6 @@ mod utils;
 
 use anyhow::Result;
 use crypt::{decrypt_repo, encrypt_repo};
-use log::debug;
 use repo::Repo;
 
 pub use crate::cli::{Cli, SetField, SubCommand};
@@ -20,8 +19,6 @@ pub use crate::cli::{Cli, SetField, SubCommand};
 pub fn run(cli: Cli) -> Result<()> {
     let repo = Repo::open(&cli.repo)?;
     let repo = Box::leak(Box::new(repo));
-    let num_cpus = num_cpus::get();
-    debug!("using blocking thread size: {}", num_cpus * 2);
     match cli.command {
         SubCommand::Encrypt => encrypt_repo(repo)?,
         SubCommand::Decrypt { path } => decrypt_repo(repo, path)?,
