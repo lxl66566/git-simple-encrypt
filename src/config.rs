@@ -163,7 +163,7 @@ mod tests {
     #[test]
     fn test_add_one_file_to_crypt_list() -> anyhow::Result<()> {
         log_init();
-        let temp_dir = TempDir::new()?.into_path();
+        let temp_dir = TempDir::new()?.keep();
         let file_path = temp_dir.join("test.toml");
         let mut config = Config::load_or_default(file_path)?.with_repo_path(&*temp_dir);
 
@@ -186,7 +186,7 @@ mod tests {
     #[should_panic]
     fn test_add_enc_file() {
         log_init();
-        let temp_dir = TempDir::new().unwrap().into_path();
+        let temp_dir = TempDir::new().unwrap().keep();
         std::fs::File::create(temp_dir.join("test.enc")).unwrap();
         let file_path = temp_dir.join("test");
         let mut config = Config::new(file_path);
@@ -197,7 +197,7 @@ mod tests {
     #[should_panic]
     fn test_add_config_file() {
         log_init();
-        let temp_dir = TempDir::new().unwrap().into_path();
+        let temp_dir = TempDir::new().unwrap().keep();
         let file_path = temp_dir.join("config.toml");
         let mut config = Config::load_or_default(file_path).unwrap();
         config.add_one_file_to_crypt_list("config.toml");

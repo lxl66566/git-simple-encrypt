@@ -14,21 +14,21 @@ version     = "1.5.0"
 [dependencies]
 aes-gcm-siv       = "0.11.1"
 anyhow            = "1.0"
-assert2           = "0.3.15"
+assert2           = "0.3"
 clap              = { version = "4.5", features = ["derive"] }
-colored           = "3.0.0"
+colored           = "3"
 config-file2      = "0.4.1"
-const-str         = "0.6.2"
+const-str         = "0.6"
 copy-metadata     = "0.1.0"
 log               = "0.4"
-path-absolutize   = "3.1.1"
-pathdiff          = "0.2.3"
-pretty_env_logger = "0.5.0"
-rayon             = "1.10.0"
-serde             = { version = "1.0.219", features = ["derive"] }
-sha3              = "0.10.8"
-tap               = "1.0.1"
-walkdir           = "2.5.0"
+path-absolutize   = "3"
+pathdiff          = "0.2"
+pretty_env_logger = "0.5"
+rayon             = "1"
+serde             = { version = "1", features = ["derive"] }
+sha3              = "0.10"
+tap               = "1"
+walkdir           = "2"
 zstd              = "0.13.3"
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
