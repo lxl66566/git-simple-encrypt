@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn test_repo_gitcommand() -> Result<()> {
-        let temp_dir = TempDir::new()?.into_path();
+        let temp_dir = TempDir::new()?.keep();
         let repo = Repo::open(&temp_dir)?;
         repo.run(&["init"])?;
         assert!(temp_dir.join(".git").is_dir());
