@@ -1,0 +1,16 @@
+pull_request_rules:
+  - name: Automatic merge
+    description: Merge when PR passes all branch protection and has label automerge
+    conditions:
+      - label = automerge
+    actions:
+      merge:
+        method: rebase
+  - name: Label Dependabot PRs after successful CI
+    conditions:
+      - author=dependabot[bot]
+      - check-success=test
+    actions:
+      label:
+        add:
+          - automerge
