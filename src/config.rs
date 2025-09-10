@@ -124,9 +124,9 @@ impl Config {
     }
 
     pub fn add_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {
-        paths
-            .iter()
-            .for_each(|x| self.add_one_file_to_crypt_list(x.as_ref()));
+        for x in paths {
+            self.add_one_file_to_crypt_list(x.as_ref());
+        }
         self.store(CONFIG_FILE_NAME).map_err(|e| anyhow::anyhow!(e))
     }
 }
