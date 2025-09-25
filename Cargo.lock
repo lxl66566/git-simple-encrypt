@@ -380,6 +380,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7fd99930f64d146689264c637b5af2f0233a933bef0d8570e2526bf9e083192d"
 
 [[package]]
+name = "fuck-backslash"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4e85622f154e07e30c696eac13b064cba35143d3831323adfd8a1cd96e6789c"
+
+[[package]]
 name = "generic-array"
 version = "0.14.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -424,6 +430,8 @@ dependencies = [
  "config-file2",
  "const-str",
  "copy-metadata",
+ "fuck-backslash",
+ "glob",
  "libz-sys",
  "log",
  "path-absolutize",
@@ -438,6 +446,12 @@ dependencies = [
  "walkdir",
  "zstd",
 ]
+
+[[package]]
+name = "glob"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
 name = "hashbrown"

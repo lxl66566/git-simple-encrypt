@@ -4,7 +4,6 @@ use std::io::Write;
 
 use anyhow::Result;
 use assert2::assert;
-pub use pathutils::*;
 
 /// Format a byte array into a hex string
 #[cfg(any(test, debug_assertions))]
