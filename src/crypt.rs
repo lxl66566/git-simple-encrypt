@@ -70,6 +70,7 @@ pub fn try_decrypt_change_path(
     key: &[u8],
     text: Box<[u8]>,
     path: PathBuf,
+    decompress_if_needed: bool,
 ) -> Result<(Vec<u8>, PathBuf)> {
     if let Some(ext) = path.extension()
         && ext.to_str() == Some(ENCRYPTED_EXTENSION)

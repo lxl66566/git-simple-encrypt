@@ -3,16 +3,14 @@ use std::path::{Path, PathBuf};
 use assert2::assert;
 use colored::Colorize;
 use config_file2::StoreConfigFile;
+use fuck_backslash::FuckBackslash;
 use log::{debug, info, warn};
 use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::{
-    crypt::{COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION},
-    utils::Git2Patch,
-};
+use crate::crypt::{COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION};
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
@@ -60,29 +58,17 @@ impl Config {
     /// Add one path to crypt list
     ///
     /// path: relative path to a file or dir.
-    pub fn add_one_file_to_crypt_list(&mut self, path: impl AsRef<Path>) {
+    pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) {
         // path is the relative path to the current dir (or absolute path)
         let path = path.as_ref().absolutize().expect("path absolutize failed");
 
-        debug!("add_one_file_to_crypt_list: {}", path.display());
-        assert!(
-            ![ENCRYPTED_EXTENSION, COMPRESSED_EXTENSION].contains(
-                &path
-                    .extension()
-                    .unwrap_or_default()
-                    .to_str()
-                    .unwrap_or_default()
-            ),
-            "Cannot add file with extension `{}`, `{}`",
-            ENCRYPTED_EXTENSION,
-            COMPRESSED_EXTENSION
-        );
-        assert!(path.exists(), "file not exist: {:?}", path);
+        debug!("adding path to crypt list: {}", path.display());
+        assert!(path.exists(), "file or dir not exist: {:?}", path);
 
         // path is the relative path to the repo
         let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
             .unwrap_or_else(|| path.to_path_buf())
-            .patch();
+            .fuck_backslash();
         debug!(
             "path diff: {} to {}",
             path.display(),
@@ -99,7 +85,7 @@ impl Config {
             format!("{}", path_relative_to_repo.display()).green()
         );
         self.crypt_list
-            .push(path_relative_to_repo.to_string_lossy().replace('\\', "/"));
+            .push(path_relative_to_repo.to_string_lossy().into_owned());
 
         // check extension
         if path.is_dir() {
@@ -123,9 +109,9 @@ impl Config {
         }
     }
 
-    pub fn add_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {
+    pub fn add_paths_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {
         for x in paths {
-            self.add_one_file_to_crypt_list(x.as_ref());
+            self.add_one_path_to_crypt_list(x.as_ref());
         }
         self.store(CONFIG_FILE_NAME).map_err(|e| anyhow::anyhow!(e))
     }
@@ -169,7 +155,7 @@ mod tests {
 
         let path_to_add = temp_dir.join("testdir");
         fs::create_dir(&path_to_add)?;
-        config.add_one_file_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref());
+        config.add_one_path_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref());
         println!("{:?}", config.crypt_list.first().unwrap());
         assert!(
             config
@@ -190,7 +176,7 @@ mod tests {
         std::fs::File::create(temp_dir.join("test.enc")).unwrap();
         let file_path = temp_dir.join("test");
         let mut config = Config::new(file_path);
-        config.add_one_file_to_crypt_list("test.enc");
+        config.add_one_path_to_crypt_list("test.enc");
     }
 
     #[test]
@@ -200,6 +186,6 @@ mod tests {
         let temp_dir = TempDir::new().unwrap().keep();
         let file_path = temp_dir.join("config.toml");
         let mut config = Config::load_or_default(file_path).unwrap();
-        config.add_one_file_to_crypt_list("config.toml");
+        config.add_one_path_to_crypt_list("config.toml");
     }
 }

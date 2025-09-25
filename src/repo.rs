@@ -71,17 +71,15 @@ impl Repo {
             key_sha: OnceLock::new(),
         })
     }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
+
     pub fn to_absolute_path(&self, path: impl AsRef<Path>) -> PathBuf {
         self.path.join(path.as_ref())
     }
-    pub fn ls_files_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<String>> {
-        let files_zip: Result<Vec<Vec<String>>> =
-            patterns.iter().map(|&x| self.ls_files(&[x])).collect();
-        Ok(files_zip?.into_iter().flatten().collect())
-    }
+
     pub fn ls_files_absolute_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<PathBuf>> {
         debug!("ls_files_absolute_with_given_patterns: {patterns:?}");
         let files_zip: Result<Vec<Vec<PathBuf>>> = patterns
@@ -90,6 +88,7 @@ impl Repo {
             .collect();
         Ok(files_zip?.into_iter().flatten().collect())
     }
+
     pub fn get_key(&self) -> String {
         self.get_config("key")
             .expect("Key not found, please exec `git-se p` first.")

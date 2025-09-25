@@ -22,7 +22,7 @@ pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
         SubCommand::Encrypt => encrypt_repo(repo)?,
         SubCommand::Decrypt { path } => decrypt_repo(repo, path)?,
-        SubCommand::Add { paths } => repo.conf.add_to_crypt_list(&paths)?,
+        SubCommand::Add { paths } => repo.conf.add_paths_to_crypt_list(&paths)?,
         SubCommand::Set { field } => field.set(repo)?,
         SubCommand::Pwd => repo.set_key_interactive()?,
     }
