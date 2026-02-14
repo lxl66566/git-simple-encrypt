@@ -5,8 +5,6 @@ use std::{
 
 use anyhow::{Result, anyhow};
 use assert2::assert;
-#[cfg(any(test, debug_assertions))]
-use colored::Colorize;
 use config_file2::LoadConfigFile;
 use log::{debug, info, warn};
 use path_absolutize::Absolutize;
@@ -14,7 +12,6 @@ use tap::Tap;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
-    crypt::calculate_key_sha,
     utils::prompt_password,
 };
 
@@ -92,25 +89,6 @@ impl Repo {
     pub fn get_key(&self) -> String {
         self.get_config("key")
             .expect("Key not found, please exec `git-se p` first.")
-    }
-
-    /// returns the first 16 bytes of sha3-224 of the key.
-    /// The sha result will only be calculated once in the lifetime of the
-    /// object.
-    pub fn get_key_sha(&self) -> &[u8] {
-        self.key_sha.get_or_init(|| {
-            let key = self.get_key();
-            #[cfg(any(test, debug_assertions))]
-            println!("Key: {}", key.green());
-            let hash_result = calculate_key_sha(key);
-            let hash_result_slice = hash_result.as_slice();
-            #[cfg(any(test, debug_assertions))]
-            {
-                use crate::utils::format_hex;
-                println!("Hash Cut result: {}", format_hex(hash_result_slice).green());
-            }
-            hash_result_slice.into()
-        })
     }
 
     /// set the key interactively

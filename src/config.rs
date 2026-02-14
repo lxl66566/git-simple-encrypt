@@ -4,13 +4,10 @@ use assert2::assert;
 use colored::Colorize;
 use config_file2::StoreConfigFile;
 use fuck_backslash::FuckBackslash;
-use log::{debug, info, warn};
+use log::{debug, info};
 use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
-use walkdir::WalkDir;
-
-use crate::crypt::{COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION};
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
@@ -86,27 +83,6 @@ impl Config {
         );
         self.crypt_list
             .push(path_relative_to_repo.to_string_lossy().into_owned());
-
-        // check extension
-        if path.is_dir() {
-            for entry in WalkDir::new(path)
-                .into_iter()
-                .filter_map(std::result::Result::ok)
-            {
-                if let Some(ext) = entry.path().extension().and_then(|ext| ext.to_str())
-                    && [COMPRESSED_EXTENSION, ENCRYPTED_EXTENSION].contains(&ext)
-                {
-                    warn!(
-                        "{}",
-                        format!(
-                            "adding dir that contains file with no-good extension: {}",
-                            entry.path().display()
-                        )
-                        .yellow()
-                    );
-                }
-            }
-        }
     }
 
     pub fn add_paths_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {

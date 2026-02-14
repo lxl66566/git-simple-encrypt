@@ -1,5 +1,3 @@
-#![feature(let_chains)]
-#![feature(test)]
 #![warn(clippy::nursery, clippy::cargo, clippy::pedantic)]
 #![allow(clippy::multiple_crate_versions)]
 
@@ -21,7 +19,7 @@ pub fn run(cli: Cli) -> Result<()> {
     let repo = Box::leak(Box::new(repo));
     match cli.command {
         SubCommand::Encrypt => encrypt_repo(repo)?,
-        SubCommand::Decrypt { path } => decrypt_repo(repo, path)?,
+        SubCommand::Decrypt { paths: path } => decrypt_repo(repo, path)?,
         SubCommand::Add { paths } => repo.conf.add_paths_to_crypt_list(&paths)?,
         SubCommand::Set { field } => field.set(repo)?,
         SubCommand::Pwd => repo.set_key_interactive()?,

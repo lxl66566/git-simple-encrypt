@@ -92,7 +92,7 @@ fn test() -> anyhow::Result<()> {
     assert!(!temp_dir.join("dir/t4.txt").exists());
 
     // Decrypt
-    run(SubCommand::Decrypt { path: None }, temp_dir)?;
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
     println!("{}", "After Decrypt".green());
 
     // Test
@@ -154,7 +154,7 @@ fn test_reencrypt() -> anyhow::Result<()> {
     assert!(!temp_dir.join("dir/t4.txt").exists());
 
     // Decrypt
-    run(SubCommand::Decrypt { path: None }, temp_dir)?;
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
     println!("{}", "After Decrypt".green());
 
     // Test
@@ -202,7 +202,7 @@ fn test_many_files() -> anyhow::Result<()> {
     // Encrypt
     run(SubCommand::Encrypt, temp_dir)?;
     // Decrypt
-    run(SubCommand::Decrypt { path: None }, temp_dir)?;
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
 
     // Test
     for _ in 1..10 {
@@ -237,7 +237,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     // Partial decrypt
     run(
         SubCommand::Decrypt {
-            path: Some("dir".into()),
+            paths: vec!["dir".into()],
         },
         temp_dir,
     )?;
@@ -255,7 +255,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     // Partial decrypt
     run(
         SubCommand::Decrypt {
-            path: Some("t1.txt.enc".into()),
+            paths: vec!["t1.txt.enc".into()],
         },
         temp_dir,
     )?;
@@ -301,7 +301,7 @@ fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
 
     b.iter(|| {
         run(SubCommand::Encrypt, temp_dir).unwrap();
-        run(SubCommand::Decrypt { path: None }, temp_dir).unwrap();
+        run(SubCommand::Decrypt { paths: vec![] }, temp_dir).unwrap();
     });
 
     Ok(())
