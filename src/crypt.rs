@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fs,
     io::{Cursor, Read, Write},
     path::{Path, PathBuf},
@@ -6,16 +7,16 @@ use std::{
 
 use aes_gcm_siv::{
     Aes256GcmSiv, Nonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
 };
 use anyhow::{Context, Result, anyhow};
+use argon2::Argon2;
 use byteorder::{ReadBytesExt, WriteBytesExt};
-use colored::Colorize;
-use hkdf::Hkdf;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use rand::RngCore;
 use rayon::prelude::*;
-use sha2::Sha256;
+use tempfile::NamedTempFile;
+use zeroize::Zeroizing;
 
 use crate::repo::{GitCommand, Repo};
 
@@ -23,14 +24,15 @@ use crate::repo::{GitCommand, Repo};
 
 const MAGIC: &[u8; 5] = b"GITSE";
 const VERSION: u8 = 2;
-
-// Flag bit definitions
 const FLAG_COMPRESSED: u8 = 1 << 0; // Bit 0
 
 // Sizes
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12; // Standard 96-bit nonce
-const HEADER_LEN: usize = MAGIC.len() + 1 + 1 + SALT_LEN + NONCE_LEN; // 5 + 1 + 1 + 16 + 12 = 35 bytes
+const HEADER_LEN: usize = 64;
+const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + SALT_LEN + NONCE_LEN); //  (64 - 5 - 1 - 1 - 16 - 12 = 29 bytes)
+
+const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB, warning for files > MAX_FILE_SIZE
 
 // --- Helper Structures ---
 
@@ -69,6 +71,8 @@ impl FileHeader {
         writer.write_u8(self.flags)?;
         writer.write_all(&self.salt)?;
         writer.write_all(&self.nonce)?;
+        let reserved = [0u8; RESERVED_LEN];
+        writer.write_all(&reserved)?;
         Ok(())
     }
 
@@ -91,6 +95,8 @@ impl FileHeader {
         reader.read_exact(&mut salt)?;
         let mut nonce = [0u8; NONCE_LEN];
         reader.read_exact(&mut nonce)?;
+        let mut reserved = [0u8; RESERVED_LEN];
+        reader.read_exact(&mut reserved)?;
 
         Ok(Self {
             version,
@@ -105,79 +111,127 @@ impl FileHeader {
     }
 }
 
-// --- Core Logic ---
-
-/// Check if a file is already encrypted by verifying the magic header.
-pub fn is_encrypted(path: &Path) -> bool {
-    if let Ok(mut file) = fs::File::open(path) {
-        let mut buffer = [0u8; 5];
-        if matches!(file.read_exact(&mut buffer), Ok(())) {
-            return &buffer == MAGIC;
-        }
+impl TryFrom<&[u8]> for FileHeader {
+    type Error = anyhow::Error;
+    fn try_from(value: &[u8]) -> std::result::Result<Self, Self::Error> {
+        Self::read(&mut Cursor::new(&value))
     }
-    false
 }
 
-/// Derive a file-specific key using HKDF-SHA256.
+// --- Core Logic ---
+
+pub fn is_encrypted(file: &mut fs::File, metadata: &fs::Metadata) -> Result<bool> {
+    if metadata.len() < HEADER_LEN as u64 {
+        return Ok(false);
+    }
+
+    // 2. MAGIC (5 bytes) + VERSION (1 byte)
+    let mut buf = [0u8; 6];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut buf, 0)?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::Seek;
+
+        file.read_exact(&mut buf)?;
+        file.rewind()?;
+    }
+    Ok(&buf[0..5] == MAGIC && buf[5] == VERSION)
+}
+
+/// Derive a file-specific key using Argon2.
 /// Input: User Master Key (bytes) + File Salt.
 /// Output: 32 bytes (for AES-256).
-fn derive_key(master_key: &[u8], salt: &[u8]) -> Vec<u8> {
-    let hkdf = Hkdf::<Sha256>::new(Some(salt), master_key);
-    let mut okm = [0u8; 32]; // AES-256 key size
-    hkdf.expand(b"GITSE_FILE_KEY", &mut okm)
-        .expect("HKDF expand failed"); // Should strictly not happen for correct lengths
-    okm.to_vec()
+fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
+    let mut key = Zeroizing::new([0u8; 32]);
+    Argon2::default()
+        .hash_password_into(password, salt, &mut *key)
+        .map_err(|e| anyhow!("Argon2 key derivation failed: {e}"))?;
+    Ok(key)
 }
 
 /// Try to compress data. Returns (data, `is_compressed`).
-fn try_compress(data: &[u8], level: u8) -> Result<(Vec<u8>, bool)> {
+fn try_compress(data: &[u8], level: u8) -> Result<(Cow<'_, [u8]>, bool)> {
     // If data is too small, compression might add overhead or valid frames are
     // larger.
     if data.len() < 50 {
-        return Ok((data.to_vec(), false));
+        return Ok((Cow::Borrowed(data), false));
     }
-
     let compressed = zstd::stream::encode_all(data, i32::from(level))?;
 
     #[cfg(any(test, debug_assertions))]
     debug!("Compression: {} -> {}", data.len(), compressed.len());
 
     if compressed.len() < data.len() {
-        Ok((compressed, true))
+        Ok((Cow::Owned(compressed), true))
     } else {
-        Ok((data.to_vec(), false))
+        Ok((Cow::Borrowed(data), false))
     }
 }
 
 /// Decompress data if the flag is set.
-fn try_decompress(data: &[u8], compressed: bool) -> Result<Vec<u8>> {
+fn try_decompress(data: &[u8], compressed: bool) -> Result<Cow<'_, [u8]>> {
     if compressed {
-        zstd::stream::decode_all(data).map_err(|e| anyhow!(e))
+        zstd::stream::decode_all(data)
+            .map(Cow::Owned)
+            .map_err(|e| anyhow!(e))
     } else {
-        Ok(data.to_vec())
+        Ok(Cow::Borrowed(data))
     }
+}
+
+fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = NamedTempFile::new_in(parent_dir)
+        .with_context(|| "Failed to create temp file".to_string())?;
+
+    temp_file.write_all(data).with_context(|| {
+        format!(
+            "Failed to write data to temp file {}",
+            temp_file.path().display()
+        )
+    })?;
+    temp_file
+        .persist(path)
+        .with_context(|| format!("Failed to persist atomic write to {}", path.display()))?;
+    Ok(())
 }
 
 // --- Public Operations ---
 
-/// Encrypt file in-place (conceptually).
+/// Encrypt file.
 /// Actually writes to a temp buffer then overwrites content.
 /// Filename is preserved.
 pub fn encrypt_file(
     file: impl AsRef<Path> + Send + Sync,
     master_key: &[u8], // This is the raw user password/key
     zstd_level: u8,
-) -> Result<PathBuf> {
+) -> Result<()> {
     let path = file.as_ref();
-
-    if is_encrypted(path) {
-        info!("File already encrypted, skipping: {}", path.display());
-        return Ok(path.to_path_buf());
+    let mut file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
+    if is_encrypted(&mut file, &metadata)? {
+        warn!("File already encrypted, skipping: {}", path.display());
+        return Ok(());
+    }
+    if metadata.len() > MAX_FILE_SIZE {
+        warn!(
+            "File size too large ({} MB), please pay attention to memory usage: {}",
+            metadata.len() / 1024 / 1024,
+            path.display()
+        );
     }
 
-    info!("Encrypting: {}", path.display().to_string().green());
+    debug!("Encrypting: {}", path.display());
 
-    let plain_bytes = fs::read(path).with_context(|| format!("Reading {path:?}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let mut plain_bytes = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut plain_bytes)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    drop(file);
 
     // 1. Compression
     let (payload_bytes, is_compressed) = try_compress(&plain_bytes, zstd_level)?;
@@ -186,15 +240,21 @@ pub fn encrypt_file(
     let header = FileHeader::new(is_compressed);
 
     // 3. Derive Key
-    let file_key = derive_key(master_key, &header.salt);
+    let file_key = derive_key(master_key, &header.salt)?;
 
     // 4. Encrypt
-    let cipher =
-        Aes256GcmSiv::new_from_slice(&file_key).map_err(|e| anyhow!("Key creation failed: {e}"))?;
+    let cipher = Aes256GcmSiv::new_from_slice(&*file_key)
+        .map_err(|e| anyhow!("Key creation failed: {e}"))?;
     let nonce = Nonce::from_slice(&header.nonce);
+    let mut header_bytes = Vec::with_capacity(HEADER_LEN);
+    header.write(&mut header_bytes)?;
+    let payload = Payload {
+        msg: &payload_bytes,
+        aad: &header_bytes,
+    };
 
     let ciphertext = cipher
-        .encrypt(nonce, payload_bytes.as_slice())
+        .encrypt(nonce, payload)
         .map_err(|e| anyhow!("Encryption failed: {e}"))?;
 
     // 5. Write Header + Ciphertext
@@ -205,59 +265,58 @@ pub fn encrypt_file(
     header.write(&mut final_data)?;
     final_data.extend_from_slice(&ciphertext);
 
-    fs::write(path, final_data).with_context(|| format!("Writing {path:?}"))?;
+    atomic_write(path, &final_data)?;
 
-    // We don't change the path anymore
-    Ok(path.to_path_buf())
+    Ok(())
 }
 
-pub fn decrypt_file(
-    file: impl AsRef<Path> + Send + Sync,
-    master_key: &[u8],
-) -> Result<Option<PathBuf>> {
+pub fn decrypt_file(file: impl AsRef<Path> + Send + Sync, master_key: &[u8]) -> Result<()> {
     let path = file.as_ref();
+    let mut file = fs::File::open(path)?;
+    let metadata = file.metadata()?;
 
     // Check magic quickly before loading whole file
-    if !is_encrypted(path) {
+    if !is_encrypted(&mut file, &metadata)? {
         debug!(
             "File not encrypted (no magic), skipping: {}",
             path.display()
         );
-        return Ok(None);
+        return Ok(());
     }
+    debug!("Decrypting: {}", path.display());
 
-    info!("Decrypting: {}", path.display());
+    #[allow(clippy::cast_possible_truncation)] // truncation is fine
+    let mut content = Vec::with_capacity(metadata.len() as usize);
+    file.read_to_end(&mut content)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    drop(file);
 
-    let content = fs::read(path).with_context(|| format!("Reading {path:?}"))?;
-    let mut cursor = Cursor::new(&content);
-
-    // 1. Parse Header
-    let header =
-        FileHeader::read(&mut cursor).with_context(|| format!("Corrupt header in {path:?}"))?;
+    let header_bytes = &content[0..HEADER_LEN];
+    let header = FileHeader::try_from(header_bytes)
+        .with_context(|| format!("Corrupt header in {}", path.display()))?;
 
     // 2. Derive Key
-    let file_key = derive_key(master_key, &header.salt);
+    let file_key = derive_key(master_key, &header.salt)?;
 
     // 3. Decrypt
-    let cipher =
-        Aes256GcmSiv::new_from_slice(&file_key).map_err(|e| anyhow!("Key creation failed: {e}"))?;
+    let cipher = Aes256GcmSiv::new_from_slice(&*file_key)
+        .map_err(|e| anyhow!("Key creation failed: {e}"))?;
     let nonce = Nonce::from_slice(&header.nonce);
-
-    // The cursor position is now at the start of ciphertext
-    #[allow(clippy::cast_possible_truncation)]
-    let ciphertext = &content[(cursor.position() as usize)..];
-
+    let payload = Payload {
+        msg: &content[HEADER_LEN..],
+        aad: header_bytes,
+    };
     let plaintext_raw = cipher
-        .decrypt(nonce, ciphertext)
-        .map_err(|e| anyhow!("Decryption failed (wrong password?): {e}"))?;
+        .decrypt(nonce, payload)
+        .map_err(|e| anyhow!("Decryption failed (wrong password or corrupt header): {e}"))?;
 
     // 4. Decompress
     let final_bytes = try_decompress(&plaintext_raw, header.is_compressed())?;
 
     // 5. Write back
-    fs::write(path, final_bytes)?;
+    atomic_write(path, &final_bytes)?;
 
-    Ok(Some(path.to_path_buf()))
+    Ok(())
 }
 
 // --- Repo Integration ---
@@ -279,16 +338,11 @@ pub fn encrypt_repo(repo: &'static Repo) -> Result<()> {
         &patterns.iter().map(|x| x as &str).collect::<Vec<&str>>(),
     )?;
 
-    target_files
-        .par_iter()
-        .map(|f| encrypt_file(f, key.as_bytes(), repo.conf.zstd_level))
-        .collect::<Vec<_>>() // force evaluation
-        .into_iter()
-        .for_each(|res| {
-            if let Err(e) = res {
-                warn!("Encryption warning: {e}");
-            }
-        });
+    target_files.par_iter().for_each(|f| {
+        if let Err(e) = encrypt_file(f, key.as_bytes(), repo.conf.zstd_level) {
+            warn!("Encryption warning for {}: {}", f.display(), e);
+        }
+    });
 
     repo.add_all()?;
     Ok(())
@@ -329,11 +383,8 @@ pub fn decrypt_repo(repo: &'static Repo, path: Vec<PathBuf>) -> Result<()> {
     files_to_decrypt
         .par_iter()
         .filter(|p| p.is_file()) // double check
-        .map(|f| decrypt_file(f, key.as_bytes()))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .for_each(|res| {
-            if let Err(e) = res {
+        .for_each(|f| {
+            if let Err(e) = decrypt_file(f, key.as_bytes()) {
                 warn!("Decryption warning: {e}");
             }
         });
@@ -345,37 +396,62 @@ pub fn decrypt_repo(repo: &'static Repo, path: Vec<PathBuf>) -> Result<()> {
 mod tests {
     use std::fs;
 
+    use log::LevelFilter;
     use tempfile::NamedTempFile;
 
     use super::*;
     use crate::{config::Config, utils::format_hex};
 
+    #[test]
+    fn test_atomic_write() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let temp_path = temp_file.into_temp_path();
+        atomic_write(&temp_path, b"Hello, world!").unwrap();
+        assert_eq!(fs::read(&temp_path).unwrap(), b"Hello, world!");
+    }
+
     fn test_basic(content: &[u8]) {
         let mut temp_file = NamedTempFile::new().unwrap();
+        println!("temp_file path: {:?}", temp_file.path());
         let key = "602bdc204140db0a".to_owned();
 
         temp_file.write_all(content).unwrap();
-        let encrypted_file = encrypt_file(
-            temp_file.path(),
-            key.as_bytes(),
-            Config::default().zstd_level,
-        )
-        .unwrap();
-        let encrypted_content = fs::read(&encrypted_file).unwrap();
+        let temp_path = temp_file.into_temp_path();
+
+        encrypt_file(&temp_path, key.as_bytes(), Config::default().zstd_level).unwrap();
+        let encrypted_content = fs::read(&temp_path).unwrap();
         dbg!(format_hex(&encrypted_content));
         assert_ne!(encrypted_content, content);
-        let decrypted_file = decrypt_file(encrypted_file, key.as_bytes())
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            temp_file.path().to_string_lossy().as_bytes(),
-            decrypted_file.to_string_lossy().as_bytes()
-        );
+        decrypt_file(&temp_path, key.as_bytes()).unwrap();
+        assert_eq!(fs::read(temp_path).unwrap(), content);
     }
 
     #[test]
     fn test_encrypt_decrypt() {
+        let _ = pretty_env_logger::formatted_builder()
+            .filter_level(LevelFilter::Debug)
+            .format_timestamp_millis()
+            .parse_default_env()
+            .try_init();
         test_basic(b"Hello, world!");
         test_basic(&b"6".repeat(100));
+    }
+
+    #[test]
+    fn test_modified_header() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+        let key = "602bdc204140db0a".to_owned();
+
+        temp_file.write_all(b"Hello, world!").unwrap();
+        let temp_path = temp_file.into_temp_path();
+
+        encrypt_file(&temp_path, key.as_bytes(), Config::default().zstd_level).unwrap();
+        let mut encrypted_content = fs::read(&temp_path).unwrap();
+        dbg!(format_hex(&encrypted_content));
+        assert_ne!(encrypted_content, b"Hello, world!");
+        encrypted_content[HEADER_LEN - 5] = 0x0F; // modify header byte
+        fs::write(&temp_path, &encrypted_content).unwrap();
+        let err = decrypt_file(&temp_path, key.as_bytes()).unwrap_err();
+        assert!(err.to_string().contains("aead::Error"));
     }
 }

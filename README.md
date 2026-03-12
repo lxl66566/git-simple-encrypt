@@ -52,16 +52,6 @@ Type `git-se -h` and `git-se [subcommand] -h` to get more information.
 - Do not add files with `.zst`, `.enc` suffixes and folders containing them to the encrypted list.
 - To delete file/dir from encrypt list, edit `git_simple_encrypt.toml`.
 - encrypt/decrypt will keep the file metadata unchanged (unix permission and timestamp).
-
-## Algorithm
-
-```mermaid
-graph TD;
-    A[Key: 123] -- SHA3_224 --> 602bdc204140db016bee5374895e5568ce422fabe17e064061d80097 -- CUT --> 602bdc204140db016bee5374895e5568 --cipher--> Aes128GcmSiv  -- output--> 14a7dd2666afd854788c80f5518fea892491f23e72798d2fbc67bfc6259610d6f4
-    B[Text: '6' * 60] --zstd--> 28b52ffd006045000010363601003f0116 --content--> Aes128GcmSiv
-    CONST --NONCE--> Aes128GcmSiv
-```
-
 - If zstd compression has the opposite effect, skip compression.
 - Decrypt all files with extension `.enc`, `.zst.enc`.
 
