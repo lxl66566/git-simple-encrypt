@@ -6,9 +6,8 @@ use std::{
 use anyhow::{Result, anyhow};
 use assert2::assert;
 use config_file2::LoadConfigFile;
-use log::{debug, info, warn};
+use log::{info, warn};
 use path_absolutize::Absolutize;
-use tap::Tap;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
@@ -77,15 +76,6 @@ impl Repo {
         self.path.join(path.as_ref())
     }
 
-    pub fn ls_files_absolute_with_given_patterns(&self, patterns: &[&str]) -> Result<Vec<PathBuf>> {
-        debug!("ls_files_absolute_with_given_patterns: {patterns:?}");
-        let files_zip: Result<Vec<Vec<PathBuf>>> = patterns
-            .iter()
-            .map(|&x| self.ls_files_absolute(&[x]))
-            .collect();
-        Ok(files_zip?.into_iter().flatten().collect())
-    }
-
     pub fn get_key(&self) -> String {
         self.get_config("key")
             .expect("Key not found, please exec `git-se p` first.")
@@ -103,9 +93,6 @@ impl Repo {
 pub trait GitCommand {
     fn run(&self, args: &[&str]) -> Result<()>;
     fn run_with_output(&self, args: &[&str]) -> Result<String>;
-    fn add_all(&self) -> Result<()>;
-    fn ls_files(&self, args: &[&str]) -> Result<Vec<String>>;
-    fn ls_files_absolute(&self, args: &[&str]) -> Result<Vec<PathBuf>>;
     fn set_config(&self, key: &str, value: &str) -> Result<()>;
     fn get_config(&self, key: &str) -> Result<String>;
 }
@@ -141,32 +128,6 @@ impl GitCommand for Repo {
         }
         Ok(String::from_utf8(output.stdout)?)
     }
-    fn add_all(&self) -> Result<()> {
-        self.run(&["add", "-A"])
-    }
-    /// `git ls-files` with given args, mostly with a wildcard pattern.
-    fn ls_files(&self, args: &[&str]) -> Result<Vec<String>> {
-        let output =
-            self.run_with_output(&vec!["ls-files", "-z"].tap_mut(|x| x.extend_from_slice(args)))?;
-        let output_processed = output.trim().trim_matches('\0');
-        if output_processed.is_empty() {
-            return Ok(vec![]);
-        }
-        let files = output_processed
-            .split('\0')
-            .map(std::string::ToString::to_string)
-            .collect();
-        debug!("ls-files: {files:?}");
-        Ok(files)
-    }
-    /// returns the absolute path of `ls-files`.
-    fn ls_files_absolute(&self, args: &[&str]) -> Result<Vec<PathBuf>> {
-        Ok(self
-            .ls_files(args)?
-            .into_iter()
-            .map(|f| self.to_absolute_path(f))
-            .collect())
-    }
     fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
         self.run(&["config", "--local", &temp, value.trim()])
@@ -180,11 +141,6 @@ impl GitCommand for Repo {
 
 #[cfg(test)]
 mod tests {
-    use std::{assert, fs};
-
-    use path_absolutize::Absolutize;
-    use tempfile::TempDir;
-
     use super::*;
 
     #[test]
@@ -193,42 +149,6 @@ mod tests {
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
         let repo = Repo::open(Path::new("./.git"))?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
-        Ok(())
-    }
-
-    #[test]
-    fn test_repo_gitcommand() -> Result<()> {
-        let temp_dir = TempDir::new()?.keep();
-        let repo = Repo::open(&temp_dir)?;
-        repo.run(&["init"])?;
-        assert!(temp_dir.join(".git").is_dir());
-        let temp = repo.ls_files(&[])?;
-        assert!(temp.is_empty(), "repo not empty: {temp:?}");
-        fs::File::create(temp_dir.join("test.txt"))?;
-        repo.add_all()?;
-        assert!(
-            repo.run_with_output(&["status"])?
-                .contains("Changes to be committed")
-        );
-        assert!(repo.ls_files(&[]).unwrap().contains(&"test.txt".into()));
-        assert_eq!(
-            repo.ls_files_absolute(&[])
-                .unwrap()
-                .into_iter()
-                .find(|x| x.file_name().unwrap() == "test.txt")
-                .unwrap()
-                .absolutize()
-                .expect("path absolutize failed")
-                .as_ref(),
-            temp_dir
-                .join("test.txt")
-                .absolutize()
-                .expect("path absolutize failed")
-                .as_ref()
-        );
-
-        repo.set_config("test", "test1")?;
-        assert_eq!(repo.get_config("test")?, "test1");
         Ok(())
     }
 }

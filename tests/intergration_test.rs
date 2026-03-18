@@ -3,14 +3,15 @@
 extern crate test;
 
 use std::{
+    fs,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
 
 use anyhow::Ok;
 use colored::Colorize;
-use git_simple_encrypt::{Cli, SetField, SubCommand};
-use rand::{Rng, SeedableRng, seq::IndexedRandom as _};
+use git_simple_encrypt::{Cli, FileHeader, SetField, SubCommand};
+use rand::prelude::*;
 use tap::Tap;
 use tempfile::TempDir;
 use test::Bencher;
@@ -55,6 +56,34 @@ fn run(cmd: SubCommand, pwd: impl Into<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+trait PathExt {
+    fn is_encrypted(&self) -> bool;
+    fn is_compressed(&self) -> bool;
+    fn is_not_encrypted(&self) -> bool {
+        !self.is_encrypted()
+    }
+}
+
+impl<T> PathExt for T
+where
+    T: AsRef<Path>,
+{
+    fn is_encrypted(&self) -> bool {
+        let mut f = fs::File::open(self.as_ref()).unwrap();
+        let header = FileHeader::read(&mut f);
+        header.is_ok()
+    }
+
+    /// Check if the file is both encrypted and compressed.
+    fn is_compressed(&self) -> bool {
+        let mut f = fs::File::open(self.as_ref()).unwrap();
+        let header = FileHeader::read(&mut f).unwrap();
+        header.is_compressed()
+    }
+}
+
+// ============ region Tests ============
+
 #[test]
 fn test() -> anyhow::Result<()> {
     let pwd = test_init();
@@ -77,30 +106,27 @@ fn test() -> anyhow::Result<()> {
         temp_dir,
     )?;
 
-    // Encrypt
-    run(SubCommand::Encrypt, temp_dir)?;
+    // Encrypt (added files)
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     // Test
     temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
     dbg!(std::fs::read_to_string(temp_dir.join("git_simple_encrypt.toml")).unwrap());
-    assert!(temp_dir.join("t1.txt.enc").exists());
-    assert!(temp_dir.join("t2.txt.zst.enc").exists());
-    assert!(temp_dir.join("t3.txt").exists());
-    assert!(temp_dir.join("dir/t4.txt.enc").exists());
-    assert!(!temp_dir.join("t1.txt").exists());
-    assert!(!temp_dir.join("t2.txt").exists());
-    assert!(!temp_dir.join("dir/t4.txt").exists());
+    assert!(temp_dir.join("t1.txt").is_encrypted());
+    assert!(temp_dir.join("t2.txt").is_compressed());
+    assert!(temp_dir.join("t3.txt").is_not_encrypted());
+    assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     // Decrypt
     run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
     println!("{}", "After Decrypt".green());
 
-    // Test
+    // Test decrypt result
     temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
-    assert!(temp_dir.join("t1.txt").exists());
-    assert!(temp_dir.join("t2.txt").exists());
-    assert!(temp_dir.join("t3.txt").exists());
-    assert!(temp_dir.join("dir/t4.txt").exists());
+    assert!(temp_dir.join("t1.txt").is_not_encrypted());
+    assert!(temp_dir.join("t2.txt").is_not_encrypted());
+    assert!(temp_dir.join("t3.txt").is_not_encrypted());
+    assert!(temp_dir.join("dir/t4.txt").is_not_encrypted());
     assert_eq!(
         std::fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
@@ -121,7 +147,7 @@ fn test() -> anyhow::Result<()> {
 }
 
 #[test]
-fn test_reencrypt() -> anyhow::Result<()> {
+fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
@@ -138,9 +164,9 @@ fn test_reencrypt() -> anyhow::Result<()> {
     )?;
 
     // Encrypt multiple times
-    run(SubCommand::Encrypt, temp_dir)?;
-    run(SubCommand::Encrypt, temp_dir)?;
-    run(SubCommand::Encrypt, temp_dir)?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     // Test
     temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
@@ -148,10 +174,8 @@ fn test_reencrypt() -> anyhow::Result<()> {
         .join("dir")
         .read_dir()?
         .for_each(|x| println!("{:?}", x));
-    assert!(temp_dir.join("t1.txt.enc").exists());
-    assert!(temp_dir.join("dir/t4.txt.enc").exists());
-    assert!(!temp_dir.join("t1.txt").exists());
-    assert!(!temp_dir.join("dir/t4.txt").exists());
+    assert!(temp_dir.join("t1.txt").is_encrypted());
+    assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     // Decrypt
     run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
@@ -162,8 +186,8 @@ fn test_reencrypt() -> anyhow::Result<()> {
     for entry in temp_dir.read_dir()? {
         println!("{:?}", entry?);
     }
-    assert!(temp_dir.join("t1.txt").exists());
-    assert!(temp_dir.join("dir/t4.txt").exists());
+    assert!(temp_dir.join("t1.txt").is_not_encrypted());
+    assert!(temp_dir.join("dir/t4.txt").is_not_encrypted());
     assert_eq!(
         std::fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
@@ -200,7 +224,7 @@ fn test_many_files() -> anyhow::Result<()> {
     )?;
 
     // Encrypt
-    run(SubCommand::Encrypt, temp_dir)?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
     // Decrypt
     run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
 
@@ -232,7 +256,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     )?;
 
     // Encrypt
-    run(SubCommand::Encrypt, temp_dir)?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     // Partial decrypt
     run(
@@ -246,16 +270,16 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     for entry in temp_dir.read_dir()? {
         println!("{:?}", entry?);
     }
-    assert!(temp_dir.join("t1.txt.enc").exists());
+    assert!(temp_dir.join("t1.txt").is_encrypted());
     assert!(temp_dir.join("dir/t4.txt").exists());
 
     // Reencrypt
-    run(SubCommand::Encrypt, temp_dir)?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     // Partial decrypt
     run(
         SubCommand::Decrypt {
-            paths: vec!["t1.txt.enc".into()],
+            paths: vec!["t1.txt".into()],
         },
         temp_dir,
     )?;
@@ -265,7 +289,7 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
         println!("{:?}", entry?);
     }
     assert!(temp_dir.join("t1.txt").exists());
-    assert!(temp_dir.join("dir/t4.txt.enc").exists());
+    assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     Ok(())
 }
@@ -300,7 +324,7 @@ fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
     )?;
 
     b.iter(|| {
-        run(SubCommand::Encrypt, temp_dir).unwrap();
+        run(SubCommand::Encrypt { paths: vec![] }, temp_dir).unwrap();
         run(SubCommand::Decrypt { paths: vec![] }, temp_dir).unwrap();
     });
 

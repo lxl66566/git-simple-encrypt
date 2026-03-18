@@ -52,17 +52,14 @@ impl Config {
     pub fn config_path(&self) -> PathBuf {
         self.repo_path.join(CONFIG_FILE_NAME)
     }
+
     /// Add one path to crypt list
     ///
-    /// path: relative path to a file or dir.
+    /// path could be either relative or absolute.
     pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) {
-        // path is the relative path to the current dir (or absolute path)
         let path = path.as_ref().absolutize().expect("path absolutize failed");
-
         debug!("adding path to crypt list: {}", path.display());
         assert!(path.exists(), "file or dir not exist: {:?}", path);
-
-        // path is the relative path to the repo
         let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
             .unwrap_or_else(|| path.to_path_buf())
             .fuck_backslash();
@@ -76,15 +73,16 @@ impl Config {
             "get absolute path `{}`, please use relative path instead",
             path_relative_to_repo.display()
         );
-        // there's no need to use ``, the output path has ""
         info!(
-            "Add to crypt list: {}",
+            "Add to encrypt list: {}",
             format!("{}", path_relative_to_repo.display()).green()
         );
         self.crypt_list
             .push(path_relative_to_repo.to_string_lossy().into_owned());
     }
 
+    /// Add the given paths to the encrypt list. This function will be called
+    /// seldomly, so it's not a performance issue.
     pub fn add_paths_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {
         for x in paths {
             self.add_one_path_to_crypt_list(x.as_ref());
@@ -99,32 +97,12 @@ mod tests {
 
     use anyhow::Ok;
     use config_file2::LoadConfigFile;
-    use log::LevelFilter;
     use tempfile::TempDir;
 
     use super::*;
 
-    #[inline]
-    pub fn log_init() {
-        #[cfg(not(debug_assertions))]
-        log_init_with_default_level(LevelFilter::Info);
-        #[cfg(debug_assertions)]
-        log_init_with_default_level(LevelFilter::Debug);
-    }
-
-    #[inline]
-    pub fn log_init_with_default_level(level: LevelFilter) {
-        _ = pretty_env_logger::formatted_builder()
-            .filter_level(level)
-            .format_timestamp_millis()
-            .filter_module("j4rs", LevelFilter::Info)
-            .parse_default_env()
-            .try_init();
-    }
-
     #[test]
     fn test_add_one_file_to_crypt_list() -> anyhow::Result<()> {
-        log_init();
         let temp_dir = TempDir::new()?.keep();
         let file_path = temp_dir.join("test.toml");
         let mut config = Config::load_or_default(file_path)?.with_repo_path(&*temp_dir);

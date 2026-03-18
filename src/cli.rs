@@ -38,22 +38,24 @@ fn repo_path_parser(path: &str) -> Result<PathBuf, String> {
 impl Default for Cli {
     fn default() -> Self {
         Self {
-            command: SubCommand::default(),
+            command: SubCommand::Pwd,
             repo: PathBuf::from("."),
         }
     }
 }
 
-#[derive(Subcommand, Debug, Clone, Default)]
+#[derive(Subcommand, Debug, Clone)]
 pub enum SubCommand {
     /// Encrypt all files with crypt attr.
-    #[default]
     #[clap(alias("e"))]
-    Encrypt,
+    Encrypt {
+        /// The files or folders to be encrypted.
+        paths: Vec<PathBuf>,
+    },
     /// Decrypt all files with crypt attr and `.enc` extension.
     #[clap(alias("d"))]
     Decrypt {
-        /// The files or folders to be decrypted, use wildcard matches.
+        /// The files or folders to be decrypted.
         paths: Vec<PathBuf>,
     },
     /// Mark files or folders as need-to-be-crypted.

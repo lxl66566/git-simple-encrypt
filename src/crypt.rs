@@ -1,3 +1,18 @@
+#![allow(clippy::too_long_first_doc_paragraph)]
+
+//! The core of this program. Encrypt/decrypt, compress/decompress files.
+//! GITSE Binary Header Layout (64 Bytes)
+//!  00          04  05  06  07          17                 23              3F
+//!  +-----------+---+---+---+-----------+-------------------+---------------+
+//!  |   MAGIC   | V | F | A |   SALT    |       NONCE       |   RESERVED    |
+//!  |  "GITSE"  |   |   |   | (16 bytes)|    (12 bytes)     |  (28 bytes)   |
+//!  +-----------+---+---+---+-----------+-------------------+---------------+
+//!    5 bytes     1   1   1    16 bytes       12 bytes          28 bytes
+//!                |   |   |
+//!     Version ---+   |   +--- Encryption Algo (0 = AES-256-GCM)
+//!                    |
+//!      Flags --------+ (Bit 0: Compression)
+
 use std::{
     borrow::Cow,
     fs,
@@ -9,43 +24,46 @@ use aes_gcm_siv::{
     Aes256GcmSiv, Nonce,
     aead::{Aead, KeyInit, Payload},
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, ensure};
 use argon2::Argon2;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use log::{debug, warn};
-use rand::RngCore;
+use rand::prelude::*;
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
-use crate::repo::{GitCommand, Repo};
+use crate::{repo::Repo, utils::list_files};
 
 // --- Constants & Header Layout ---
 
 const MAGIC: &[u8; 5] = b"GITSE";
 const VERSION: u8 = 2;
 const FLAG_COMPRESSED: u8 = 1 << 0; // Bit 0
+const ENC_ALGO: u8 = 0; // 0 = AES-256-GCM
 
 // Sizes
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12; // Standard 96-bit nonce
 const HEADER_LEN: usize = 64;
-const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + SALT_LEN + NONCE_LEN); //  (64 - 5 - 1 - 1 - 16 - 12 = 29 bytes)
+const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + NONCE_LEN); //  (64 - 5 - 1 - 1 - 1 - 16 - 12 = 28 bytes)
 
 const MAX_FILE_SIZE: u64 = 1024 * 1024 * 1024; // 1 GB, warning for files > MAX_FILE_SIZE
 
 // --- Helper Structures ---
 
 #[derive(Debug)]
-struct FileHeader {
+pub struct FileHeader {
     version: u8,
     flags: u8,
+    enc_algo: u8,
     salt: [u8; SALT_LEN],
     nonce: [u8; NONCE_LEN],
 }
 
 impl FileHeader {
-    fn new(compressed: bool) -> Self {
+    #[must_use]
+    pub fn new(compressed: bool) -> Self {
         let mut rng = rand::rng();
         let mut salt = [0u8; SALT_LEN];
         let mut nonce = [0u8; NONCE_LEN];
@@ -60,15 +78,18 @@ impl FileHeader {
         Self {
             version: VERSION,
             flags,
+            enc_algo: ENC_ALGO,
             salt,
             nonce,
         }
     }
 
-    fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
+    /// Write the header to the writer.
+    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
         writer.write_all(MAGIC)?;
         writer.write_u8(self.version)?;
         writer.write_u8(self.flags)?;
+        writer.write_u8(self.enc_algo)?;
         writer.write_all(&self.salt)?;
         writer.write_all(&self.nonce)?;
         let reserved = [0u8; RESERVED_LEN];
@@ -76,7 +97,8 @@ impl FileHeader {
         Ok(())
     }
 
-    fn read<R: Read>(reader: &mut R) -> Result<Self> {
+    /// Read the header from the reader.
+    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
         let mut magic_buf = [0u8; 5];
         reader
             .read_exact(&mut magic_buf)
@@ -91,6 +113,7 @@ impl FileHeader {
         }
 
         let flags = reader.read_u8()?;
+        let enc_algo = reader.read_u8()?;
         let mut salt = [0u8; SALT_LEN];
         reader.read_exact(&mut salt)?;
         let mut nonce = [0u8; NONCE_LEN];
@@ -101,12 +124,14 @@ impl FileHeader {
         Ok(Self {
             version,
             flags,
+            enc_algo,
             salt,
             nonce,
         })
     }
 
-    const fn is_compressed(&self) -> bool {
+    #[must_use]
+    pub const fn is_compressed(&self) -> bool {
         (self.flags & FLAG_COMPRESSED) != 0
     }
 }
@@ -321,66 +346,46 @@ pub fn decrypt_file(file: impl AsRef<Path> + Send + Sync, master_key: &[u8]) -> 
 
 // --- Repo Integration ---
 
-pub fn encrypt_repo(repo: &'static Repo) -> Result<()> {
+/// Encrypt given files in the repo. If no paths are given, encrypt all files
+/// in the repo's crypt list.
+///
+/// # Panics
+///
+/// Panics if the master key is not set.
+pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     let key = repo.get_key();
     assert!(!key.is_empty(), "Key must not be empty");
 
-    let patterns = &repo.conf.crypt_list;
-    if patterns.is_empty() {
-        return Err(anyhow!("No pattern to encrypt"));
-    }
-
-    // 1. Make sure everything tracked is clean or we are about to modify worktree
-    // Logic: Git add -> ls-files -> encrypt -> Git add
-    repo.add_all()?;
-
-    let target_files = repo.ls_files_absolute_with_given_patterns(
-        &patterns.iter().map(|x| x as &str).collect::<Vec<&str>>(),
-    )?;
-
+    let target_files = if paths.is_empty() {
+        list_files(repo.conf.crypt_list.iter())
+    } else {
+        list_files(paths)
+    };
+    ensure!(!target_files.is_empty(), "No file to encrypt");
     target_files.par_iter().for_each(|f| {
         if let Err(e) = encrypt_file(f, key.as_bytes(), repo.conf.zstd_level) {
             warn!("Encryption warning for {}: {}", f.display(), e);
         }
     });
-
-    repo.add_all()?;
     Ok(())
 }
 
-pub fn decrypt_repo(repo: &'static Repo, path: Vec<PathBuf>) -> Result<()> {
+/// Decrypt given files in the repo. If no paths are given, decrypt all files
+/// in the repo's crypt list.
+///
+/// # Panics
+///
+/// Panics if the master key is not set.
+pub fn decrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     let key = repo.get_key();
-    assert!(!key.is_empty(), "Key must not be empty");
-
-    // Strategy: If path provided, find files inside. If not, use crypt_list.
-    // Since we don't change extensions anymore, we rely on the crypt_list to know
-    // what *should* be encrypted, or scan files for Magic header.
-    // Better practice: Use ls-files based on crypt_list to limit scanning scope.
-
-    let files_to_decrypt =
-        if path.is_empty() {
-            // Decrypt everything in crypt_list
-            let patterns = repo
-                .conf
-                .crypt_list
-                .iter()
-                .map(std::string::String::as_str)
-                .collect::<Vec<_>>();
-            repo.ls_files_absolute_with_given_patterns(&patterns)?
-        } else {
-            let mut res = vec![];
-            for p in path {
-                if p.is_file() {
-                    res.push(p);
-                } else {
-                    res.extend_from_slice(&repo.ls_files_absolute_with_given_patterns(&[
-                        &format!("{}/**/*", p.display()),
-                    ])?);
-                }
-            }
-            res
-        };
-    files_to_decrypt
+    assert!(!key.is_empty(), "Master key must not be empty");
+    let target_files = if paths.is_empty() {
+        list_files(repo.conf.crypt_list.iter())
+    } else {
+        list_files(paths)
+    };
+    ensure!(!target_files.is_empty(), "No file to decrypt");
+    target_files
         .par_iter()
         .filter(|p| p.is_file()) // double check
         .for_each(|f| {
