@@ -93,12 +93,29 @@ mod tests {
         let paths = vec!["docs", ".gitignore", "src", "some_thing_not_exist"]
             .into_iter()
             .map(PathBuf::from);
-        let res = list_files(paths, ".");
+        let res = list_files(paths, ".")
+            .into_iter()
+            .map(|x| x.absolutize().unwrap().to_path_buf())
+            .collect::<Vec<_>>();
         dbg!(&res);
-        assert!(res.contains(&PathBuf::from("docs/README_zh-CN.md")));
-        assert!(res.contains(&PathBuf::from(".gitignore")));
-        assert!(res.contains(&PathBuf::from("src/utils/mod.rs")));
-        assert!(!res.contains(&PathBuf::from("docs/")));
+        assert!(
+            res.contains(
+                &Path::new("docs/README_zh-CN.md")
+                    .absolutize()
+                    .unwrap()
+                    .to_path_buf()
+            )
+        );
+        assert!(res.contains(&Path::new(".gitignore").absolutize().unwrap().to_path_buf()));
+        assert!(
+            res.contains(
+                &Path::new("src/utils/mod.rs")
+                    .absolutize()
+                    .unwrap()
+                    .to_path_buf()
+            )
+        );
+        assert!(!res.contains(&Path::new("docs/").absolutize().unwrap().to_path_buf()));
     }
 
     #[test]

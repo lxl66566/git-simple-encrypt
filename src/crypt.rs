@@ -19,11 +19,9 @@
 //! nonce with `i`.
 
 use std::{
-    collections::HashMap,
     fs,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
@@ -31,8 +29,9 @@ use argon2::Argon2;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
 };
+use dashmap::DashMap;
 use log::{debug, warn};
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -158,14 +157,11 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
-/// Derive a unique nonce for each chunk to prevent nonce reuse.
+/// Derive a unique nonce for each chunk.
+/// Uses a 16-byte random prefix (from [`base_nonce`]) + 8-byte chunk counter.
 fn derive_nonce(base_nonce: &[u8; NONCE_LEN], chunk_idx: u64) -> XNonce {
     let mut nonce_bytes = *base_nonce;
-    let idx_bytes = chunk_idx.to_le_bytes();
-    // XOR the chunk index into the last 8 bytes of the nonce
-    for i in 0..8 {
-        nonce_bytes[16 + i] ^= idx_bytes[i];
-    }
+    nonce_bytes[16..24].copy_from_slice(&chunk_idx.to_le_bytes());
     XNonce::from(nonce_bytes)
 }
 
@@ -249,17 +245,25 @@ pub fn encrypt_file(
             bytes_read += n;
         }
 
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
+        let is_last_chunk = bytes_read < CHUNK_SIZE;
+        let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
         let nonce = derive_nonce(&header.nonce, chunk_idx);
+
+        let payload = Payload {
+            msg: &buffer[..bytes_read],
+            aad,
+        };
+
         let ciphertext = cipher
-            .encrypt(&nonce, &buffer[..bytes_read])
+            .encrypt(&nonce, payload)
             .map_err(|e| anyhow!("Encryption failed: {e}"))?;
 
         temp_file.write_all(&ciphertext)?;
         chunk_idx += 1;
+
+        if is_last_chunk {
+            break;
+        }
     }
 
     // 5. Atomic Write with Metadata Preservation
@@ -271,7 +275,7 @@ pub fn encrypt_file(
 
 /// Decrypt a single file using streaming chunked decryption.
 pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
-    let key_cache = Mutex::new(HashMap::new());
+    let key_cache = DashMap::new();
     decrypt_file_with_cache(path, &key_cache, master_key)
 }
 
@@ -282,9 +286,9 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 ///
 /// Panics if the cache is poisoned.
 #[allow(clippy::type_complexity)]
-pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher>(
+pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher + Clone>(
     path: &Path,
-    key_cache: &Mutex<HashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>, S>>,
+    key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>, S>,
     master_key: &[u8],
 ) -> Result<()> {
     let mut file = fs::File::open(path)?;
@@ -312,12 +316,11 @@ pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher>(
 
     // 2. Retrieve or Derive Key (Argon2 Performance fixed)
     let derived_key = {
-        let mut cache = key_cache.lock().unwrap();
-        if let Some(k) = cache.get(&header.salt) {
+        if let Some(k) = key_cache.get(&header.salt) {
             k.clone()
         } else {
             let k = derive_key(master_key, &header.salt)?;
-            cache.insert(header.salt, k.clone());
+            key_cache.insert(header.salt, k.clone());
             k
         }
     };
@@ -332,12 +335,13 @@ pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher>(
     if header.is_compressed() {
         let mut decoder = zstd::stream::write::Decoder::new(&mut temp_file)?.auto_flush();
         decrypt_chunks(&mut file, &mut decoder, &cipher, &header.nonce)?;
+        decoder.flush()?;
     } else {
         decrypt_chunks(&mut file, &mut temp_file, &cipher, &header.nonce)?;
     }
+    drop(file);
 
     // 5. Atomic Write with Metadata Preservation
-    drop(file);
     atomic_write_with_metadata(path, temp_file)?;
 
     Ok(())
@@ -354,6 +358,7 @@ fn decrypt_chunks(
     // Ciphertext chunk size = Plaintext chunk size + 16 bytes (Poly1305 MAC tag)
     let mut buffer = vec![0u8; CHUNK_SIZE + 16];
     let mut chunk_idx = 0u64;
+    let mut last_chunk_was_final = false;
 
     loop {
         let mut bytes_read = 0;
@@ -369,18 +374,34 @@ fn decrypt_chunks(
             break; // EOF
         }
 
+        let is_last_chunk = bytes_read < buffer.len();
+        let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
         let nonce = derive_nonce(base_nonce, chunk_idx);
 
-        // Decrypt and wrap plaintext in Zeroizing to prevent memory leaks
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(&nonce, &buffer[..bytes_read])
-                .map_err(|e| anyhow!("Decryption failed (wrong password or corrupt data): {e}"))?,
-        );
+        let payload = chacha20poly1305::aead::Payload {
+            msg: &buffer[..bytes_read],
+            aad,
+        };
+
+        let plaintext = Zeroizing::new(cipher.decrypt(&nonce, payload).map_err(|e| {
+            anyhow!("Decryption failed (wrong password, corrupt, or tampered data): {e}")
+        })?);
 
         writer.write_all(&plaintext)?;
         chunk_idx += 1;
+
+        if is_last_chunk {
+            last_chunk_was_final = true;
+            break;
+        }
     }
+
+    if !last_chunk_was_final {
+        return Err(anyhow!(
+            "File truncation detected! The ciphertext is incomplete."
+        ));
+    }
+
     Ok(())
 }
 
@@ -681,7 +702,7 @@ mod tests {
         assert_eq!(encrypted_perms.mode() & 0o777, 0o755);
 
         // Decrypt
-        let key_cache = Mutex::new(HashMap::new());
+        let key_cache = DashMap::new();
         decrypt_file(path, master_key).unwrap();
 
         // Check permissions after decryption
