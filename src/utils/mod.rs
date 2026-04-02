@@ -31,20 +31,27 @@ pub fn prompt_password(prompt: &str) -> Result<String> {
 
 /// If the given path is a file, return the file name. Otherwise, return the
 /// recursive file name in the given dir.
-pub fn list_files(paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Vec<PathBuf> {
+pub fn list_files(
+    paths: impl IntoIterator<Item = impl AsRef<Path>>,
+    cwd: impl AsRef<Path>,
+) -> Vec<PathBuf> {
     let mut paths_iter = paths.into_iter();
+    let cwd = cwd.as_ref();
 
-    let Some(first_path) = paths_iter.next() else {
+    let mut builder = if let Some(first_path) = paths_iter.next() {
+        debug_assert!(first_path.as_ref().is_relative());
+        WalkBuilder::new(cwd.join(first_path))
+    } else {
         return Vec::new();
     };
 
-    let mut builder = WalkBuilder::new(first_path);
-
     for p in paths_iter {
-        builder.add(p);
+        debug_assert!(p.as_ref().is_relative());
+        builder.add(cwd.join(p));
     }
 
     builder
+        .current_dir(cwd)
         .hidden(false)
         .git_ignore(true)
         .ignore(true)
@@ -53,7 +60,7 @@ pub fn list_files(paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Vec<Path
         .follow_links(false)
         .threads(0);
 
-    let parallel_walker = builder.build_parallel();
+    let parallel_walker: ignore::WalkParallel = builder.build_parallel();
 
     let (tx, rx) = mpsc::channel();
 
@@ -77,6 +84,7 @@ pub fn list_files(paths: impl IntoIterator<Item = impl AsRef<Path>>) -> Vec<Path
 #[cfg(test)]
 mod tests {
     use assert2::assert;
+    use path_absolutize::Absolutize as _;
 
     use super::*;
 
@@ -85,11 +93,23 @@ mod tests {
         let paths = vec!["docs", ".gitignore", "src", "some_thing_not_exist"]
             .into_iter()
             .map(PathBuf::from);
-        let res = list_files(paths);
+        let res = list_files(paths, ".");
         dbg!(&res);
         assert!(res.contains(&PathBuf::from("docs/README_zh-CN.md")));
         assert!(res.contains(&PathBuf::from(".gitignore")));
         assert!(res.contains(&PathBuf::from("src/utils/mod.rs")));
         assert!(!res.contains(&PathBuf::from("docs/")));
+    }
+
+    #[test]
+    fn test_cwd() {
+        assert_eq!(
+            list_files([".gitignore"], Path::new(".").absolutize().unwrap()),
+            vec![Path::new(".gitignore").absolutize().unwrap()]
+        );
+        assert_eq!(
+            list_files(["lib.rs"], Path::new("src").absolutize().unwrap()),
+            vec![Path::new("src/lib.rs").absolutize().unwrap()]
+        );
     }
 }

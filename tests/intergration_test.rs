@@ -48,7 +48,6 @@ fn exec(cmd: &str, pwd: impl AsRef<Path>) -> std::io::Result<Output> {
 
 fn run(cmd: SubCommand, pwd: impl Into<PathBuf>) -> anyhow::Result<()> {
     let pwd = pwd.into();
-    std::env::set_current_dir(&pwd).unwrap();
     git_simple_encrypt::run(Cli {
         command: cmd,
         repo: pwd,
@@ -85,7 +84,7 @@ where
 // ============ region Tests ============
 
 #[test]
-fn test() -> anyhow::Result<()> {
+fn test_basic() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 

@@ -7,7 +7,6 @@ use anyhow::{Result, anyhow};
 use assert2::assert;
 use config_file2::LoadConfigFile;
 use log::{info, warn};
-use path_absolutize::Absolutize;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
@@ -26,14 +25,10 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// open a repo. The [`path`] of repo will be processed to absolute path.
+    /// open a repo. The [`path`] param must be absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut repo_path = path
-            .as_ref()
-            .absolutize()
-            .expect("path absolutize failed")
-            .to_path_buf();
-        assert!(repo_path.is_absolute(), "given path must be absolute");
+        debug_assert!(path.as_ref().is_absolute(), "given path must be absolute");
+        let mut repo_path = path.as_ref().to_path_buf();
         assert!(
             repo_path.exists(),
             "Repo not found: {}",
@@ -59,8 +54,7 @@ impl Repo {
                 config_file_path.display()
             );
         }
-        let mut conf = Config::load_or_default(config_file_path)?;
-        conf.repo_path.clone_from(&repo_path);
+        let conf = Config::load_or_default(&config_file_path)?.with_repo_path(&repo_path);
         Ok(Self {
             path: repo_path,
             conf,
@@ -141,13 +135,15 @@ impl GitCommand for Repo {
 
 #[cfg(test)]
 mod tests {
+    use path_absolutize::Absolutize;
+
     use super::*;
 
     #[test]
     fn test_repo_open() -> Result<()> {
-        let repo = Repo::open(Path::new("."))?;
+        let repo = Repo::open(Path::new(".").absolutize()?)?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
-        let repo = Repo::open(Path::new("./.git"))?;
+        let repo = Repo::open(Path::new("./.git").absolutize()?)?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
         Ok(())
     }

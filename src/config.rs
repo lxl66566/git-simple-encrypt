@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use assert2::assert;
 use colored::Colorize;
-use config_file2::StoreConfigFile;
+use config_file2::Storable;
 use fuck_backslash::FuckBackslash;
 use log::{debug, info};
 use path_absolutize::Absolutize as _;
@@ -11,12 +11,16 @@ use serde::{Deserialize, Serialize};
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Config {
     /// **absolute path** of the repo. This config item will not be ser/de from
     /// file; instead, it will be set by cli param.
     #[serde(skip)]
     pub repo_path: PathBuf,
+    /// config file path
+    #[serde(skip)]
+    pub(crate) config_path: PathBuf,
     /// whether to use zstd
     pub use_zstd: bool,
     /// zstd compression level (1-22).
@@ -29,6 +33,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             repo_path: PathBuf::from("."),
+            config_path: PathBuf::from(CONFIG_FILE_NAME),
             use_zstd: true,
             zstd_level: 15,
             crypt_list: vec![],
@@ -36,28 +41,33 @@ impl Default for Config {
     }
 }
 
+impl Storable for Config {
+    fn path(&self) -> impl AsRef<Path> {
+        &self.config_path
+    }
+}
+
 impl Config {
+    /// The path must be absolute.
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::default().with_repo_path(path)
     }
+    /// The path must be absolute.
     pub fn with_repo_path(mut self, path: impl AsRef<Path>) -> Self {
-        self.repo_path = path
-            .as_ref()
-            .absolutize()
-            .expect("path absolutize failed")
-            .to_path_buf();
+        let path = path.as_ref();
+        self.repo_path = path.to_path_buf();
+        self.config_path = path.join(CONFIG_FILE_NAME);
         self
-    }
-    /// The absolute path of the config file.
-    pub fn config_path(&self) -> PathBuf {
-        self.repo_path.join(CONFIG_FILE_NAME)
     }
 
     /// Add one path to crypt list
     ///
     /// path could be either relative or absolute.
     pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) {
-        let path = path.as_ref().absolutize().expect("path absolutize failed");
+        let path = path
+            .as_ref()
+            .absolutize_from(&self.repo_path)
+            .expect("path absolutize failed");
         debug!("adding path to crypt list: {}", path.display());
         assert!(path.exists(), "file or dir not exist: {:?}", path);
         let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
@@ -87,7 +97,8 @@ impl Config {
         for x in paths {
             self.add_one_path_to_crypt_list(x.as_ref());
         }
-        self.store(CONFIG_FILE_NAME).map_err(|e| anyhow::anyhow!(e))
+        debug!("store config to {}", self.config_path.display());
+        self.store().map_err(|e| anyhow::anyhow!(e))
     }
 }
 

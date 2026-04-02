@@ -1,13 +1,10 @@
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use config_file2::StoreConfigFile;
-use log::{info, warn};
+use config_file2::Storable;
+use log::{debug, info, warn};
 
-use crate::{
-    config::CONFIG_FILE_NAME,
-    repo::{GitCommand, Repo},
-};
+use crate::repo::{GitCommand, Repo};
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
@@ -109,7 +106,8 @@ impl SetField {
                 info!("zstd compression level set to {value}");
             }
         }
-        repo.conf.store(CONFIG_FILE_NAME)?;
+        debug!("store config to {}", repo.conf.config_path.display());
+        repo.conf.store()?;
 
         Ok(())
     }

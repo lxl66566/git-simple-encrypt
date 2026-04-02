@@ -396,9 +396,9 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     assert!(!key.is_empty(), "Key must not be empty");
 
     let target_files = if paths.is_empty() {
-        list_files(repo.conf.crypt_list.iter())
+        list_files(repo.conf.crypt_list.iter(), repo.path())
     } else {
-        list_files(paths)
+        list_files(paths, repo.path())
     };
     ensure!(!target_files.is_empty(), "No file to encrypt");
 
@@ -433,9 +433,9 @@ pub fn decrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     assert!(!key.is_empty(), "Master key must not be empty");
 
     let target_files = if paths.is_empty() {
-        list_files(repo.conf.crypt_list.iter())
+        list_files(repo.conf.crypt_list.iter(), repo.path())
     } else {
-        list_files(paths)
+        list_files(paths, repo.path())
     };
     ensure!(!target_files.is_empty(), "No file to decrypt");
 

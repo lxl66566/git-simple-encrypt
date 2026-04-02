@@ -9,6 +9,7 @@ mod repo;
 mod utils;
 
 use anyhow::Result;
+use assert2::assert;
 use crypt::{decrypt_repo, encrypt_repo};
 use repo::Repo;
 
@@ -19,6 +20,7 @@ pub use crate::{
 
 #[allow(clippy::missing_panics_doc, clippy::missing_errors_doc)]
 pub fn run(cli: Cli) -> Result<()> {
+    assert!(cli.repo.is_absolute(), "repo path must be absolute");
     let repo = Repo::open(&cli.repo)?;
     let repo = Box::leak(Box::new(repo));
     match cli.command {
