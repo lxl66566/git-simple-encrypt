@@ -25,6 +25,7 @@ copy-metadata     = "0.2.0"
 dashmap           = "6.1.0"
 fuck-backslash    = "0.1.0"
 ignore            = { version = "0.4.25", features = ["simd-accel"] }
+indicatif         = "0.18"
 log               = "0.4"
 memmap2           = "0.9"
 path-absolutize   = "3"

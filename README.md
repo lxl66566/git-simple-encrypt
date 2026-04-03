@@ -10,6 +10,7 @@ A simple, secure git encryption tool. With just one password, you can encrypt/de
 - Parallel acceleration: Multi-threaded parallel encryption/decryption makes full use of multi-core CPU performance.
 - Metadata retention: Atomic write during encryption/decryption preserves original file permissions and timestamps.
 - Zstd compression: Enabled by default.
+- Duality guarantee: Cache salt and nonce during decryption and reuse them during encryption. If the file remains unchanged, the encrypted output remains the same, avoiding repository size inflation caused by repeated encryption and decryption.
 
 ## Installation
 
@@ -44,6 +45,7 @@ git-se e                    # Encrypt all files in the list
 git-se d                    # Decrypt all files in the list
 git-se e xxx.txt dir1 ...   # Encrypt specific files
 git-se d xxx.txt dir1 ...   # Decrypt specific files
+git-se i                    # Install a pre-commit hook to check encryption before committing
 ```
 
 ## Notes

@@ -22,14 +22,15 @@ use std::{
     fs,
     io::{Cursor, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
 use argon2::Argon2;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use chacha20poly1305::{
-    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
+    aead::{Aead, KeyInit, Payload},
 };
 use dashmap::DashMap;
 use log::{debug, warn};
@@ -39,22 +40,25 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 use crate::{
-    salt_cache::{self, CachedEntry, SaltCacheReader},
-    utils::list_files,
     Repo,
+    salt_cache::{self, CachedEntry, SaltCacheReader},
+    utils::{
+        create_progress_bar, is_file_encrypted, print_post_report, print_pre_report,
+        resolve_target_files,
+    },
 };
 
 // --- Constants & Header Layout ---
 
-const MAGIC: &[u8; 5] = b"GITSE";
-const VERSION: u8 = 2;
+pub const MAGIC: &[u8; 5] = b"GITSE";
+pub const VERSION: u8 = 2;
 const FLAG_COMPRESSED: u8 = 1 << 0; // Bit 0
 const ENC_ALGO: u8 = 1; // 1 = XChaCha20-Poly1305
 
 // Sizes
 pub const SALT_LEN: usize = 16;
 pub const NONCE_LEN: usize = 24; // XChaCha20 uses a 192-bit (24-byte) nonce
-const HEADER_LEN: usize = 64;
+pub const HEADER_LEN: usize = 64;
 const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + NONCE_LEN); // 16 bytes
 
 // Streaming
@@ -453,16 +457,15 @@ fn decrypt_chunks(
 ///
 /// # Panics
 /// Panics if the master key is not set.
-pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
+pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key();
     assert!(!key.is_empty(), "Key must not be empty");
 
-    let target_files = if paths.is_empty() {
-        list_files(repo.conf.crypt_list.iter(), repo.path())
-    } else {
-        list_files(paths, repo.path())
-    };
+    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
     ensure!(!target_files.is_empty(), "No file to encrypt");
+
+    // Pre-operation report
+    print_pre_report("Encrypting", &target_files, repo.path());
 
     // Read-only cache: mmap + rkyv zero-copy.
     let reader = SaltCacheReader::load(repo.path());
@@ -473,10 +476,12 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
 
     // Generate a single batch salt for files that have no cache entry.
-    // This preserves the original performance characteristic of one Argon2
-    // call for a full-batch encrypt.
     let mut batch_salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut batch_salt);
+
+    let pb = create_progress_bar(target_files.len(), "Encrypt");
+    let skipped = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
 
     let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
         let (salt, cached_nonce) = reader
@@ -503,17 +508,22 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
         )
         .with_context(|| format!("Failed to encrypt {}", f.display()))?;
 
-        // Send the salt+nonce used for this file.
-        if let Some(h) = header {
-            sender.insert(
-                f,
-                CachedEntry {
-                    salt: *h.salt(),
-                    nonce: *h.nonce(),
-                },
-            );
+        match header {
+            Some(h) => {
+                sender.insert(
+                    f,
+                    CachedEntry {
+                        salt: *h.salt(),
+                        nonce: *h.nonce(),
+                    },
+                );
+            }
+            None => {
+                skipped.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
+        pb.inc(1);
         Ok(())
     });
 
@@ -521,7 +531,17 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     drop(sender);
     saver.save();
 
+    pb.finish_and_clear();
+
+    print_post_report(
+        "Encrypt",
+        target_files.len(),
+        skipped.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+    );
+
     result?;
+
     Ok(())
 }
 
@@ -534,35 +554,58 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
 ///
 /// # Panics
 /// Panics if the master key is not set.
-pub fn decrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
+pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key();
     assert!(!key.is_empty(), "Master key must not be empty");
 
-    let target_files = if paths.is_empty() {
-        list_files(repo.conf.crypt_list.iter(), repo.path())
-    } else {
-        list_files(paths, repo.path())
-    };
+    let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
     ensure!(!target_files.is_empty(), "No file to decrypt");
+
+    // Pre-operation report
+    print_pre_report("Decrypting", &target_files, repo.path());
 
     let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
 
     // Write-only: mpsc channel collects salt/nonce from rayon threads.
     let (sender, saver) = salt_cache::create_writer(repo.path());
 
-    let result = target_files
-        .par_iter()
-        .filter(|p| p.is_file())
-        .try_for_each(|f| -> Result<()> {
-            decrypt_file_with_cache(f, &key_cache, Some(&sender), key.as_bytes())
-                .with_context(|| format!("Failed to decrypt {}", f.display()))
-        });
+    let pb = create_progress_bar(target_files.len(), "Decrypt");
+    let skipped = AtomicUsize::new(0);
+    let failed = AtomicUsize::new(0);
+
+    let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
+        if !is_file_encrypted(f)? {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            pb.inc(1);
+            return Ok(());
+        }
+
+        let decrypt_result = decrypt_file_with_cache(f, &key_cache, Some(&sender), key.as_bytes())
+            .with_context(|| format!("Failed to decrypt {}", f.display()));
+
+        if decrypt_result.is_err() {
+            failed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        pb.inc(1);
+        decrypt_result
+    });
 
     // Drop sender to close the channel, then persist the cache.
     drop(sender);
     saver.save();
 
+    pb.finish_and_clear();
+
+    print_post_report(
+        "Decrypt",
+        target_files.len(),
+        skipped.load(Ordering::Relaxed),
+        failed.load(Ordering::Relaxed),
+    );
+
     result?;
+
     Ok(())
 }
 
@@ -763,10 +806,12 @@ mod tests {
         let result = decrypt_file(&path, master_key);
 
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Decryption failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Decryption failed")
+        );
     }
 
     #[test]

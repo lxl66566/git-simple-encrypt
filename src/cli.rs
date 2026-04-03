@@ -13,6 +13,8 @@ git-se add file.txt     # mark `file.txt` as need-to-be-crypted
 git-se e                # encrypt current repo with all marked files
 git-se d                # decrypt current repo
 git-se d 'src/*'        # decrypt all encrypted files in `src` folder
+git-se c                # check if all files in crypt list are encrypted
+git-se i                # install pre-commit hook for encryption check
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {
@@ -65,6 +67,16 @@ pub enum SubCommand {
     /// Set password interactively.
     #[clap(alias("p"))]
     Pwd,
+    /// Check if all files in the crypt list are encrypted.
+    #[clap(alias("c"))]
+    Check {
+        /// The files or folders to check. If empty, checks all files in the
+        /// crypt list.
+        paths: Vec<PathBuf>,
+    },
+    /// Install a pre-commit hook to check encryption before committing.
+    #[clap(alias("i"))]
+    Install,
 }
 
 #[derive(Debug, Subcommand, Clone)]
