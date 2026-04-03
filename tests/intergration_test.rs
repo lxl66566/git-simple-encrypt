@@ -238,6 +238,36 @@ fn test_many_files() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_large_file_encrypt_decrypt() -> anyhow::Result<()> {
+    const FILE_SIZE: usize = 5 * 1024 * 1024; // 5 MB
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let mut rng = rand::rngs::SmallRng::from_seed([42; 32]);
+    let original_data: Vec<u8> = (0..FILE_SIZE).map(|_| rng.random::<u8>()).collect();
+
+    let file_path = temp_dir.join("large.bin");
+    std::fs::write(&file_path, &original_data)?;
+
+    run(
+        SubCommand::Add {
+            paths: vec![file_path.clone()],
+        },
+        temp_dir,
+    )?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+
+    assert!(file_path.is_encrypted());
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+
+    let decrypted_data = std::fs::read(&file_path)?;
+    assert_eq!(decrypted_data, original_data);
+    assert!(file_path.is_not_encrypted());
+
+    Ok(())
+}
+
+#[test]
 fn test_partial_decrypt() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
@@ -293,10 +323,57 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let file_path = temp_dir.join("secret.txt");
+    let original_content = b"Hello, this is a secret message that must be authenticated!";
+    std::fs::write(&file_path, original_content)?;
+
+    run(
+        SubCommand::Add {
+            paths: vec![file_path.clone()],
+        },
+        temp_dir,
+    )?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+
+    assert!(file_path.is_encrypted());
+    let mut encrypted_data = std::fs::read(&file_path)?;
+    assert!(!encrypted_data.is_empty());
+
+    // 篡改：翻转中间的一个字节
+    let mid = encrypted_data.len() / 2;
+    encrypted_data[mid] ^= 0xFF;
+
+    // 写回篡改后的数据
+    std::fs::write(&file_path, &encrypted_data)?;
+
+    // 尝试解密，应该失败（AAD 校验不通过）
+    let decrypt_result = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
+    dbg!(&decrypt_result);
+    assert!(decrypt_result.is_err());
+    // 可选：验证文件仍然处于加密状态（因为解密失败，文件未被修改）
+    assert!(file_path.is_encrypted());
+
+    // 另一种篡改方式：截断文件末尾 10 个字节
+    let mut encrypted_data2 = std::fs::read(&file_path)?;
+    encrypted_data2.truncate(encrypted_data2.len().saturating_sub(10));
+    std::fs::write(&file_path, &encrypted_data2)?;
+
+    let decrypt_result2 = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
+    dbg!(&decrypt_result);
+    assert!(decrypt_result2.is_err());
+
+    Ok(())
+}
+
 #[bench]
 fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
-    const FILES_NUM: i32 = 3;
-    const FILE_SIZE: usize = 100;
+    const FILES_NUM: i32 = 5;
+    const FILE_SIZE: usize = 256 * 1024;
 
     let pwd = bench_init();
     let temp_dir = pwd.path();

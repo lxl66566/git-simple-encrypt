@@ -1,7 +1,7 @@
 [package]
 authors     = ["lxl66566 <lxl66566@gmail.com>"]
 categories  = ["cryptography"]
-description = "Encrypt/decrypt files in git repo using one password"
+description = "Encrypt/decrypt some files in your git repo using only one password"
 edition     = "2024"
 homepage    = "https://github.com/lxl66566/git-simple-encrypt"
 keywords    = ["git", "encryption"]
@@ -9,7 +9,7 @@ license     = "MIT"
 name        = "git-simple-encrypt"
 readme      = "./README.md"
 repository  = "https://github.com/lxl66566/git-simple-encrypt"
-version     = "1.5.0"
+version     = "2.0.0"
 
 [dependencies]
 anyhow            = "1.0"
@@ -49,6 +49,6 @@ path = "src/lib.rs"
 
 [profile.release]
 lto       = true
-opt-level = "z"
+opt-level = "s"
 panic     = "abort"
 strip     = true
