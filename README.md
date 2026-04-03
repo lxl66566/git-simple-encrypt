@@ -103,3 +103,10 @@ sequenceDiagram
     T->>T: 5. Copy metadata (Permissions/Timestamps)
     T->>F: 6. Atomic overwrite (fs::rename)
 ```
+
+### 4. Deterministic Re-encryption (Salt + Nonce Caching)
+
+To ensure that repeated decrypt -> encrypt cycles produce exactly the same ciphertext (avoiding Git repository bloat), the program persists the salt and nonce for each file in `.git/git-simple-encrypt-salt-cache`.
+
+- **Encryption**: The cache file is memory-mapped via `mmap`, and `rkyv` zero-copy deserialization is used to directly query a `HashMap<path → (salt, nonce)>`.
+- **Decryption**: Rayon worker threads send `(path, salt, nonce)` entries through an `mpsc` channel. The main thread collects these entries, writes them to disk via `rkyv` serialization, and merges them with the existing cache.

@@ -103,3 +103,10 @@ sequenceDiagram
     T->>T: 5. 复制元数据 (Permissions/Timestamps)
     T->>F: 6. 原子覆写 (fs::rename)
 ```
+
+### 4. 确定性重加密（Salt + Nonce 缓存）
+
+为保证 decrypt -> encrypt 循环产生完全相同的密文（避免 Git 仓库膨胀），程序在 `.git/git-simple-encrypt-salt-cache` 中持久化每个文件的 Salt 和 Nonce。
+
+- 加密：通过 mmap 将缓存文件映射到内存，rkyv zerocopy 反序列化直接查询 `HashMap<path → (salt, nonce)>`。
+- 解密：Rayon 工作线程通过 mpsc channel 发送 `(path, salt, nonce)` 条目，主线程收集后通过 rkyv 序列化写入磁盘，并与已有缓存合并。

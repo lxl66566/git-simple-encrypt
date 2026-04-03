@@ -24,12 +24,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{anyhow, ensure, Context, Result};
 use argon2::Argon2;
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
+    XChaCha20Poly1305, XNonce,
 };
 use dashmap::DashMap;
 use log::{debug, warn};
@@ -38,7 +38,11 @@ use rayon::prelude::*;
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
-use crate::{repo::Repo, salt_cache, utils::list_files};
+use crate::{
+    salt_cache::{self, CachedEntry, SaltCacheReader},
+    utils::list_files,
+    Repo,
+};
 
 // --- Constants & Header Layout ---
 
@@ -297,17 +301,16 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 }
 
 /// Decrypt a single file using streaming chunked decryption, with a thread-safe
-/// cache for derived keys and an optional salt cache for deterministic
+/// cache for derived keys and an optional cache sender for deterministic
 /// re-encryption.
 ///
 /// # Panics
 ///
 /// Panics if the cache is poisoned.
-#[allow(clippy::type_complexity)]
-pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher + Clone>(
+pub fn decrypt_file_with_cache(
     path: &Path,
-    key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>, S>,
-    salt_cache: Option<&salt_cache::SaltCache>,
+    key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>>,
+    cache_sender: Option<&salt_cache::SaltCacheSender>,
     master_key: &[u8],
 ) -> Result<()> {
     let mut file = fs::File::open(path)?;
@@ -335,10 +338,10 @@ pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher + Clone>(
 
     // Cache the salt+nonce BEFORE decryption so it is preserved even if
     // decryption fails halfway through.
-    if let Some(sc) = salt_cache {
-        sc.insert(
+    if let Some(sender) = cache_sender {
+        sender.insert(
             path,
-            salt_cache::CachedEntry {
+            CachedEntry {
                 salt: header.salt,
                 nonce: header.nonce,
             },
@@ -443,10 +446,10 @@ fn decrypt_chunks(
 ///
 /// # Deterministic Re-encryption
 ///
-/// Loads the salt+nonce cache (populated by a previous decrypt) and reuses
-/// cached values so that decrypt→encrypt on unchanged content produces
-/// byte-identical ciphertext. Files not in the cache share a single new
-/// batch salt to minimise Argon2 overhead.
+/// Loads the salt+nonce cache (populated by a previous decrypt) via mmap +
+/// rkyv zero-copy and reuses cached values so that decrypt→encrypt on
+/// unchanged content produces byte-identical ciphertext. Files not in the
+/// cache share a single new batch salt to minimise Argon2 overhead.
 ///
 /// # Panics
 /// Panics if the master key is not set.
@@ -461,7 +464,12 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     };
     ensure!(!target_files.is_empty(), "No file to encrypt");
 
-    let salt_cache = salt_cache::SaltCache::load(repo.path());
+    // Read-only cache: mmap + rkyv zero-copy.
+    let reader = SaltCacheReader::load(repo.path());
+
+    // Write path: mpsc sender for new/updated entries.
+    let (sender, saver) = salt_cache::create_writer(repo.path());
+
     let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
 
     // Generate a single batch salt for files that have no cache entry.
@@ -471,7 +479,7 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     rand::rng().fill_bytes(&mut batch_salt);
 
     let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
-        let (salt, cached_nonce) = salt_cache
+        let (salt, cached_nonce) = reader
             .get(f)
             .map_or((batch_salt, None), |entry| (entry.salt, Some(entry.nonce)));
 
@@ -495,11 +503,11 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
         )
         .with_context(|| format!("Failed to encrypt {}", f.display()))?;
 
-        // Update cache with the salt+nonce used for this file.
+        // Send the salt+nonce used for this file.
         if let Some(h) = header {
-            salt_cache.insert(
+            sender.insert(
                 f,
-                salt_cache::CachedEntry {
+                CachedEntry {
                     salt: *h.salt(),
                     nonce: *h.nonce(),
                 },
@@ -509,9 +517,9 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
         Ok(())
     });
 
-    // Always save the cache — even on partial failure the successfully
-    // processed entries should be preserved for the next run.
-    salt_cache.save();
+    // Drop sender to close the mpsc channel, then persist the cache.
+    drop(sender);
+    saver.save();
 
     result?;
     Ok(())
@@ -520,9 +528,9 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
 /// Decrypt given files in the repo. If no paths are given, decrypt all files
 /// in the repo's crypt list.
 ///
-/// The salt+nonce of each successfully parsed encrypted file is captured into
-/// the persistent salt cache so that a subsequent encrypt can reproduce
-/// identical ciphertext.
+/// The salt+nonce of each successfully parsed encrypted file is captured via
+/// an mpsc channel so that a subsequent encrypt can reproduce identical
+/// ciphertext.
 ///
 /// # Panics
 /// Panics if the master key is not set.
@@ -538,19 +546,21 @@ pub fn decrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     ensure!(!target_files.is_empty(), "No file to decrypt");
 
     let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
-    let salt_cache = salt_cache::SaltCache::load(repo.path());
+
+    // Write-only: mpsc channel collects salt/nonce from rayon threads.
+    let (sender, saver) = salt_cache::create_writer(repo.path());
 
     let result = target_files
         .par_iter()
         .filter(|p| p.is_file())
         .try_for_each(|f| -> Result<()> {
-            decrypt_file_with_cache(f, &key_cache, Some(&salt_cache), key.as_bytes())
+            decrypt_file_with_cache(f, &key_cache, Some(&sender), key.as_bytes())
                 .with_context(|| format!("Failed to decrypt {}", f.display()))
         });
 
-    // Always save the salt cache — even on partial failure the extracted
-    // entries are valuable for the next encrypt run.
-    salt_cache.save();
+    // Drop sender to close the channel, then persist the cache.
+    drop(sender);
+    saver.save();
 
     result?;
     Ok(())
@@ -753,12 +763,10 @@ mod tests {
         let result = decrypt_file(&path, master_key);
 
         assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Decryption failed")
-        );
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Decryption failed"));
     }
 
     #[test]
