@@ -1,4 +1,2 @@
 /target
-/test_assets/test.txt.enc
-/test_assets/test.txt.zst.enc
-/test_assets/test.zst.enc
+.opencode

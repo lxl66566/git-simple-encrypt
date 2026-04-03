@@ -38,7 +38,7 @@ use rayon::prelude::*;
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
-use crate::{repo::Repo, utils::list_files};
+use crate::{repo::Repo, salt_cache, utils::list_files};
 
 // --- Constants & Header Layout ---
 
@@ -48,8 +48,8 @@ const FLAG_COMPRESSED: u8 = 1 << 0; // Bit 0
 const ENC_ALGO: u8 = 1; // 1 = XChaCha20-Poly1305
 
 // Sizes
-const SALT_LEN: usize = 16;
-const NONCE_LEN: usize = 24; // XChaCha20 uses a 192-bit (24-byte) nonce
+pub const SALT_LEN: usize = 16;
+pub const NONCE_LEN: usize = 24; // XChaCha20 uses a 192-bit (24-byte) nonce
 const HEADER_LEN: usize = 64;
 const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + NONCE_LEN); // 16 bytes
 
@@ -69,10 +69,13 @@ pub struct FileHeader {
 
 impl FileHeader {
     #[must_use]
-    pub fn new(compressed: bool, salt: [u8; SALT_LEN]) -> Self {
-        let mut rng = rand::rng();
-        let mut nonce = [0u8; NONCE_LEN];
-        rng.fill_bytes(&mut nonce);
+    pub fn new(compressed: bool, salt: [u8; SALT_LEN], nonce: Option<[u8; NONCE_LEN]>) -> Self {
+        let nonce = nonce.unwrap_or_else(|| {
+            let mut rng = rand::rng();
+            let mut n = [0u8; NONCE_LEN];
+            rng.fill_bytes(&mut n);
+            n
+        });
 
         let mut flags = 0u8;
         if compressed {
@@ -142,6 +145,16 @@ impl FileHeader {
     pub const fn is_compressed(&self) -> bool {
         (self.flags & FLAG_COMPRESSED) != 0
     }
+
+    #[must_use]
+    pub const fn salt(&self) -> &[u8; SALT_LEN] {
+        &self.salt
+    }
+
+    #[must_use]
+    pub const fn nonce(&self) -> &[u8; NONCE_LEN] {
+        &self.nonce
+    }
 }
 
 // --- Core Logic ---
@@ -189,12 +202,16 @@ fn atomic_write_with_metadata(original_path: &Path, temp_file: NamedTempFile) ->
 // --- Public Operations ---
 
 /// Encrypt a single file using streaming chunked encryption.
+///
+/// Returns `Some(header)` on success, or `None` if the file was already
+/// encrypted and skipped.
 pub fn encrypt_file(
     path: &Path,
     derived_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
+    nonce: Option<[u8; NONCE_LEN]>,
     zstd: Option<u8>,
-) -> Result<()> {
+) -> Result<Option<FileHeader>> {
     let mut file = fs::File::open(path)?;
 
     // 1. Quick check if already encrypted (Redundant I/O fixed)
@@ -204,14 +221,14 @@ pub fn encrypt_file(
         && header_bytes[5] == VERSION
     {
         warn!("File already encrypted, skipping: {}", path.display());
-        return Ok(());
+        return Ok(None);
     }
     file.seek(SeekFrom::Start(0))?; // Rewind to start
 
     debug!("Encrypting: {}", path.display());
 
     // 2. Prepare Header & Temp File
-    let header = FileHeader::new(zstd.is_some(), *salt);
+    let header = FileHeader::new(zstd.is_some(), *salt, nonce);
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent_dir)
         .with_context(|| "Failed to create temp file".to_string())?;
@@ -270,17 +287,18 @@ pub fn encrypt_file(
     drop(reader);
     atomic_write_with_metadata(path, temp_file)?;
 
-    Ok(())
+    Ok(Some(header))
 }
 
 /// Decrypt a single file using streaming chunked decryption.
 pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
     let key_cache = DashMap::new();
-    decrypt_file_with_cache(path, &key_cache, master_key)
+    decrypt_file_with_cache(path, &key_cache, None, master_key)
 }
 
 /// Decrypt a single file using streaming chunked decryption, with a thread-safe
-/// cache for derived keys.
+/// cache for derived keys and an optional salt cache for deterministic
+/// re-encryption.
 ///
 /// # Panics
 ///
@@ -289,6 +307,7 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher + Clone>(
     path: &Path,
     key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>, S>,
+    salt_cache: Option<&salt_cache::SaltCache>,
     master_key: &[u8],
 ) -> Result<()> {
     let mut file = fs::File::open(path)?;
@@ -313,6 +332,18 @@ pub fn decrypt_file_with_cache<S: ::std::hash::BuildHasher + Clone>(
     debug!("Decrypting: {}", path.display());
     let header = FileHeader::read(&mut Cursor::new(&header_bytes))
         .with_context(|| format!("Corrupt header in {}", path.display()))?;
+
+    // Cache the salt+nonce BEFORE decryption so it is preserved even if
+    // decryption fails halfway through.
+    if let Some(sc) = salt_cache {
+        sc.insert(
+            path,
+            salt_cache::CachedEntry {
+                salt: header.salt,
+                nonce: header.nonce,
+            },
+        );
+    }
 
     // 2. Retrieve or Derive Key (Argon2 Performance fixed)
     let derived_key = {
@@ -410,6 +441,13 @@ fn decrypt_chunks(
 /// Encrypt given files in the repo. If no paths are given, encrypt all files
 /// in the repo's crypt list.
 ///
+/// # Deterministic Re-encryption
+///
+/// Loads the salt+nonce cache (populated by a previous decrypt) and reuses
+/// cached values so that decrypt→encrypt on unchanged content produces
+/// byte-identical ciphertext. Files not in the cache share a single new
+/// batch salt to minimise Argon2 overhead.
+///
 /// # Panics
 /// Panics if the master key is not set.
 pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
@@ -423,29 +461,68 @@ pub fn encrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     };
     ensure!(!target_files.is_empty(), "No file to encrypt");
 
-    // 1. Generate a single SALT for this entire encryption run
-    let mut salt = [0u8; SALT_LEN];
-    rand::rng().fill_bytes(&mut salt);
+    let salt_cache = salt_cache::SaltCache::load(repo.path());
+    let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
 
-    // 2. Derive the Master Key ONCE using Argon2
-    let derived_key = derive_key(key.as_bytes(), &salt)?;
+    // Generate a single batch salt for files that have no cache entry.
+    // This preserves the original performance characteristic of one Argon2
+    // call for a full-batch encrypt.
+    let mut batch_salt = [0u8; SALT_LEN];
+    rand::rng().fill_bytes(&mut batch_salt);
 
-    // 3. Encrypt files in parallel
-    target_files.par_iter().try_for_each(|f| -> Result<()> {
-        encrypt_file(
+    let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
+        let (salt, cached_nonce) = salt_cache
+            .get(f)
+            .map_or((batch_salt, None), |entry| (entry.salt, Some(entry.nonce)));
+
+        // Derive key — cached across threads to avoid redundant Argon2 work.
+        let derived_key = {
+            if let Some(k) = key_cache.get(&salt) {
+                k.clone()
+            } else {
+                let k = derive_key(key.as_bytes(), &salt)?;
+                key_cache.insert(salt, k.clone());
+                k
+            }
+        };
+
+        let header = encrypt_file(
             f,
             &derived_key,
             &salt,
+            cached_nonce,
             repo.conf.use_zstd.then_some(repo.conf.zstd_level),
         )
-        .with_context(|| format!("Failed to encrypt {}", f.display()))
-    })?;
+        .with_context(|| format!("Failed to encrypt {}", f.display()))?;
 
+        // Update cache with the salt+nonce used for this file.
+        if let Some(h) = header {
+            salt_cache.insert(
+                f,
+                salt_cache::CachedEntry {
+                    salt: *h.salt(),
+                    nonce: *h.nonce(),
+                },
+            );
+        }
+
+        Ok(())
+    });
+
+    // Always save the cache — even on partial failure the successfully
+    // processed entries should be preserved for the next run.
+    salt_cache.save();
+
+    result?;
     Ok(())
 }
 
 /// Decrypt given files in the repo. If no paths are given, decrypt all files
 /// in the repo's crypt list.
+///
+/// The salt+nonce of each successfully parsed encrypted file is captured into
+/// the persistent salt cache so that a subsequent encrypt can reproduce
+/// identical ciphertext.
 ///
 /// # Panics
 /// Panics if the master key is not set.
@@ -460,15 +537,22 @@ pub fn decrypt_repo(repo: &'static Repo, paths: Vec<PathBuf>) -> Result<()> {
     };
     ensure!(!target_files.is_empty(), "No file to decrypt");
 
-    // Decrypt files in parallel (Rayon error swallowing fixed)
-    target_files
+    let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
+    let salt_cache = salt_cache::SaltCache::load(repo.path());
+
+    let result = target_files
         .par_iter()
         .filter(|p| p.is_file())
         .try_for_each(|f| -> Result<()> {
-            decrypt_file(f, key.as_bytes())
+            decrypt_file_with_cache(f, &key_cache, Some(&salt_cache), key.as_bytes())
                 .with_context(|| format!("Failed to decrypt {}", f.display()))
-        })?;
+        });
 
+    // Always save the salt cache — even on partial failure the extracted
+    // entries are valuable for the next encrypt run.
+    salt_cache.save();
+
+    result?;
     Ok(())
 }
 
@@ -504,7 +588,7 @@ mod tests {
     #[test]
     fn test_header_serialization() {
         let salt = [0xAB; SALT_LEN];
-        let header = FileHeader::new(true, salt);
+        let header = FileHeader::new(true, salt, None);
 
         let mut buf = Vec::new();
         header.write(&mut buf).unwrap();
@@ -553,7 +637,7 @@ mod tests {
         let master_key = b"super_secret_password";
 
         // Encrypt
-        encrypt_file(&path, &key, &salt, None).unwrap();
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
 
         // Verify it's encrypted
         let mut encrypted_content = Vec::new();
@@ -586,7 +670,7 @@ mod tests {
         let master_key = b"super_secret_password";
 
         // Encrypt with Zstd level 3
-        encrypt_file(&path, &key, &salt, Some(3)).unwrap();
+        encrypt_file(&path, &key, &salt, None, Some(3)).unwrap();
 
         // Verify it's encrypted and compressed (size should be much smaller than 10000
         // + header)
@@ -624,7 +708,7 @@ mod tests {
         let master_key = b"super_secret_password";
 
         // Encrypt
-        encrypt_file(&path, &key, &salt, None).unwrap();
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
 
         // Decrypt
         decrypt_file(&path, master_key).unwrap();
@@ -647,7 +731,7 @@ mod tests {
         let master_key = b"super_secret_password";
 
         // Encrypt
-        encrypt_file(&path, &key, &salt, None).unwrap();
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
 
         // Tamper with the ciphertext (modify a byte after the 64-byte header)
         let mut encrypted_content = Vec::new();
@@ -677,6 +761,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_deterministic_encrypt_with_fixed_salt_nonce() {
+        let plaintext = b"Deterministic encryption test data.";
+
+        let password = b"test_password";
+        let salt = [0x42; SALT_LEN];
+        let nonce = [0x13; NONCE_LEN];
+        let derived = derive_key(password, &salt).unwrap();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&*derived);
+
+        // Encrypt twice with the same salt+nonce → identical ciphertext
+        let path1 = create_temp_file(plaintext);
+        let path2 = create_temp_file(plaintext);
+
+        encrypt_file(&path1, &key, &salt, Some(nonce), None).unwrap();
+        encrypt_file(&path2, &key, &salt, Some(nonce), None).unwrap();
+
+        let ct1 = fs::read(&path1).unwrap();
+        let ct2 = fs::read(&path2).unwrap();
+        assert_eq!(
+            ct1, ct2,
+            "Same plaintext + same salt+nonce must produce identical ciphertext"
+        );
+
+        // And both should decrypt correctly
+        decrypt_file(&path1, password).unwrap();
+        assert_eq!(fs::read(&path1).unwrap(), plaintext);
+    }
+
     #[cfg(unix)]
     #[test]
     fn test_metadata_preservation() {
@@ -695,7 +809,7 @@ mod tests {
         let master_key = b"super_secret_password";
 
         // Encrypt
-        encrypt_file(path, &key, &salt, false, 0).unwrap();
+        encrypt_file(path, &key, &salt, None, None).unwrap();
 
         // Check permissions after encryption
         let encrypted_perms = fs::metadata(path).unwrap().permissions();
@@ -703,7 +817,7 @@ mod tests {
 
         // Decrypt
         let key_cache = DashMap::new();
-        decrypt_file(path, master_key).unwrap();
+        decrypt_file_with_cache(path, &key_cache, None, master_key).unwrap();
 
         // Check permissions after decryption
         let decrypted_perms = fs::metadata(path).unwrap().permissions();

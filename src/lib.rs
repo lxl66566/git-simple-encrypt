@@ -6,6 +6,7 @@ mod cli;
 mod config;
 pub mod crypt;
 mod repo;
+mod salt_cache;
 mod utils;
 
 use anyhow::Result;

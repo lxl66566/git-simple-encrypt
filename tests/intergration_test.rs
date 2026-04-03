@@ -370,6 +370,121 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_deterministic_reencryption() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::create_dir(temp_dir.join("dir"))?;
+    std::fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
+    std::fs::write(temp_dir.join("t2.txt"), "6".repeat(100))?;
+    std::fs::write(temp_dir.join("dir/t3.txt"), "nested file")?;
+
+    // Add files
+    run(
+        SubCommand::Add {
+            paths: ["t1.txt", "t2.txt", "dir"].map(PathBuf::from).to_vec(),
+        },
+        temp_dir,
+    )?;
+
+    // ---- First encrypt ----
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    assert!(temp_dir.join("t1.txt").is_encrypted());
+    assert!(temp_dir.join("t2.txt").is_compressed());
+    assert!(temp_dir.join("dir/t3.txt").is_encrypted());
+
+    let enc1_t1 = std::fs::read(temp_dir.join("t1.txt"))?;
+    let enc1_t2 = std::fs::read(temp_dir.join("t2.txt"))?;
+    let enc1_t3 = std::fs::read(temp_dir.join("dir/t3.txt"))?;
+
+    // ---- Decrypt ----
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("t1.txt"))?,
+        "Hello, world!"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("t2.txt"))?,
+        "6".repeat(100)
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("dir/t3.txt"))?,
+        "nested file"
+    );
+
+    // ---- Re-encrypt (should produce identical ciphertext) ----
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+
+    let enc2_t1 = std::fs::read(temp_dir.join("t1.txt"))?;
+    let enc2_t2 = std::fs::read(temp_dir.join("t2.txt"))?;
+    let enc2_t3 = std::fs::read(temp_dir.join("dir/t3.txt"))?;
+
+    assert_eq!(
+        enc1_t1, enc2_t1,
+        "t1.txt: decrypt→encrypt must produce identical ciphertext"
+    );
+    assert_eq!(
+        enc1_t2, enc2_t2,
+        "t2.txt: decrypt→encrypt must produce identical ciphertext"
+    );
+    assert_eq!(
+        enc1_t3, enc2_t3,
+        "dir/t3.txt: decrypt→encrypt must produce identical ciphertext"
+    );
+
+    // Verify the files still decrypt correctly
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("t1.txt"))?,
+        "Hello, world!"
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("t2.txt"))?,
+        "6".repeat(100)
+    );
+    assert_eq!(
+        std::fs::read_to_string(temp_dir.join("dir/t3.txt"))?,
+        "nested file"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::write(temp_dir.join("data.txt"), "persistent data")?;
+
+    run(
+        SubCommand::Add {
+            paths: vec!["data.txt".into()],
+        },
+        temp_dir,
+    )?;
+
+    // Encrypt and capture ciphertext from 3 decrypt→encrypt cycles
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    let reference = std::fs::read(temp_dir.join("data.txt"))?;
+
+    for cycle in 1..=3 {
+        run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+        assert_eq!(
+            std::fs::read_to_string(temp_dir.join("data.txt"))?,
+            "persistent data",
+            "Data corrupted at cycle {cycle}"
+        );
+
+        run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+        let ciphertext = std::fs::read(temp_dir.join("data.txt"))?;
+        assert_eq!(ciphertext, reference, "Ciphertext changed at cycle {cycle}");
+    }
+
+    Ok(())
+}
+
 #[bench]
 fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
     const FILES_NUM: i32 = 5;
