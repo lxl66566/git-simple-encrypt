@@ -9,7 +9,7 @@ license     = "MIT"
 name        = "git-simple-encrypt"
 readme      = "./README.md"
 repository  = "https://github.com/lxl66566/git-simple-encrypt"
-version     = "2.0.0"
+version     = "3.0.0"
 
 [dependencies]
 anyhow            = "1.0"

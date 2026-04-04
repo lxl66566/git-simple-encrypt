@@ -39,8 +39,7 @@ You can choose **any** of the following methods:
 
 ```sh
 git-se p                    # Set/update master password
-git-se add file.txt         # Add a file to the encryption list
-git-se add mydir            # Add a folder to the encryption list, then recursively encrypt all files under it
+git-se add file.txt  mydir  # Add files/folders to the encryption list
 git-se e                    # Encrypt all files in the list
 git-se d                    # Decrypt all files in the list
 git-se e xxx.txt dir1 ...   # Encrypt specific files

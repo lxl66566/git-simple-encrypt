@@ -16,17 +16,24 @@
 //! Files are processed in 64KB chunks to prevent OOM on large files.
 //! Each chunk is individually encrypted using XChaCha20-Poly1305.
 //!
-//! # VERSION=3 Nonce Derivation
+//! # VERSION=3 Nonce Derivation (Content-Based)
 //!
-//! Per-chunk nonces are derived via blake3 to prevent nonce reuse when a file
-//! changes but its cached base nonce is reused:
+//! Per-chunk nonces are derived from the chunk's own plaintext content using
+//! keyed Blake3, eliminating any dependency on previous chunks:
 //!
-//! - Chunk 0: `blake3(base_nonce || chunk_idx_le)[0..24]`
-//! - Chunk i>0: `blake3(base_nonce || H(plaintext[i-1]) ||
-//!   chunk_idx_le)[0..24]`
+//! 1. The Argon2-derived master key is split via `blake3::derive_key` into
+//!    `Key_ENC` (for XChaCha20-Poly1305 encryption) and `Key_MAC` (for nonce
+//!    generation).
+//! 2. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, M_i ||
+//!    chunk_idx_le)[0..24]`
+//! 3. The 24-byte nonce is stored in plaintext at the head of each encrypted
+//!    chunk.
 //!
-//! This creates a hash chain: if any chunk's plaintext changes, all subsequent
-//! nonces change automatically. For unchanged files the chain is deterministic.
+//! Different plaintext always produces a different nonce. The chunk index
+//! prevents reordering attacks on identical 64 KB blocks. Decryption reads the
+//! nonce directly from each chunk — no dependency on previous chunks.
+//!
+//! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
 
 use std::{
     fs,
@@ -190,13 +197,21 @@ impl FileHeader {
 
 /// Derive a file-specific key using Argon2.
 /// Input: User Master Key (bytes) + File Salt.
-/// Output: 32 bytes (for XChaCha20-Poly1305).
+/// Output: 32 bytes (master key, to be split into `Key_ENC` + `Key_MAC`).
 fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let mut key = Zeroizing::new([0u8; 32]);
     Argon2::default()
         .hash_password_into(password, salt, &mut *key)
         .map_err(|e| anyhow!("Argon2 key derivation failed: {e}"))?;
     Ok(key)
+}
+
+/// Split the Argon2-derived master key into `Key_ENC` (encryption) and
+/// `Key_MAC` (nonce generation) using blake3's `derive_key` (HKDF-like).
+fn split_keys(master_key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
+    let key_enc = blake3::derive_key("git-simple-encrypt-enc", master_key);
+    let key_mac = blake3::derive_key("git-simple-encrypt-mac", master_key);
+    (Zeroizing::new(key_enc), Zeroizing::new(key_mac))
 }
 
 /// VERSION=2 nonce derivation (legacy, decrypt only).
@@ -207,29 +222,25 @@ fn derive_nonce_v2(base_nonce: &[u8; NONCE_LEN], chunk_idx: u64) -> XNonce {
     XNonce::from(nonce_bytes)
 }
 
-/// VERSION=3 nonce derivation using blake3.
+/// VERSION=3 content-based nonce derivation using keyed Blake3.
 ///
-/// Creates a hash chain: each chunk's nonce depends on the previous chunk's
-/// plaintext hash, so a content change in chunk N causes all nonces from N+1
-/// onwards to change (preventing nonce reuse).
+/// Computes: `Blake3_keyed(Key_MAC, plaintext || chunk_idx_le)[0..24]`
 ///
-/// - Chunk 0: `blake3(base_nonce || chunk_idx_le)`
-/// - Chunk i>0: `blake3(base_nonce || prev_plaintext_hash || chunk_idx_le)`
-fn derive_nonce_v3(
-    base_nonce: &[u8; NONCE_LEN],
-    prev_chunk_hash: Option<&blake3::Hash>,
+/// Each chunk's nonce is derived from its own plaintext content, so different
+/// plaintext always produces a different nonce. The chunk index prevents
+/// reordering attacks on identical 64 KB blocks.
+fn derive_nonce_v3_content(
+    key_mac: &[u8; 32],
+    plaintext: &[u8],
     chunk_idx: u64,
-) -> XNonce {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(base_nonce);
-    if let Some(h) = prev_chunk_hash {
-        hasher.update(h.as_bytes());
-    }
+) -> [u8; NONCE_LEN] {
+    let mut hasher = blake3::Hasher::new_keyed(key_mac);
+    hasher.update(plaintext);
     hasher.update(&chunk_idx.to_le_bytes());
     let hash = hasher.finalize();
-    let mut nonce_bytes: [u8; 24] = [0u8; NONCE_LEN];
-    nonce_bytes.copy_from_slice(&hash.as_bytes()[..NONCE_LEN]);
-    XNonce::from(nonce_bytes)
+    let mut nonce = [0u8; NONCE_LEN];
+    nonce.copy_from_slice(&hash.as_bytes()[..NONCE_LEN]);
+    nonce
 }
 
 /// Safely persist a temporary file while retaining the original file's metadata
@@ -314,8 +325,9 @@ pub fn encrypt_file(
 
     header.write(&mut temp_file)?;
 
-    // 3. Setup Streaming Pipeline
-    let cipher = XChaCha20Poly1305::new(derived_key.into());
+    // 3. Split master key into encryption key and MAC key, then setup cipher.
+    let (key_enc, key_mac) = split_keys(derived_key);
+    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
 
     // If compression is enabled, wrap the file reader in a Zstd Encoder
     let mut reader: Box<dyn Read> = if let Some(zstd_level) = zstd {
@@ -327,10 +339,13 @@ pub fn encrypt_file(
         Box::new(file)
     };
 
-    // 4. Chunked Encryption Loop with hash-chain nonce derivation (v3)
+    // 4. Chunked Encryption Loop — content-based nonce derivation (v3)
+    //
+    // Each chunk is written as: [NONCE (24B)] [CIPHERTEXT] [TAG (16B)]
+    // Nonce is derived from the plaintext of the current chunk via keyed Blake3,
+    // so different content always yields a different nonce.
     let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
     let mut chunk_idx = 0u64;
-    let mut prev_chunk_hash: Option<blake3::Hash> = None;
 
     loop {
         let mut bytes_read = 0;
@@ -343,22 +358,27 @@ pub fn encrypt_file(
         }
 
         let is_last_chunk = bytes_read < CHUNK_SIZE;
-        let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
-        let nonce = derive_nonce_v3(&header.nonce, prev_chunk_hash.as_ref(), chunk_idx);
+        let mut aad = [0u8; 9];
+        aad[..8].copy_from_slice(&chunk_idx.to_le_bytes());
+        aad[8] = u8::from(is_last_chunk);
+
+        // Derive nonce from current chunk's plaintext using keyed Blake3.
+        let nonce_bytes = derive_nonce_v3_content(&key_mac, &buffer[..bytes_read], chunk_idx);
+        let nonce = XNonce::from(nonce_bytes);
 
         let payload = Payload {
             msg: &buffer[..bytes_read],
-            aad,
+            aad: &aad,
         };
 
         let ciphertext = cipher
             .encrypt(&nonce, payload)
             .map_err(|e| anyhow!("Encryption failed: {e}"))?;
 
+        // Write: nonce (24B) + ciphertext (includes 16B Poly1305 tag).
+        temp_file.write_all(&nonce_bytes)?;
         temp_file.write_all(&ciphertext)?;
 
-        // Update hash chain for next chunk.
-        prev_chunk_hash = Some(blake3::hash(&buffer[..bytes_read]));
         chunk_idx += 1;
 
         if is_last_chunk {
@@ -441,8 +461,9 @@ pub fn decrypt_file_with_cache(
         }
     };
 
-    // 3. Setup Streaming Pipeline
-    let cipher = XChaCha20Poly1305::new(derived_key.as_ref().into());
+    // 3. Split master key and setup cipher
+    let (key_enc, _key_mac) = split_keys(&derived_key);
+    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent_dir)
         .with_context(|| "Failed to create temp file".to_string())?;
@@ -479,7 +500,7 @@ pub fn decrypt_file_with_cache(
 /// destination.
 ///
 /// Uses version-appropriate nonce derivation: v2 uses simple counter-based
-/// nonces, v3 uses blake3 hash-chain nonces.
+/// nonces, v3 reads the nonce from each chunk's header (content-based).
 fn decrypt_chunks(
     file: &mut fs::File,
     writer: &mut dyn Write,
@@ -487,11 +508,24 @@ fn decrypt_chunks(
     base_nonce: &[u8; NONCE_LEN],
     version: u8,
 ) -> Result<()> {
+    match version {
+        2 => decrypt_chunks_v2(file, writer, cipher, base_nonce),
+        3 => decrypt_chunks_v3(file, writer, cipher),
+        _ => Err(anyhow!("Unsupported version for decryption: {version}")),
+    }
+}
+
+/// VERSION=2 decryption: counter-based nonce, no per-chunk nonce in stream.
+fn decrypt_chunks_v2(
+    file: &mut fs::File,
+    writer: &mut dyn Write,
+    cipher: &XChaCha20Poly1305,
+    base_nonce: &[u8; NONCE_LEN],
+) -> Result<()> {
     // Ciphertext chunk size = Plaintext chunk size + 16 bytes (Poly1305 MAC tag)
     let mut buffer = vec![0u8; CHUNK_SIZE + 16];
     let mut chunk_idx = 0u64;
     let mut last_chunk_was_final = false;
-    let mut prev_chunk_hash: Option<blake3::Hash> = None;
 
     loop {
         let mut bytes_read = 0;
@@ -510,11 +544,7 @@ fn decrypt_chunks(
         let is_last_chunk = bytes_read < buffer.len();
         let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
 
-        let nonce = match version {
-            2 => derive_nonce_v2(base_nonce, chunk_idx),
-            3 => derive_nonce_v3(base_nonce, prev_chunk_hash.as_ref(), chunk_idx),
-            _ => return Err(anyhow!("Unsupported version for decryption: {version}")),
-        };
+        let nonce = derive_nonce_v2(base_nonce, chunk_idx);
 
         let payload = chacha20poly1305::aead::Payload {
             msg: &buffer[..bytes_read],
@@ -525,12 +555,80 @@ fn decrypt_chunks(
             anyhow!("Decryption failed (wrong password, corrupt, or tampered data): {e}")
         })?);
 
-        // Update hash chain for v3.
-        if version == 3 {
-            prev_chunk_hash = Some(blake3::hash(&plaintext));
+        writer.write_all(&plaintext)?;
+        chunk_idx += 1;
+
+        if is_last_chunk {
+            last_chunk_was_final = true;
+            break;
+        }
+    }
+
+    if !last_chunk_was_final {
+        return Err(anyhow!(
+            "File truncation detected! The ciphertext is incomplete."
+        ));
+    }
+
+    Ok(())
+}
+
+/// VERSION=3 decryption: nonce is stored in plaintext at the head of each
+/// encrypted chunk. No dependency on previous chunks.
+///
+/// Chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
+fn decrypt_chunks_v3(
+    file: &mut fs::File,
+    writer: &mut dyn Write,
+    cipher: &XChaCha20Poly1305,
+) -> Result<()> {
+    let mut nonce_buf = [0u8; NONCE_LEN];
+    let mut ct_buffer = vec![0u8; CHUNK_SIZE + 16]; // ciphertext + Poly1305 tag
+    let mut last_chunk_was_final = false;
+    let mut chunk_idx = 0u64;
+
+    loop {
+        // Read the 24-byte nonce from the chunk header.
+        match file.read_exact(&mut nonce_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
         }
 
+        // Read ciphertext + tag (up to CHUNK_SIZE + 16 bytes).
+        let mut bytes_read = 0;
+        while bytes_read < ct_buffer.len() {
+            let n = file.read(&mut ct_buffer[bytes_read..])?;
+            if n == 0 {
+                break;
+            }
+            bytes_read += n;
+        }
+
+        if bytes_read == 0 {
+            return Err(anyhow!(
+                "Truncated chunk: nonce present but no ciphertext follows"
+            ));
+        }
+
+        let is_last_chunk = bytes_read < ct_buffer.len();
+
+        let mut aad = [0u8; 9];
+        aad[..8].copy_from_slice(&chunk_idx.to_le_bytes());
+        aad[8] = u8::from(is_last_chunk);
+
+        let nonce = XNonce::from(nonce_buf);
+        let payload = chacha20poly1305::aead::Payload {
+            msg: &ct_buffer[..bytes_read],
+            aad: &aad,
+        };
+
+        let plaintext = Zeroizing::new(cipher.decrypt(&nonce, payload).map_err(|e| {
+            anyhow!("Decryption failed (wrong password, corrupt, or tampered data): {e}")
+        })?);
+
         writer.write_all(&plaintext)?;
+
         chunk_idx += 1;
 
         if is_last_chunk {
@@ -780,25 +878,31 @@ mod tests {
 
     #[test]
     fn test_nonce_derivation_v3_deterministic() {
-        let base_nonce = [0x42u8; NONCE_LEN];
+        let key_mac = [0x42u8; 32];
+        let plaintext = b"hello world";
 
-        // Chunk 0 without prev hash: same inputs → same nonce
-        let nonce0_a = derive_nonce_v3(&base_nonce, None, 0);
-        let nonce0_b = derive_nonce_v3(&base_nonce, None, 0);
-        assert_eq!(nonce0_a.as_slice(), nonce0_b.as_slice());
+        // Same inputs → same nonce (deterministic).
+        let nonce0_a = derive_nonce_v3_content(&key_mac, plaintext, 0);
+        let nonce0_b = derive_nonce_v3_content(&key_mac, plaintext, 0);
+        assert_eq!(nonce0_a, nonce0_b);
 
-        // Chunk 0 and Chunk 1 must differ
-        let nonce1 = derive_nonce_v3(&base_nonce, None, 1);
-        assert_ne!(nonce0_a.as_slice(), nonce1.as_slice());
+        // Different chunk index → different nonce.
+        let nonce1 = derive_nonce_v3_content(&key_mac, plaintext, 1);
+        assert_ne!(nonce0_a, nonce1);
 
-        // With a prev hash, the nonce should differ from without
-        let fake_hash = blake3::hash(b"previous chunk data");
-        let nonce_with_hash = derive_nonce_v3(&base_nonce, Some(&fake_hash), 1);
-        assert_ne!(nonce1.as_slice(), nonce_with_hash.as_slice());
+        // Different plaintext → different nonce.
+        let other_plaintext = b"hello world!";
+        let nonce_other = derive_nonce_v3_content(&key_mac, other_plaintext, 0);
+        assert_ne!(nonce0_a, nonce_other);
 
-        // Same prev hash → same nonce (deterministic)
-        let nonce_with_hash_2 = derive_nonce_v3(&base_nonce, Some(&fake_hash), 1);
-        assert_eq!(nonce_with_hash.as_slice(), nonce_with_hash_2.as_slice());
+        // Different key_mac → different nonce.
+        let key_mac2 = [0x43u8; 32];
+        let nonce_key2 = derive_nonce_v3_content(&key_mac2, plaintext, 0);
+        assert_ne!(nonce0_a, nonce_key2);
+
+        // Empty plaintext should still produce a valid nonce.
+        let nonce_empty = derive_nonce_v3_content(&key_mac, b"", 0);
+        assert_ne!(nonce_empty, [0u8; NONCE_LEN]);
     }
 
     #[test]

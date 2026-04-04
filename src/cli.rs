@@ -8,13 +8,13 @@ use crate::repo::{GitCommand, Repo};
 
 #[derive(Parser, Clone, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
-git-se p                # set password
-git-se add file.txt     # mark `file.txt` as need-to-be-crypted
-git-se e                # encrypt current repo with all marked files
-git-se d                # decrypt current repo
-git-se d 'src/*'        # decrypt all encrypted files in `src` folder
-git-se c                # check if all files in crypt list are encrypted
-git-se i                # install pre-commit hook for encryption check
+git-se p                    # Set/update master password
+git-se add file.txt  mydir  # Add files/folders to the encryption list
+git-se e                    # Encrypt all files in the list
+git-se d                    # Decrypt all files in the list
+git-se e xxx.txt dir1 ...   # Encrypt specific files
+git-se d xxx.txt dir1 ...   # Decrypt specific files
+git-se i                    # Install a pre-commit hook to check encryption before committing
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {

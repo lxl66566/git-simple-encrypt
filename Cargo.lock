@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "git-simple-encrypt"
-version = "2.0.0"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "argon2",
