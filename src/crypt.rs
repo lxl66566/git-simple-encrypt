@@ -15,8 +15,18 @@
 //! Streaming Format:
 //! Files are processed in 64KB chunks to prevent OOM on large files.
 //! Each chunk is individually encrypted using XChaCha20-Poly1305.
-//! The nonce for chunk `i` is derived by `XORing` the last 8 bytes of the base
-//! nonce with `i`.
+//!
+//! # VERSION=3 Nonce Derivation
+//!
+//! Per-chunk nonces are derived via blake3 to prevent nonce reuse when a file
+//! changes but its cached base nonce is reused:
+//!
+//! - Chunk 0: `blake3(base_nonce || chunk_idx_le)[0..24]`
+//! - Chunk i>0: `blake3(base_nonce || H(plaintext[i-1]) ||
+//!   chunk_idx_le)[0..24]`
+//!
+//! This creates a hash chain: if any chunk's plaintext changes, all subsequent
+//! nonces change automatically. For unchanged files the chain is deterministic.
 
 use std::{
     fs,
@@ -34,6 +44,8 @@ use chacha20poly1305::{
 };
 use dashmap::DashMap;
 use log::{debug, warn};
+use path_absolutize::Absolutize as _;
+use pathdiff::diff_paths;
 use rand::prelude::*;
 use rayon::prelude::*;
 use tempfile::NamedTempFile;
@@ -41,7 +53,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     Repo,
-    salt_cache::{self, CachedEntry, SaltCacheReader},
+    salt_cache::{self, CachedEntry, SaltCacheSender},
     utils::{
         create_progress_bar, is_file_encrypted, print_post_report, print_pre_report,
         resolve_target_files,
@@ -51,7 +63,10 @@ use crate::{
 // --- Constants & Header Layout ---
 
 pub const MAGIC: &[u8; 5] = b"GITSE";
-pub const VERSION: u8 = 2;
+/// Current encryption format version. Encryption always produces this version.
+pub const VERSION: u8 = 3;
+/// Minimum supported version for decryption (backward compatibility).
+const MIN_VERSION: u8 = 2;
 const FLAG_COMPRESSED: u8 = 1 << 0; // Bit 0
 const ENC_ALGO: u8 = 1; // 1 = XChaCha20-Poly1305
 
@@ -63,6 +78,12 @@ const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + N
 
 // Streaming
 const CHUNK_SIZE: usize = 65536; // 64 KB chunks
+
+/// Returns `true` if the given version byte is supported for decryption.
+#[must_use]
+pub fn is_encrypted_version(v: u8) -> bool {
+    (MIN_VERSION..=VERSION).contains(&v)
+}
 
 // --- Helper Structures ---
 
@@ -123,7 +144,7 @@ impl FileHeader {
         }
 
         let version = reader.read_u8()?;
-        if version != VERSION {
+        if !is_encrypted_version(version) {
             return Err(anyhow!("Unsupported version: {version}"));
         }
 
@@ -178,11 +199,36 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
-/// Derive a unique nonce for each chunk.
+/// VERSION=2 nonce derivation (legacy, decrypt only).
 /// Uses a 16-byte random prefix (from [`base_nonce`]) + 8-byte chunk counter.
-fn derive_nonce(base_nonce: &[u8; NONCE_LEN], chunk_idx: u64) -> XNonce {
+fn derive_nonce_v2(base_nonce: &[u8; NONCE_LEN], chunk_idx: u64) -> XNonce {
     let mut nonce_bytes = *base_nonce;
     nonce_bytes[16..24].copy_from_slice(&chunk_idx.to_le_bytes());
+    XNonce::from(nonce_bytes)
+}
+
+/// VERSION=3 nonce derivation using blake3.
+///
+/// Creates a hash chain: each chunk's nonce depends on the previous chunk's
+/// plaintext hash, so a content change in chunk N causes all nonces from N+1
+/// onwards to change (preventing nonce reuse).
+///
+/// - Chunk 0: `blake3(base_nonce || chunk_idx_le)`
+/// - Chunk i>0: `blake3(base_nonce || prev_plaintext_hash || chunk_idx_le)`
+fn derive_nonce_v3(
+    base_nonce: &[u8; NONCE_LEN],
+    prev_chunk_hash: Option<&blake3::Hash>,
+    chunk_idx: u64,
+) -> XNonce {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(base_nonce);
+    if let Some(h) = prev_chunk_hash {
+        hasher.update(h.as_bytes());
+    }
+    hasher.update(&chunk_idx.to_le_bytes());
+    let hash = hasher.finalize();
+    let mut nonce_bytes: [u8; 24] = [0u8; NONCE_LEN];
+    nonce_bytes.copy_from_slice(&hash.as_bytes()[..NONCE_LEN]);
     XNonce::from(nonce_bytes)
 }
 
@@ -207,9 +253,34 @@ fn atomic_write_with_metadata(original_path: &Path, temp_file: NamedTempFile) ->
     Ok(())
 }
 
+/// Compute a repo-relative cache key from a file path.
+///
+/// Uses `absolutize_from(repo_path)` to guarantee a correct absolute path
+/// (even if `list_files` returns relative paths), then computes the relative
+/// path via `diff_paths`. The result is raw OS-encoded bytes with `b'\\'`
+/// replaced by `b'/'` for cross-platform consistency.
+fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
+    let abs_path = if file_path.is_absolute() {
+        file_path.into()
+    } else {
+        file_path
+            .absolutize_from(repo_path)
+            .unwrap_or_else(|_| file_path.into())
+    };
+    let relative =
+        diff_paths(abs_path.as_ref(), repo_path).unwrap_or_else(|| abs_path.to_path_buf());
+    let mut bytes = relative.into_os_string().into_encoded_bytes();
+    for b in &mut bytes {
+        if *b == b'\\' {
+            *b = b'/';
+        }
+    }
+    bytes
+}
+
 // --- Public Operations ---
 
-/// Encrypt a single file using streaming chunked encryption.
+/// Encrypt a single file using streaming chunked encryption (VERSION=3).
 ///
 /// Returns `Some(header)` on success, or `None` if the file was already
 /// encrypted and skipped.
@@ -222,11 +293,11 @@ pub fn encrypt_file(
 ) -> Result<Option<FileHeader>> {
     let mut file = fs::File::open(path)?;
 
-    // 1. Quick check if already encrypted (Redundant I/O fixed)
+    // 1. Quick check if already encrypted (any supported version)
     let mut header_bytes = [0u8; HEADER_LEN];
     if file.read_exact(&mut header_bytes).is_ok()
         && &header_bytes[0..5] == MAGIC
-        && header_bytes[5] == VERSION
+        && is_encrypted_version(header_bytes[5])
     {
         warn!("File already encrypted, skipping: {}", path.display());
         return Ok(None);
@@ -256,9 +327,10 @@ pub fn encrypt_file(
         Box::new(file)
     };
 
-    // 4. Chunked Encryption Loop (OOM risk fixed, Zeroizing applied)
+    // 4. Chunked Encryption Loop with hash-chain nonce derivation (v3)
     let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
     let mut chunk_idx = 0u64;
+    let mut prev_chunk_hash: Option<blake3::Hash> = None;
 
     loop {
         let mut bytes_read = 0;
@@ -272,7 +344,7 @@ pub fn encrypt_file(
 
         let is_last_chunk = bytes_read < CHUNK_SIZE;
         let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
-        let nonce = derive_nonce(&header.nonce, chunk_idx);
+        let nonce = derive_nonce_v3(&header.nonce, prev_chunk_hash.as_ref(), chunk_idx);
 
         let payload = Payload {
             msg: &buffer[..bytes_read],
@@ -284,6 +356,9 @@ pub fn encrypt_file(
             .map_err(|e| anyhow!("Encryption failed: {e}"))?;
 
         temp_file.write_all(&ciphertext)?;
+
+        // Update hash chain for next chunk.
+        prev_chunk_hash = Some(blake3::hash(&buffer[..bytes_read]));
         chunk_idx += 1;
 
         if is_last_chunk {
@@ -308,13 +383,16 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 /// cache for derived keys and an optional cache sender for deterministic
 /// re-encryption.
 ///
+/// The `cache` tuple contains `(sender, relative_key)` — the caller is
+/// responsible for computing the repo-relative path key.
+///
 /// # Panics
 ///
 /// Panics if the cache is poisoned.
 pub fn decrypt_file_with_cache(
     path: &Path,
     key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>>,
-    cache_sender: Option<&salt_cache::SaltCacheSender>,
+    cache: Option<(&SaltCacheSender, &[u8])>,
     master_key: &[u8],
 ) -> Result<()> {
     let mut file = fs::File::open(path)?;
@@ -328,7 +406,7 @@ pub fn decrypt_file_with_cache(
         );
         return Ok(());
     }
-    if &header_bytes[0..5] != MAGIC || header_bytes[5] != VERSION {
+    if &header_bytes[0..5] != MAGIC || !is_encrypted_version(header_bytes[5]) {
         debug!(
             "File not encrypted (no magic), skipping: {}",
             path.display()
@@ -342,9 +420,9 @@ pub fn decrypt_file_with_cache(
 
     // Cache the salt+nonce BEFORE decryption so it is preserved even if
     // decryption fails halfway through.
-    if let Some(sender) = cache_sender {
+    if let Some((sender, key)) = cache {
         sender.insert(
-            path,
+            key,
             CachedEntry {
                 salt: header.salt,
                 nonce: header.nonce,
@@ -372,10 +450,22 @@ pub fn decrypt_file_with_cache(
     // 4. Chunked Decryption Loop
     if header.is_compressed() {
         let mut decoder = zstd::stream::write::Decoder::new(&mut temp_file)?.auto_flush();
-        decrypt_chunks(&mut file, &mut decoder, &cipher, &header.nonce)?;
+        decrypt_chunks(
+            &mut file,
+            &mut decoder,
+            &cipher,
+            &header.nonce,
+            header.version,
+        )?;
         decoder.flush()?;
     } else {
-        decrypt_chunks(&mut file, &mut temp_file, &cipher, &header.nonce)?;
+        decrypt_chunks(
+            &mut file,
+            &mut temp_file,
+            &cipher,
+            &header.nonce,
+            header.version,
+        )?;
     }
     drop(file);
 
@@ -387,16 +477,21 @@ pub fn decrypt_file_with_cache(
 
 /// Helper function to read ciphertext chunks, decrypt them, and write to the
 /// destination.
+///
+/// Uses version-appropriate nonce derivation: v2 uses simple counter-based
+/// nonces, v3 uses blake3 hash-chain nonces.
 fn decrypt_chunks(
     file: &mut fs::File,
     writer: &mut dyn Write,
     cipher: &XChaCha20Poly1305,
     base_nonce: &[u8; NONCE_LEN],
+    version: u8,
 ) -> Result<()> {
     // Ciphertext chunk size = Plaintext chunk size + 16 bytes (Poly1305 MAC tag)
     let mut buffer = vec![0u8; CHUNK_SIZE + 16];
     let mut chunk_idx = 0u64;
     let mut last_chunk_was_final = false;
+    let mut prev_chunk_hash: Option<blake3::Hash> = None;
 
     loop {
         let mut bytes_read = 0;
@@ -414,7 +509,12 @@ fn decrypt_chunks(
 
         let is_last_chunk = bytes_read < buffer.len();
         let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
-        let nonce = derive_nonce(base_nonce, chunk_idx);
+
+        let nonce = match version {
+            2 => derive_nonce_v2(base_nonce, chunk_idx),
+            3 => derive_nonce_v3(base_nonce, prev_chunk_hash.as_ref(), chunk_idx),
+            _ => return Err(anyhow!("Unsupported version for decryption: {version}")),
+        };
 
         let payload = chacha20poly1305::aead::Payload {
             msg: &buffer[..bytes_read],
@@ -424,6 +524,11 @@ fn decrypt_chunks(
         let plaintext = Zeroizing::new(cipher.decrypt(&nonce, payload).map_err(|e| {
             anyhow!("Decryption failed (wrong password, corrupt, or tampered data): {e}")
         })?);
+
+        // Update hash chain for v3.
+        if version == 3 {
+            prev_chunk_hash = Some(blake3::hash(&plaintext));
+        }
 
         writer.write_all(&plaintext)?;
         chunk_idx += 1;
@@ -455,6 +560,9 @@ fn decrypt_chunks(
 /// unchanged content produces byte-identical ciphertext. Files not in the
 /// cache share a single new batch salt to minimise Argon2 overhead.
 ///
+/// The cache is **read-only** during encryption; only the decrypt path
+/// writes to the cache.
+///
 /// # Panics
 /// Panics if the master key is not set.
 pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
@@ -467,11 +575,8 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     // Pre-operation report
     print_pre_report("Encrypting", &target_files, repo.path());
 
-    // Read-only cache: mmap + rkyv zero-copy.
-    let reader = SaltCacheReader::load(repo.path());
-
-    // Write path: mpsc sender for new/updated entries.
-    let (sender, saver) = salt_cache::create_writer(repo.path());
+    // Read-only cache: mmap + rkyv zero-copy. No write during encryption.
+    let reader = salt_cache::SaltCacheReader::load(repo.path());
 
     let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
 
@@ -484,8 +589,9 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     let failed = AtomicUsize::new(0);
 
     let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
+        let relative_key = cache_key(f, repo.path());
         let (salt, cached_nonce) = reader
-            .get(f)
+            .get(&relative_key)
             .map_or((batch_salt, None), |entry| (entry.salt, Some(entry.nonce)));
 
         // Derive key — cached across threads to avoid redundant Argon2 work.
@@ -508,28 +614,13 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
         )
         .with_context(|| format!("Failed to encrypt {}", f.display()))?;
 
-        match header {
-            Some(h) => {
-                sender.insert(
-                    f,
-                    CachedEntry {
-                        salt: *h.salt(),
-                        nonce: *h.nonce(),
-                    },
-                );
-            }
-            None => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            }
+        if header.is_none() {
+            skipped.fetch_add(1, Ordering::Relaxed);
         }
 
         pb.inc(1);
         Ok(())
     });
-
-    // Drop sender to close the mpsc channel, then persist the cache.
-    drop(sender);
-    saver.save();
 
     pb.finish_and_clear();
 
@@ -580,8 +671,15 @@ pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
             return Ok(());
         }
 
-        let decrypt_result = decrypt_file_with_cache(f, &key_cache, Some(&sender), key.as_bytes())
-            .with_context(|| format!("Failed to decrypt {}", f.display()));
+        let relative_key = cache_key(f, repo.path());
+
+        let decrypt_result = decrypt_file_with_cache(
+            f,
+            &key_cache,
+            Some((&sender, &relative_key)),
+            key.as_bytes(),
+        )
+        .with_context(|| format!("Failed to decrypt {}", f.display()));
 
         if decrypt_result.is_err() {
             failed.fetch_add(1, Ordering::Relaxed);
@@ -660,25 +758,47 @@ mod tests {
     }
 
     #[test]
-    fn test_nonce_derivation() {
+    fn test_nonce_derivation_v2() {
         let base_nonce = [0u8; NONCE_LEN];
 
         // Chunk 0: Should be identical to base_nonce
-        let nonce0 = derive_nonce(&base_nonce, 0);
+        let nonce0 = derive_nonce_v2(&base_nonce, 0);
         assert_eq!(nonce0.as_slice(), &[0u8; NONCE_LEN]);
 
-        // Chunk 1: The 16th byte (index 16) should be XORed with 1
-        let nonce1 = derive_nonce(&base_nonce, 1);
+        // Chunk 1: The 16th byte (index 16) should be 1
+        let nonce1 = derive_nonce_v2(&base_nonce, 1);
         let mut expected1 = [0u8; NONCE_LEN];
         expected1[16] = 1;
         assert_eq!(nonce1.as_slice(), &expected1);
 
-        // Chunk 256: The 17th byte (index 17) should be XORed with 1 (256 is 0x0100 in
-        // LE)
-        let nonce256 = derive_nonce(&base_nonce, 256);
+        // Chunk 256: The 17th byte (index 17) should be 1 (256 = 0x0100 in LE)
+        let nonce256 = derive_nonce_v2(&base_nonce, 256);
         let mut expected256 = [0u8; NONCE_LEN];
         expected256[17] = 1;
         assert_eq!(nonce256.as_slice(), &expected256);
+    }
+
+    #[test]
+    fn test_nonce_derivation_v3_deterministic() {
+        let base_nonce = [0x42u8; NONCE_LEN];
+
+        // Chunk 0 without prev hash: same inputs → same nonce
+        let nonce0_a = derive_nonce_v3(&base_nonce, None, 0);
+        let nonce0_b = derive_nonce_v3(&base_nonce, None, 0);
+        assert_eq!(nonce0_a.as_slice(), nonce0_b.as_slice());
+
+        // Chunk 0 and Chunk 1 must differ
+        let nonce1 = derive_nonce_v3(&base_nonce, None, 1);
+        assert_ne!(nonce0_a.as_slice(), nonce1.as_slice());
+
+        // With a prev hash, the nonce should differ from without
+        let fake_hash = blake3::hash(b"previous chunk data");
+        let nonce_with_hash = derive_nonce_v3(&base_nonce, Some(&fake_hash), 1);
+        assert_ne!(nonce1.as_slice(), nonce_with_hash.as_slice());
+
+        // Same prev hash → same nonce (deterministic)
+        let nonce_with_hash_2 = derive_nonce_v3(&base_nonce, Some(&fake_hash), 1);
+        assert_eq!(nonce_with_hash.as_slice(), nonce_with_hash_2.as_slice());
     }
 
     #[test]
@@ -700,6 +820,7 @@ mod tests {
             .unwrap();
         assert_ne!(encrypted_content, plaintext);
         assert_eq!(&encrypted_content[0..5], MAGIC);
+        assert_eq!(encrypted_content[5], VERSION);
 
         // Decrypt
         decrypt_file(&path, master_key).unwrap();
@@ -842,6 +963,51 @@ mod tests {
         // And both should decrypt correctly
         decrypt_file(&path1, password).unwrap();
         assert_eq!(fs::read(&path1).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_deterministic_encrypt_multi_chunk() {
+        // Multi-chunk file: test hash-chain determinism across chunk boundaries.
+        #[allow(clippy::cast_possible_truncation)]
+        let plaintext = {
+            let mut data = Vec::with_capacity(CHUNK_SIZE * 2 + 1000);
+            for i in 0..(CHUNK_SIZE * 2 + 1000) {
+                data.push(i as u8);
+            }
+            data
+        };
+
+        let password = b"test_password";
+        let salt = [0x42; SALT_LEN];
+        let nonce = [0x13; NONCE_LEN];
+        let derived = derive_key(password, &salt).unwrap();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&*derived);
+
+        let path1 = create_temp_file(&plaintext);
+        let path2 = create_temp_file(&plaintext);
+
+        encrypt_file(&path1, &key, &salt, Some(nonce), None).unwrap();
+        encrypt_file(&path2, &key, &salt, Some(nonce), None).unwrap();
+
+        let ct1 = fs::read(&path1).unwrap();
+        let ct2 = fs::read(&path2).unwrap();
+        assert_eq!(
+            ct1, ct2,
+            "Same multi-chunk plaintext + same salt+nonce must produce identical ciphertext"
+        );
+
+        // Decrypt and verify
+        decrypt_file(&path1, password).unwrap();
+        assert_eq!(fs::read(&path1).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_is_encrypted_version() {
+        assert!(!is_encrypted_version(1));
+        assert!(is_encrypted_version(2));
+        assert!(is_encrypted_version(3));
+        assert!(!is_encrypted_version(4));
     }
 
     #[cfg(unix)]

@@ -10,8 +10,9 @@ use assert2::assert;
 use colored::Colorize;
 use ignore::{WalkBuilder, WalkState};
 use indicatif::{ProgressBar, ProgressStyle};
+use tempfile::NamedTempFile;
 
-use crate::crypt::{HEADER_LEN, MAGIC, VERSION};
+use crate::crypt::{HEADER_LEN, MAGIC, is_encrypted_version};
 
 /// Format a byte array into a hex string
 #[allow(dead_code)]
@@ -22,6 +23,19 @@ pub fn format_hex(value: &[u8]) -> String {
         let _ = write!(output, "{b:02x}");
         output
     })
+}
+
+/// Atomically write `data` to `path` by writing to a temp file first, then
+/// renaming. This prevents partial writes from corrupting the target file.
+pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = NamedTempFile::new_in(parent)
+        .with_context(|| "Failed to create temp file for atomic write")?;
+    temp_file.write_all(data)?;
+    temp_file
+        .persist(path)
+        .with_context(|| format!("Failed to persist atomic write to {}", path.display()))?;
+    Ok(())
 }
 
 /// Prompt the user for a password
@@ -169,7 +183,7 @@ pub fn is_file_encrypted(path: &Path) -> Result<bool> {
         // File is smaller than the header, definitely not encrypted
         return Ok(false);
     }
-    Ok(&header_bytes[0..5] == MAGIC && header_bytes[5] == VERSION)
+    Ok(&header_bytes[0..5] == MAGIC && is_encrypted_version(header_bytes[5]))
 }
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the

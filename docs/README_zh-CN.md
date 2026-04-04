@@ -10,7 +10,7 @@
 - 并行加速：多线程并行加解密，充分利用 CPU 多核性能。
 - 元数据保留：加解密过程实现原子写入，保留原文件的权限与时间戳。
 - Zstd 压缩：默认开启，可选择关闭，减少空间占用。
-- 对偶性保证：解密时缓存 salt + nonce 并在加密时复用，文件无变更则加密产物也相同，避免反复加解密导致仓库体积膨胀。
+- 对偶性保证：解密时缓存 salt + nonce 并在加密时复用，文件无变更则加密产物也相同，避免反复加解密导致仓库体积膨胀。通过 blake3 派生 per-chunk nonce，在保持确定性同时消除 nonce 重用风险。
 
 ## 安装
 
@@ -77,14 +77,16 @@ v2.0.0+ 版本的加密流程如下：
       |        |   |   |
       |        |   |   +--- 加密算法 (1 = XChaCha20-Poly1305)
       |        |   +------- 压缩标志位 (Bit 0: 是否 Zstd 压缩)
-      |        +----------- 版本号 (当前为 2)
+      |        +----------- 版本号 (当前为 3，兼容解密版本 2)
       +-------------------- 魔数
 ```
 
 ### 3\. 加密逻辑
 
 - 算法： 文件被切分为 64KB 的块，使用 XChaCha20-Poly1305 进行加密。
-- Nonce 派生： 每个分块使用不同的 Nonce。派生规则：`Base Nonce (24字节) Overwrite [16..24] 字节位为分块索引 i`。
+- Nonce 派生（v3）： 每个 chunk 的 nonce 通过 blake3 派生，确保内容变更会自动使后续所有 nonce 失效：
+  - Chunk 0：`blake3(base_nonce || chunk_idx)[0..24]`
+  - Chunk i>0：`blake3(base_nonce || H(plaintext[i-1]) || chunk_idx)[0..24]`
 - AAD： 非末尾块：`AAD = "MORE"`，末尾块：`AAD = "LAST"`
 
 ```mermaid
@@ -96,19 +98,21 @@ sequenceDiagram
 
     F->>M: 1. 读取 64KB 数据
     M->>M: 2. Zstd 压缩 (可选)
-    Note over M,E: 生成分块索引 i & Nonce_i
+    Note over M,E: blake3 派生 Nonce_i
     M->>E: 3. 加入 AAD (MORE/LAST) 并加密
     E->>T: 4. 写入密文 + Tag
+    Note over M: 5. 更新 hash chain: H = blake3(plaintext)
     loop 持续处理直至 EOF
         F->>T: 循环上述流程
     end
-    T->>T: 5. 复制元数据 (Permissions/Timestamps)
-    T->>F: 6. 原子覆写 (fs::rename)
+    T->>T: 6. 复制元数据 (Permissions/Timestamps)
+    T->>F: 7. 原子覆写 (fs::rename)
 ```
 
 ### 4. 确定性重加密（Salt + Nonce 缓存）
 
 为保证 decrypt -> encrypt 循环产生完全相同的密文（避免 Git 仓库膨胀），程序在 `.git/git-simple-encrypt-salt-cache` 中持久化每个文件的 Salt 和 Nonce。
 
-- 加密：通过 mmap 将缓存文件映射到内存，rkyv zerocopy 反序列化直接查询 `HashMap<path → (salt, nonce)>`。
-- 解密：Rayon 工作线程通过 mpsc channel 发送 `(path, salt, nonce)` 条目，主线程收集后通过 rkyv 序列化写入磁盘，并与已有缓存合并。
+- 加密（只读缓存）：通过 mmap 将缓存文件映射到内存，rkyv zerocopy 反序列化直接查询。
+- 解密（写入缓存）：Rayon 工作线程通过 mpsc channel 发送 `(path, salt, nonce)` 条目，主线程收集后通过 rkyv 序列化，并使用原子写入持久化到磁盘，与已有缓存合并。
+  - 缓存 key 使用仓库相对路径的原始字节（`/` 作为分隔符），确保跨平台一致性。
