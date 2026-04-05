@@ -103,7 +103,7 @@ pub fn list_files(
 // --- Reporting & Progress Helpers ---
 
 /// Maximum number of files to display individually before collapsing.
-const REPORT_LIST_LIMIT: usize = 20;
+const REPORT_LIST_LIMIT: usize = 10;
 
 /// Print a pre-operation report listing the target files and total count.
 /// If the list exceeds `REPORT_LIST_LIMIT`, show the first few and summarize
