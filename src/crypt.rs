@@ -1,37 +1,40 @@
 //! The core of this program. Encrypt/decrypt, compress/decompress files.
 //!
 //! GITSE Binary Header Layout (64 Bytes)
-//!  00          04  05  06  07          17                 2F              3F
+//!  00          04  05  06  07           17                  27              3F
 //!  +-----------+---+---+---+-----------+-------------------+---------------+
-//!  |   MAGIC   | V | F | A |   SALT    |       NONCE       |   RESERVED    |
-//!  |  "GITSE"  |   |   |   | (16 bytes)|    (24 bytes)     |  (16 bytes)   |
+//!  |   MAGIC   | V | F | A |   SALT    |     `FILE_ID`     |   RESERVED    |
+//!  |  "GITSE"  |   |   |   | (16 bytes)|    (16 bytes)     |  (24 bytes)   |
 //!  +-----------+---+---+---+-----------+-------------------+---------------+
-//!    5 bytes     1   1   1    16 bytes       24 bytes          16 bytes
+//!    5 bytes     1   1   1    16 bytes       16 bytes          24 bytes
 //!                |   |   |
 //!     Version ---+   |   +--- Encryption Algo (1 = XChaCha20-Poly1305 Stream)
 //!                    |
 //!      Flags --------+ (Bit 0: Compression)
 //!
 //! Streaming Format:
-//! Files are processed in 64KB chunks to prevent OOM on large files.
+//! Files are processed in 64KB chunks.
 //! Each chunk is individually encrypted using XChaCha20-Poly1305.
 //!
-//! # VERSION=3 Nonce Derivation (Content-Based)
+//! # Nonce Derivation (Content-Based with File ID)
 //!
-//! Per-chunk nonces are derived from the chunk's own plaintext content using
-//! keyed Blake3, eliminating any dependency on previous chunks:
+//! Per-chunk nonces are derived from the file's random `File_ID` and the
+//! chunk's own plaintext content using keyed Blake3:
 //!
-//! 1. The Argon2-derived master key is split via `blake3::derive_key` into
+//! 1. A random 16-byte `File_ID` is generated once per file and stored in the
+//!    header. This ensures that even if two different files have identical
+//!    plaintext at chunk 0, they produce different nonces and ciphertexts.
+//! 2. The Argon2-derived master key is split via `blake3::derive_key` into
 //!    `Key_ENC` (for XChaCha20-Poly1305 encryption) and `Key_MAC` (for nonce
 //!    generation).
-//! 2. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, M_i ||
+//! 3. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i ||
 //!    chunk_idx_le)[0..24]`
-//! 3. The 24-byte nonce is stored in plaintext at the head of each encrypted
+//! 4. The 24-byte nonce is stored in plaintext at the head of each encrypted
 //!    chunk.
 //!
-//! Different plaintext always produces a different nonce. The chunk index
-//! prevents reordering attacks on identical 64 KB blocks. Decryption reads the
-//! nonce directly from each chunk — no dependency on previous chunks.
+//! Different plaintext always produces a different nonce (within the same
+//! file). The `File_ID` ensures cross-file uniqueness. The chunk index prevents
+//! reordering attacks on identical 64 KB blocks.
 //!
 //! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
 
@@ -70,26 +73,26 @@ use crate::{
 // --- Constants & Header Layout ---
 
 pub const MAGIC: &[u8; 5] = b"GITSE";
-/// Current encryption format version. Encryption always produces this version.
+/// Current encryption format version.
 pub const VERSION: u8 = 3;
-/// Minimum supported version for decryption (backward compatibility).
-const MIN_VERSION: u8 = 2;
 const FLAG_COMPRESSED: u8 = 1 << 0; // Bit 0
 const ENC_ALGO: u8 = 1; // 1 = XChaCha20-Poly1305
 
 // Sizes
 pub const SALT_LEN: usize = 16;
+pub const FILE_ID_LEN: usize = 16;
 pub const NONCE_LEN: usize = 24; // XChaCha20 uses a 192-bit (24-byte) nonce
 pub const HEADER_LEN: usize = 64;
-const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + NONCE_LEN); // 16 bytes
+const RESERVED_LEN: usize = HEADER_LEN - (MAGIC.len() + 1 + 1 + 1 + SALT_LEN + FILE_ID_LEN); // 24 bytes
 
 // Streaming
 const CHUNK_SIZE: usize = 65536; // 64 KB chunks
 
 /// Returns `true` if the given version byte is supported for decryption.
+#[inline]
 #[must_use]
-pub fn is_encrypted_version(v: u8) -> bool {
-    (MIN_VERSION..=VERSION).contains(&v)
+pub const fn is_encrypted_version(v: u8) -> bool {
+    v == VERSION
 }
 
 // --- Helper Structures ---
@@ -100,17 +103,17 @@ pub struct FileHeader {
     flags: u8,
     enc_algo: u8,
     salt: [u8; SALT_LEN],
-    nonce: [u8; NONCE_LEN],
+    file_id: [u8; FILE_ID_LEN],
 }
 
 impl FileHeader {
     #[must_use]
-    pub fn new(compressed: bool, salt: [u8; SALT_LEN], nonce: Option<[u8; NONCE_LEN]>) -> Self {
-        let nonce = nonce.unwrap_or_else(|| {
+    pub fn new(compressed: bool, salt: [u8; SALT_LEN], file_id: Option<[u8; FILE_ID_LEN]>) -> Self {
+        let file_id = file_id.unwrap_or_else(|| {
             let mut rng = rand::rng();
-            let mut n = [0u8; NONCE_LEN];
-            rng.fill_bytes(&mut n);
-            n
+            let mut id = [0u8; FILE_ID_LEN];
+            rng.fill_bytes(&mut id);
+            id
         });
 
         let mut flags = 0u8;
@@ -123,7 +126,7 @@ impl FileHeader {
             flags,
             enc_algo: ENC_ALGO,
             salt,
-            nonce,
+            file_id,
         }
     }
 
@@ -134,7 +137,7 @@ impl FileHeader {
         writer.write_u8(self.flags)?;
         writer.write_u8(self.enc_algo)?;
         writer.write_all(&self.salt)?;
-        writer.write_all(&self.nonce)?;
+        writer.write_all(&self.file_id)?;
         let reserved = [0u8; RESERVED_LEN];
         writer.write_all(&reserved)?;
         Ok(())
@@ -163,8 +166,8 @@ impl FileHeader {
 
         let mut salt = [0u8; SALT_LEN];
         reader.read_exact(&mut salt)?;
-        let mut nonce = [0u8; NONCE_LEN];
-        reader.read_exact(&mut nonce)?;
+        let mut file_id = [0u8; FILE_ID_LEN];
+        reader.read_exact(&mut file_id)?;
         let mut reserved = [0u8; RESERVED_LEN];
         reader.read_exact(&mut reserved)?;
 
@@ -173,23 +176,13 @@ impl FileHeader {
             flags,
             enc_algo,
             salt,
-            nonce,
+            file_id,
         })
     }
 
     #[must_use]
     pub const fn is_compressed(&self) -> bool {
         (self.flags & FLAG_COMPRESSED) != 0
-    }
-
-    #[must_use]
-    pub const fn salt(&self) -> &[u8; SALT_LEN] {
-        &self.salt
-    }
-
-    #[must_use]
-    pub const fn nonce(&self) -> &[u8; NONCE_LEN] {
-        &self.nonce
     }
 }
 
@@ -214,27 +207,23 @@ fn split_keys(master_key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]
     (Zeroizing::new(key_enc), Zeroizing::new(key_mac))
 }
 
-/// VERSION=2 nonce derivation (legacy, decrypt only).
-/// Uses a 16-byte random prefix (from [`base_nonce`]) + 8-byte chunk counter.
-fn derive_nonce_v2(base_nonce: &[u8; NONCE_LEN], chunk_idx: u64) -> XNonce {
-    let mut nonce_bytes = *base_nonce;
-    nonce_bytes[16..24].copy_from_slice(&chunk_idx.to_le_bytes());
-    XNonce::from(nonce_bytes)
-}
-
-/// VERSION=3 content-based nonce derivation using keyed Blake3.
+/// Content-based nonce derivation using keyed Blake3 with `File_ID`.
 ///
-/// Computes: `Blake3_keyed(Key_MAC, plaintext || chunk_idx_le)[0..24]`
+/// Computes: `Blake3_keyed(Key_MAC, File_ID || plaintext ||
+/// chunk_idx_le)[0..24]`
 ///
-/// Each chunk's nonce is derived from its own plaintext content, so different
-/// plaintext always produces a different nonce. The chunk index prevents
-/// reordering attacks on identical 64 KB blocks.
-fn derive_nonce_v3_content(
+/// The `File_ID` ensures cross-file uniqueness: even if two different files
+/// have identical plaintext at the same chunk index, they produce different
+/// nonces. The chunk index prevents reordering attacks on identical 64 KB
+/// blocks.
+fn derive_nonce(
     key_mac: &[u8; 32],
+    file_id: &[u8; FILE_ID_LEN],
     plaintext: &[u8],
     chunk_idx: u64,
 ) -> [u8; NONCE_LEN] {
     let mut hasher = blake3::Hasher::new_keyed(key_mac);
+    hasher.update(file_id);
     hasher.update(plaintext);
     hasher.update(&chunk_idx.to_le_bytes());
     let hash = hasher.finalize();
@@ -291,7 +280,7 @@ fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
 
 // --- Public Operations ---
 
-/// Encrypt a single file using streaming chunked encryption (VERSION=3).
+/// Encrypt a single file using streaming chunked encryption.
 ///
 /// Returns `Some(header)` on success, or `None` if the file was already
 /// encrypted and skipped.
@@ -299,12 +288,12 @@ pub fn encrypt_file(
     path: &Path,
     derived_key: &[u8; 32],
     salt: &[u8; SALT_LEN],
-    nonce: Option<[u8; NONCE_LEN]>,
+    file_id: Option<[u8; FILE_ID_LEN]>,
     zstd: Option<u8>,
 ) -> Result<Option<FileHeader>> {
     let mut file = fs::File::open(path)?;
 
-    // 1. Quick check if already encrypted (any supported version)
+    // 1. Quick check if already encrypted
     let mut header_bytes = [0u8; HEADER_LEN];
     if file.read_exact(&mut header_bytes).is_ok()
         && &header_bytes[0..5] == MAGIC
@@ -317,8 +306,14 @@ pub fn encrypt_file(
 
     debug!("Encrypting: {}", path.display());
 
-    // 2. Prepare Header & Temp File
-    let header = FileHeader::new(zstd.is_some(), *salt, nonce);
+    // 2. Generate File_ID (random if not cached) and prepare Header & Temp File
+    let file_id = file_id.unwrap_or_else(|| {
+        let mut rng = rand::rng();
+        let mut id = [0u8; FILE_ID_LEN];
+        rng.fill_bytes(&mut id);
+        id
+    });
+    let header = FileHeader::new(zstd.is_some(), *salt, Some(file_id));
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent_dir)
         .with_context(|| "Failed to create temp file".to_string())?;
@@ -339,11 +334,7 @@ pub fn encrypt_file(
         Box::new(file)
     };
 
-    // 4. Chunked Encryption Loop — content-based nonce derivation (v3)
-    //
-    // Each chunk is written as: [NONCE (24B)] [CIPHERTEXT] [TAG (16B)]
-    // Nonce is derived from the plaintext of the current chunk via keyed Blake3,
-    // so different content always yields a different nonce.
+    // 4. Chunked Encryption Loop — content-based nonce derivation with File_ID
     let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
     let mut chunk_idx = 0u64;
 
@@ -362,8 +353,8 @@ pub fn encrypt_file(
         aad[..8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[8] = u8::from(is_last_chunk);
 
-        // Derive nonce from current chunk's plaintext using keyed Blake3.
-        let nonce_bytes = derive_nonce_v3_content(&key_mac, &buffer[..bytes_read], chunk_idx);
+        // Derive nonce from File_ID + current chunk's plaintext using keyed Blake3.
+        let nonce_bytes = derive_nonce(&key_mac, &file_id, &buffer[..bytes_read], chunk_idx);
         let nonce = XNonce::from(nonce_bytes);
 
         let payload = Payload {
@@ -405,10 +396,6 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 ///
 /// The `cache` tuple contains `(sender, relative_key)` — the caller is
 /// responsible for computing the repo-relative path key.
-///
-/// # Panics
-///
-/// Panics if the cache is poisoned.
 pub fn decrypt_file_with_cache(
     path: &Path,
     key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>>,
@@ -438,14 +425,14 @@ pub fn decrypt_file_with_cache(
     let header = FileHeader::read(&mut Cursor::new(&header_bytes))
         .with_context(|| format!("Corrupt header in {}", path.display()))?;
 
-    // Cache the salt+nonce BEFORE decryption so it is preserved even if
+    // Cache the salt+file_id BEFORE decryption so it is preserved even if
     // decryption fails halfway through.
     if let Some((sender, key)) = cache {
         sender.insert(
             key,
             CachedEntry {
                 salt: header.salt,
-                nonce: header.nonce,
+                file_id: header.file_id,
             },
         );
     }
@@ -471,22 +458,10 @@ pub fn decrypt_file_with_cache(
     // 4. Chunked Decryption Loop
     if header.is_compressed() {
         let mut decoder = zstd::stream::write::Decoder::new(&mut temp_file)?.auto_flush();
-        decrypt_chunks(
-            &mut file,
-            &mut decoder,
-            &cipher,
-            &header.nonce,
-            header.version,
-        )?;
+        decrypt_chunks(&mut file, &mut decoder, &cipher)?;
         decoder.flush()?;
     } else {
-        decrypt_chunks(
-            &mut file,
-            &mut temp_file,
-            &cipher,
-            &header.nonce,
-            header.version,
-        )?;
+        decrypt_chunks(&mut file, &mut temp_file, &cipher)?;
     }
     drop(file);
 
@@ -499,85 +474,8 @@ pub fn decrypt_file_with_cache(
 /// Helper function to read ciphertext chunks, decrypt them, and write to the
 /// destination.
 ///
-/// Uses version-appropriate nonce derivation: v2 uses simple counter-based
-/// nonces, v3 reads the nonce from each chunk's header (content-based).
-fn decrypt_chunks(
-    file: &mut fs::File,
-    writer: &mut dyn Write,
-    cipher: &XChaCha20Poly1305,
-    base_nonce: &[u8; NONCE_LEN],
-    version: u8,
-) -> Result<()> {
-    match version {
-        2 => decrypt_chunks_v2(file, writer, cipher, base_nonce),
-        3 => decrypt_chunks_v3(file, writer, cipher),
-        _ => Err(anyhow!("Unsupported version for decryption: {version}")),
-    }
-}
-
-/// VERSION=2 decryption: counter-based nonce, no per-chunk nonce in stream.
-fn decrypt_chunks_v2(
-    file: &mut fs::File,
-    writer: &mut dyn Write,
-    cipher: &XChaCha20Poly1305,
-    base_nonce: &[u8; NONCE_LEN],
-) -> Result<()> {
-    // Ciphertext chunk size = Plaintext chunk size + 16 bytes (Poly1305 MAC tag)
-    let mut buffer = vec![0u8; CHUNK_SIZE + 16];
-    let mut chunk_idx = 0u64;
-    let mut last_chunk_was_final = false;
-
-    loop {
-        let mut bytes_read = 0;
-        while bytes_read < buffer.len() {
-            let n = file.read(&mut buffer[bytes_read..])?;
-            if n == 0 {
-                break;
-            }
-            bytes_read += n;
-        }
-
-        if bytes_read == 0 {
-            break; // EOF
-        }
-
-        let is_last_chunk = bytes_read < buffer.len();
-        let aad = if is_last_chunk { b"LAST" } else { b"MORE" };
-
-        let nonce = derive_nonce_v2(base_nonce, chunk_idx);
-
-        let payload = chacha20poly1305::aead::Payload {
-            msg: &buffer[..bytes_read],
-            aad,
-        };
-
-        let plaintext = Zeroizing::new(cipher.decrypt(&nonce, payload).map_err(|e| {
-            anyhow!("Decryption failed (wrong password, corrupt, or tampered data): {e}")
-        })?);
-
-        writer.write_all(&plaintext)?;
-        chunk_idx += 1;
-
-        if is_last_chunk {
-            last_chunk_was_final = true;
-            break;
-        }
-    }
-
-    if !last_chunk_was_final {
-        return Err(anyhow!(
-            "File truncation detected! The ciphertext is incomplete."
-        ));
-    }
-
-    Ok(())
-}
-
-/// VERSION=3 decryption: nonce is stored in plaintext at the head of each
-/// encrypted chunk. No dependency on previous chunks.
-///
 /// Chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
-fn decrypt_chunks_v3(
+fn decrypt_chunks(
     file: &mut fs::File,
     writer: &mut dyn Write,
     cipher: &XChaCha20Poly1305,
@@ -653,19 +551,16 @@ fn decrypt_chunks_v3(
 ///
 /// # Deterministic Re-encryption
 ///
-/// Loads the salt+nonce cache (populated by a previous decrypt) via mmap +
+/// Loads the `salt+file_id` cache (populated by a previous decrypt) via mmap +
 /// rkyv zero-copy and reuses cached values so that decrypt→encrypt on
 /// unchanged content produces byte-identical ciphertext. Files not in the
 /// cache share a single new batch salt to minimise Argon2 overhead.
 ///
 /// The cache is **read-only** during encryption; only the decrypt path
 /// writes to the cache.
-///
-/// # Panics
-/// Panics if the master key is not set.
 pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key();
-    assert!(!key.is_empty(), "Key must not be empty");
+    ensure!(!key.is_empty(), "Key must not be empty");
 
     let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
     ensure!(!target_files.is_empty(), "No file to encrypt");
@@ -688,9 +583,11 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 
     let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
         let relative_key = cache_key(f, repo.path());
-        let (salt, cached_nonce) = reader
+        let (salt, cached_file_id) = reader
             .get(&relative_key)
-            .map_or((batch_salt, None), |entry| (entry.salt, Some(entry.nonce)));
+            .map_or((batch_salt, None), |entry| {
+                (entry.salt, Some(entry.file_id))
+            });
 
         // Derive key — cached across threads to avoid redundant Argon2 work.
         let derived_key = {
@@ -707,7 +604,7 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
             f,
             &derived_key,
             &salt,
-            cached_nonce,
+            cached_file_id,
             repo.conf.use_zstd.then_some(repo.conf.zstd_level),
         )
         .with_context(|| format!("Failed to encrypt {}", f.display()))?;
@@ -737,15 +634,12 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 /// Decrypt given files in the repo. If no paths are given, decrypt all files
 /// in the repo's crypt list.
 ///
-/// The salt+nonce of each successfully parsed encrypted file is captured via
-/// an mpsc channel so that a subsequent encrypt can reproduce identical
+/// The `salt+file_id` of each successfully parsed encrypted file is captured
+/// via an mpsc channel so that a subsequent encrypt can reproduce identical
 /// ciphertext.
-///
-/// # Panics
-/// Panics if the master key is not set.
 pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key();
-    assert!(!key.is_empty(), "Master key must not be empty");
+    ensure!(!key.is_empty(), "Master key must not be empty");
 
     let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
     ensure!(!target_files.is_empty(), "No file to decrypt");
@@ -755,7 +649,7 @@ pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 
     let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
 
-    // Write-only: mpsc channel collects salt/nonce from rayon threads.
+    // Write-only: mpsc channel collects salt/file_id from rayon threads.
     let (sender, saver) = salt_cache::create_writer(repo.path());
 
     let pb = create_progress_bar(target_files.len(), "Decrypt");
@@ -851,57 +745,42 @@ mod tests {
         assert_eq!(decoded.flags, FLAG_COMPRESSED);
         assert_eq!(decoded.enc_algo, ENC_ALGO);
         assert_eq!(decoded.salt, salt);
-        assert_eq!(decoded.nonce, header.nonce);
+        assert_eq!(decoded.file_id, header.file_id);
         assert!(decoded.is_compressed());
     }
 
     #[test]
-    fn test_nonce_derivation_v2() {
-        let base_nonce = [0u8; NONCE_LEN];
-
-        // Chunk 0: Should be identical to base_nonce
-        let nonce0 = derive_nonce_v2(&base_nonce, 0);
-        assert_eq!(nonce0.as_slice(), &[0u8; NONCE_LEN]);
-
-        // Chunk 1: The 16th byte (index 16) should be 1
-        let nonce1 = derive_nonce_v2(&base_nonce, 1);
-        let mut expected1 = [0u8; NONCE_LEN];
-        expected1[16] = 1;
-        assert_eq!(nonce1.as_slice(), &expected1);
-
-        // Chunk 256: The 17th byte (index 17) should be 1 (256 = 0x0100 in LE)
-        let nonce256 = derive_nonce_v2(&base_nonce, 256);
-        let mut expected256 = [0u8; NONCE_LEN];
-        expected256[17] = 1;
-        assert_eq!(nonce256.as_slice(), &expected256);
-    }
-
-    #[test]
-    fn test_nonce_derivation_v3_deterministic() {
+    fn test_nonce_derivation_deterministic() {
         let key_mac = [0x42u8; 32];
+        let file_id = [0x99u8; FILE_ID_LEN];
         let plaintext = b"hello world";
 
         // Same inputs → same nonce (deterministic).
-        let nonce0_a = derive_nonce_v3_content(&key_mac, plaintext, 0);
-        let nonce0_b = derive_nonce_v3_content(&key_mac, plaintext, 0);
+        let nonce0_a = derive_nonce(&key_mac, &file_id, plaintext, 0);
+        let nonce0_b = derive_nonce(&key_mac, &file_id, plaintext, 0);
         assert_eq!(nonce0_a, nonce0_b);
 
         // Different chunk index → different nonce.
-        let nonce1 = derive_nonce_v3_content(&key_mac, plaintext, 1);
+        let nonce1 = derive_nonce(&key_mac, &file_id, plaintext, 1);
         assert_ne!(nonce0_a, nonce1);
 
         // Different plaintext → different nonce.
         let other_plaintext = b"hello world!";
-        let nonce_other = derive_nonce_v3_content(&key_mac, other_plaintext, 0);
+        let nonce_other = derive_nonce(&key_mac, &file_id, other_plaintext, 0);
         assert_ne!(nonce0_a, nonce_other);
 
         // Different key_mac → different nonce.
         let key_mac2 = [0x43u8; 32];
-        let nonce_key2 = derive_nonce_v3_content(&key_mac2, plaintext, 0);
+        let nonce_key2 = derive_nonce(&key_mac2, &file_id, plaintext, 0);
         assert_ne!(nonce0_a, nonce_key2);
 
+        // Different file_id → different nonce (cross-file uniqueness).
+        let file_id2 = [0xAAu8; FILE_ID_LEN];
+        let nonce_file2 = derive_nonce(&key_mac, &file_id2, plaintext, 0);
+        assert_ne!(nonce0_a, nonce_file2);
+
         // Empty plaintext should still produce a valid nonce.
-        let nonce_empty = derive_nonce_v3_content(&key_mac, b"", 0);
+        let nonce_empty = derive_nonce(&key_mac, &file_id, b"", 0);
         assert_ne!(nonce_empty, [0u8; NONCE_LEN]);
     }
 
@@ -1040,28 +919,28 @@ mod tests {
     }
 
     #[test]
-    fn test_deterministic_encrypt_with_fixed_salt_nonce() {
+    fn test_deterministic_encrypt_with_fixed_salt_file_id() {
         let plaintext = b"Deterministic encryption test data.";
 
         let password = b"test_password";
         let salt = [0x42; SALT_LEN];
-        let nonce = [0x13; NONCE_LEN];
+        let file_id = [0x13; FILE_ID_LEN];
         let derived = derive_key(password, &salt).unwrap();
         let mut key = [0u8; 32];
         key.copy_from_slice(&*derived);
 
-        // Encrypt twice with the same salt+nonce → identical ciphertext
+        // Encrypt twice with the same salt+file_id → identical ciphertext
         let path1 = create_temp_file(plaintext);
         let path2 = create_temp_file(plaintext);
 
-        encrypt_file(&path1, &key, &salt, Some(nonce), None).unwrap();
-        encrypt_file(&path2, &key, &salt, Some(nonce), None).unwrap();
+        encrypt_file(&path1, &key, &salt, Some(file_id), None).unwrap();
+        encrypt_file(&path2, &key, &salt, Some(file_id), None).unwrap();
 
         let ct1 = fs::read(&path1).unwrap();
         let ct2 = fs::read(&path2).unwrap();
         assert_eq!(
             ct1, ct2,
-            "Same plaintext + same salt+nonce must produce identical ciphertext"
+            "Same plaintext + same salt+file_id must produce identical ciphertext"
         );
 
         // And both should decrypt correctly
@@ -1071,7 +950,7 @@ mod tests {
 
     #[test]
     fn test_deterministic_encrypt_multi_chunk() {
-        // Multi-chunk file: test hash-chain determinism across chunk boundaries.
+        // Multi-chunk file: test determinism across chunk boundaries.
         #[allow(clippy::cast_possible_truncation)]
         let plaintext = {
             let mut data = Vec::with_capacity(CHUNK_SIZE * 2 + 1000);
@@ -1083,7 +962,7 @@ mod tests {
 
         let password = b"test_password";
         let salt = [0x42; SALT_LEN];
-        let nonce = [0x13; NONCE_LEN];
+        let file_id = [0x13; FILE_ID_LEN];
         let derived = derive_key(password, &salt).unwrap();
         let mut key = [0u8; 32];
         key.copy_from_slice(&*derived);
@@ -1091,14 +970,14 @@ mod tests {
         let path1 = create_temp_file(&plaintext);
         let path2 = create_temp_file(&plaintext);
 
-        encrypt_file(&path1, &key, &salt, Some(nonce), None).unwrap();
-        encrypt_file(&path2, &key, &salt, Some(nonce), None).unwrap();
+        encrypt_file(&path1, &key, &salt, Some(file_id), None).unwrap();
+        encrypt_file(&path2, &key, &salt, Some(file_id), None).unwrap();
 
         let ct1 = fs::read(&path1).unwrap();
         let ct2 = fs::read(&path2).unwrap();
         assert_eq!(
             ct1, ct2,
-            "Same multi-chunk plaintext + same salt+nonce must produce identical ciphertext"
+            "Same multi-chunk plaintext + same salt+file_id must produce identical ciphertext"
         );
 
         // Decrypt and verify
@@ -1107,11 +986,38 @@ mod tests {
     }
 
     #[test]
-    fn test_is_encrypted_version() {
-        assert!(!is_encrypted_version(1));
-        assert!(is_encrypted_version(2));
-        assert!(is_encrypted_version(3));
-        assert!(!is_encrypted_version(4));
+    fn test_different_file_id_produces_different_ciphertext() {
+        // Verify that the same plaintext encrypted with different File_IDs
+        // produces different ciphertext (cross-file uniqueness).
+        let plaintext = b"Same content, different file.";
+
+        let password = b"test_password";
+        let salt = [0x42; SALT_LEN];
+        let derived = derive_key(password, &salt).unwrap();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&*derived);
+
+        let path1 = create_temp_file(plaintext);
+        let path2 = create_temp_file(plaintext);
+
+        let file_id1 = [0x01; FILE_ID_LEN];
+        let file_id2 = [0x02; FILE_ID_LEN];
+
+        encrypt_file(&path1, &key, &salt, Some(file_id1), None).unwrap();
+        encrypt_file(&path2, &key, &salt, Some(file_id2), None).unwrap();
+
+        let ct1 = fs::read(&path1).unwrap();
+        let ct2 = fs::read(&path2).unwrap();
+        assert_ne!(
+            ct1, ct2,
+            "Same plaintext with different File_IDs must produce different ciphertext"
+        );
+
+        // Both should decrypt correctly
+        decrypt_file(&path1, password).unwrap();
+        assert_eq!(fs::read(&path1).unwrap(), plaintext);
+        decrypt_file(&path2, password).unwrap();
+        assert_eq!(fs::read(&path2).unwrap(), plaintext);
     }
 
     #[cfg(unix)]
