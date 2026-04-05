@@ -35,6 +35,7 @@ You can choose **any** of the following methods:
   ```sh
   cargo install git-simple-encrypt
   ```
+- NixOS users can install from [my NUR](https://github.com/lxl66566/NUR).
 
 ## Usage
 

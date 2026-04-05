@@ -35,6 +35,7 @@
   ```sh
   cargo install git-simple-encrypt
   ```
+- NixOS 用户可以通过[我的 NUR](https://github.com/lxl66566/NUR) 安装。
 
 ## 使用
 
