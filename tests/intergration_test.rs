@@ -1,7 +1,3 @@
-#![feature(test)]
-
-extern crate test;
-
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -14,7 +10,6 @@ use git_simple_encrypt::{Cli, FileHeader, SetField, SubCommand};
 use rand::prelude::*;
 use tap::Tap;
 use tempfile::TempDir;
-use test::Bencher;
 
 fn bench_init() -> TempDir {
     let pwd = TempDir::new().unwrap();
@@ -69,15 +64,13 @@ where
 {
     fn is_encrypted(&self) -> bool {
         let mut f = fs::File::open(self.as_ref()).unwrap();
-        let header = FileHeader::read(&mut f);
-        header.is_ok()
+        FileHeader::read_from(&mut f).is_ok()
     }
 
     /// Check if the file is both encrypted and compressed.
     fn is_compressed(&self) -> bool {
         let mut f = fs::File::open(self.as_ref()).unwrap();
-        let header = FileHeader::read(&mut f).unwrap();
-        header.is_compressed()
+        FileHeader::read_from(&mut f).unwrap().is_compressed()
     }
 }
 
@@ -481,43 +474,6 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
         let ciphertext = std::fs::read(temp_dir.join("data.txt"))?;
         assert_eq!(ciphertext, reference, "Ciphertext changed at cycle {cycle}");
     }
-
-    Ok(())
-}
-
-#[bench]
-fn bench_encrypt_and_decrypt(b: &mut Bencher) -> anyhow::Result<()> {
-    const FILES_NUM: i32 = 5;
-    const FILE_SIZE: usize = 256 * 1024;
-
-    let pwd = bench_init();
-    let temp_dir = pwd.path();
-    let inner_dir = temp_dir.join("dir");
-    std::fs::create_dir(&inner_dir).unwrap();
-
-    let mut rng = rand::rngs::SmallRng::from_seed([0, 1].repeat(16).as_slice().try_into().unwrap());
-    let mut random_vec = || {
-        let mut v = Vec::with_capacity(FILE_SIZE);
-        for _ in 0..FILE_SIZE {
-            v.push(rng.random::<u8>());
-        }
-        v
-    };
-    for i in 1..=FILES_NUM {
-        std::fs::write(inner_dir.join(format!("file{}", i)), random_vec()).unwrap();
-    }
-
-    run(
-        SubCommand::Add {
-            paths: vec![inner_dir],
-        },
-        temp_dir,
-    )?;
-
-    b.iter(|| {
-        run(SubCommand::Encrypt { paths: vec![] }, temp_dir).unwrap();
-        run(SubCommand::Decrypt { paths: vec![] }, temp_dir).unwrap();
-    });
 
     Ok(())
 }

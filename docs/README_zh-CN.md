@@ -2,12 +2,12 @@
 
 [English](../README.md) | 简体中文
 
-这是一个简单、安全的 git 加密工具。只需一个密码，即可在任何设备上加密/解密您的 git 仓库。
+这是一个安全、高性能、易于使用的 git 加密工具。只需一个密码，即可在任何设备上加密/解密您的 git 仓库内的指定文件。
 
 - 相比 [git-crypt](https://github.com/AGWA/git-crypt)，它不需要管理 GPG 密钥或备份密钥文件。**单密码对称加密**是核心原则。
 - 安全性：v2.0.0+ 版本进行了彻底重构，采用 **Argon2 + XChaCha20-Poly1305** 保证安全性，适用于生产环境。
   - 算法可抗位篡改、重排攻击、重放攻击、截断攻击，详见[原理](#原理)。
-- 对偶性保证：解密时缓存 salt + FILE_ID，并在加密时复用，若**文件无变更则加密产物也相同**，避免反复加解密导致仓库体积膨胀。v3.0.0+ Nonce 基于当前分块明文 + File_ID 计算，在保持确定性同时消除了 nonce 重用风险和跨文件数据块碰撞问题。
+- 对偶性保证：解密时缓存 salt + FILE_ID，并在加密时复用，若**文件无变更则加密产物也相同**，避免反复加解密导致仓库体积膨胀。v3.0.0+ Nonce 基于当前分块明文 + File_ID + chunk_idx 计算，在保持确定性同时消除了 Nonce 重用风险和跨文件数据块碰撞问题。
 - 流式处理：采用 64KB 分块加密，降低大文件加密的内存占用。
 - 并行加速：多线程并行加解密，充分利用 CPU 多核性能。
 - 原子写入：加解密过程实现原子写入，防止中断时损坏文件；保留原文件的权限与时间戳。
@@ -63,7 +63,7 @@ v3.0.0+ 版本的加密流程如下：
 ### 1\. 密钥派生
 
 - 程序通过 Argon2 算法结合文件的 16B Salt 派生出 32B 的 Master Key，再通过 `blake3::derive_key` 拆分为两个独立密钥，用于 XChaCha20-Poly1305 加密 + 计算每个分块的 Nonce。
-  - 利用 DashMap 缓存已派生的密钥，减少重复 Argon2 运算。
+  - 利用 `DashMap<Salt, Arc<OnceLock>>` 缓存已派生的密钥，减少重复 Argon2 运算。
 
 ### 2\. 头部结构
 
@@ -88,7 +88,7 @@ v3.0.0+ 版本的加密流程如下：
 
 - 算法： 文件被切分为 64KB 的块，使用 XChaCha20-Poly1305 进行加密。
 - Nonce 派生： 每个 chunk 的 nonce 基于 File_ID 和当前块自身的明文内容，通过带密钥的 Blake3 哈希计算：`Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i || chunk_idx)[0..24]`
-- AAD： `chunk_idx + (is_last_chunk as u8)`，共 9B
+- AAD： 完整的 64B HEADER + chunk_idx (8B) + is_last_chunk (1B)，共 73B。HEADER 参与所有 chunk 的 AAD 绑定。
 - 存储格式： 每个加密分块的物理结构为 `[NONCE (24B)] [CIPHERTEXT (<= 64KB)] [Poly1305 TAG (16B)]`，Nonce 存储在分块头部。
 
 ```mermaid

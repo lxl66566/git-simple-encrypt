@@ -36,18 +36,30 @@
 //! file). The `File_ID` ensures cross-file uniqueness. The chunk index prevents
 //! reordering attacks on identical 64 KB blocks.
 //!
+//! # Authenticated Additional Data (AAD)
+//!
+//! Each chunk's AAD binds the ciphertext to the full file header so that any
+//! tampering with header fields (version, compression flag, salt, `file_id`,
+//! reserved) is detected via Poly1305 authentication failure:
+//!
+//! ```text
+//! AAD = HEADER (64B) || chunk_idx (8B LE) || is_last_chunk (1B)   // 73 bytes
+//! ```
+//!
 //! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
 
 use std::{
     fs,
-    io::{Cursor, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 use anyhow::{Context, Result, anyhow, ensure};
 use argon2::Argon2;
-use byteorder::{ReadBytesExt, WriteBytesExt};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
@@ -97,14 +109,31 @@ pub const fn is_encrypted_version(v: u8) -> bool {
 
 // --- Helper Structures ---
 
-#[derive(Debug)]
+/// Fixed-size file header stored at the beginning of every encrypted file.
+///
+/// The layout is `#[repr(C)]` with all fields being `u8` or `[u8; N]`, so:
+/// - **Alignment** = 1 (same as `u8`)
+/// - **Size** = exactly `HEADER_LEN` (64 bytes)
+/// - **No padding** — the compiler cannot insert any between `u8`-aligned
+///   fields
+///
+/// This makes zero-copy casting to/from `[u8; HEADER_LEN]` sound, verified by
+/// the compile-time assertions below.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileHeader {
+    magic: [u8; 5],
     version: u8,
     flags: u8,
     enc_algo: u8,
     salt: [u8; SALT_LEN],
     file_id: [u8; FILE_ID_LEN],
+    reserved: [u8; RESERVED_LEN],
 }
+
+// Compile-time safety invariants for zero-copy casting.
+const _: () = assert!(std::mem::size_of::<FileHeader>() == HEADER_LEN);
+const _: () = assert!(std::mem::align_of::<FileHeader>() == 1);
 
 impl FileHeader {
     #[must_use]
@@ -122,62 +151,68 @@ impl FileHeader {
         }
 
         Self {
+            magic: *MAGIC,
             version: VERSION,
             flags,
             enc_algo: ENC_ALGO,
             salt,
             file_id,
+            reserved: [0u8; RESERVED_LEN],
         }
     }
 
-    /// Write the header to the writer.
-    pub fn write<W: Write>(&self, writer: &mut W) -> Result<()> {
-        writer.write_all(MAGIC)?;
-        writer.write_u8(self.version)?;
-        writer.write_u8(self.flags)?;
-        writer.write_u8(self.enc_algo)?;
-        writer.write_all(&self.salt)?;
-        writer.write_all(&self.file_id)?;
-        let reserved = [0u8; RESERVED_LEN];
-        writer.write_all(&reserved)?;
+    /// Zero-copy: validate and cast `&[u8; 64]` → `&FileHeader`.
+    ///
+    /// The returned reference borrows from `bytes` — no allocation or copying.
+    pub fn from_bytes(bytes: &[u8; HEADER_LEN]) -> Result<&Self> {
+        // SAFETY: FileHeader is #[repr(C)] with only u8/[u8; N] fields.
+        // Alignment == 1, size == HEADER_LEN, no padding — verified by the
+        // compile-time assertions above.
+        let header: &Self = unsafe { &*(bytes.as_ptr().cast()) };
+
+        if &header.magic != MAGIC {
+            return Err(anyhow!("Invalid magic bytes"));
+        }
+        if !is_encrypted_version(header.version) {
+            return Err(anyhow!("Unsupported version: {}", header.version));
+        }
+        if header.enc_algo != ENC_ALGO {
+            return Err(anyhow!(
+                "Unsupported encryption algorithm: {}",
+                header.enc_algo
+            ));
+        }
+
+        Ok(header)
+    }
+
+    /// Read 64 bytes from `reader`, validate, and return an owned header.
+    ///
+    /// This is a convenience wrapper around [`from_bytes`](Self::from_bytes)
+    /// for callers that already have a `Read` impl (e.g. integration tests).
+    pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
+        let mut buf = [0u8; HEADER_LEN];
+        reader
+            .read_exact(&mut buf)
+            .context("Failed to read header")?;
+        Ok(*Self::from_bytes(&buf)?)
+    }
+
+    /// Write the header bytes to `writer` (zero-copy via [`as_bytes`]).
+    pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
+        writer.write_all(self.as_bytes())?;
         Ok(())
     }
 
-    /// Read the header from the reader.
-    pub fn read<R: Read>(reader: &mut R) -> Result<Self> {
-        let mut magic_buf = [0u8; 5];
-        reader
-            .read_exact(&mut magic_buf)
-            .context("Failed to read magic")?;
-        if &magic_buf != MAGIC {
-            return Err(anyhow!("Invalid magic bytes"));
-        }
-
-        let version = reader.read_u8()?;
-        if !is_encrypted_version(version) {
-            return Err(anyhow!("Unsupported version: {version}"));
-        }
-
-        let flags = reader.read_u8()?;
-        let enc_algo = reader.read_u8()?;
-        if enc_algo != ENC_ALGO {
-            return Err(anyhow!("Unsupported encryption algorithm: {enc_algo}"));
-        }
-
-        let mut salt = [0u8; SALT_LEN];
-        reader.read_exact(&mut salt)?;
-        let mut file_id = [0u8; FILE_ID_LEN];
-        reader.read_exact(&mut file_id)?;
-        let mut reserved = [0u8; RESERVED_LEN];
-        reader.read_exact(&mut reserved)?;
-
-        Ok(Self {
-            version,
-            flags,
-            enc_algo,
-            salt,
-            file_id,
-        })
+    /// Zero-copy: view the header as a fixed-size byte slice.
+    ///
+    /// The returned `&[u8; HEADER_LEN]` borrows from `self`.
+    #[must_use]
+    #[inline]
+    pub const fn as_bytes(&self) -> &[u8; HEADER_LEN] {
+        // SAFETY: Same reasoning as from_bytes — #[repr(C)], align 1,
+        // size == HEADER_LEN, no padding.
+        unsafe { &*std::ptr::from_ref::<Self>(self).cast() }
     }
 
     #[must_use]
@@ -278,6 +313,50 @@ fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     bytes
 }
 
+// --- Key Derivation Cache (thundering-herd safe) ---
+
+/// Thread-safe key derivation cache with thundering-herd protection.
+///
+/// Uses `Arc<OnceLock>` per salt so that when multiple threads encounter the
+/// same salt simultaneously (e.g. new files sharing a `batch_salt`), only ONE
+/// thread performs the expensive Argon2 computation; all others block on the
+/// `OnceLock` and then clone the result.
+///
+/// The `Arc` allows cloning the handle out of the `DashMap` guard, releasing
+/// the internal shard lock before the Argon2 computation starts. This prevents
+/// contention on other keys sharing the same shard.
+type KeyCache = DashMap<[u8; SALT_LEN], Arc<OnceLock<Result<Zeroizing<[u8; 32]>, String>>>>;
+
+/// Retrieve or derive a key for the given salt, with thundering-herd
+/// protection.
+///
+/// If the key has already been computed, returns a clone immediately.
+/// If multiple threads arrive simultaneously for the same salt, only one
+/// performs the Argon2 computation; the others block and then clone the result.
+fn get_or_derive_key(
+    key_cache: &KeyCache,
+    master_key: &[u8],
+    salt: &[u8; SALT_LEN],
+) -> Result<Zeroizing<[u8; 32]>> {
+    // Atomically insert a placeholder OnceLock if this salt is new.
+    // We clone the Arc so that the DashMap shard lock is released before
+    // the potentially slow Argon2 computation, preventing contention on
+    // other keys in the same shard.
+    let lock = {
+        let guard = key_cache
+            .entry(*salt)
+            .or_insert_with(|| Arc::new(OnceLock::new()));
+        Arc::clone(&*guard)
+    };
+
+    // Only the first thread to reach get_or_init runs the closure;
+    // all others block until the result is available.
+    match lock.get_or_init(|| derive_key(master_key, salt).map_err(|e| e.to_string())) {
+        Ok(key) => Ok(key.clone()),
+        Err(msg) => Err(anyhow!("{msg}")),
+    }
+}
+
 // --- Public Operations ---
 
 /// Encrypt a single file using streaming chunked encryption.
@@ -318,7 +397,7 @@ pub fn encrypt_file(
     let mut temp_file = NamedTempFile::new_in(parent_dir)
         .with_context(|| "Failed to create temp file".to_string())?;
 
-    header.write(&mut temp_file)?;
+    header.write_to(&mut temp_file)?;
 
     // 3. Split master key into encryption key and MAC key, then setup cipher.
     let (key_enc, key_mac) = split_keys(derived_key);
@@ -349,9 +428,13 @@ pub fn encrypt_file(
         }
 
         let is_last_chunk = bytes_read < CHUNK_SIZE;
-        let mut aad = [0u8; 9];
-        aad[..8].copy_from_slice(&chunk_idx.to_le_bytes());
-        aad[8] = u8::from(is_last_chunk);
+        // AAD includes the full 64-byte header + chunk_idx + is_last_chunk.
+        // This ensures any tampering with header fields (e.g. compressed flag)
+        // is detected during decryption via Poly1305 authentication failure.
+        let mut aad = [0u8; HEADER_LEN + 9];
+        aad[..HEADER_LEN].copy_from_slice(header.as_bytes());
+        aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
+        aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
         // Derive nonce from File_ID + current chunk's plaintext using keyed Blake3.
         let nonce_bytes = derive_nonce(&key_mac, &file_id, &buffer[..bytes_read], chunk_idx);
@@ -386,7 +469,7 @@ pub fn encrypt_file(
 
 /// Decrypt a single file using streaming chunked decryption.
 pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
-    let key_cache = DashMap::new();
+    let key_cache: KeyCache = DashMap::new();
     decrypt_file_with_cache(path, &key_cache, None, master_key)
 }
 
@@ -398,7 +481,7 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 /// responsible for computing the repo-relative path key.
 pub fn decrypt_file_with_cache(
     path: &Path,
-    key_cache: &DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>>,
+    key_cache: &KeyCache,
     cache: Option<(&SaltCacheSender, &[u8])>,
     master_key: &[u8],
 ) -> Result<()> {
@@ -422,7 +505,7 @@ pub fn decrypt_file_with_cache(
     }
 
     debug!("Decrypting: {}", path.display());
-    let header = FileHeader::read(&mut Cursor::new(&header_bytes))
+    let header = FileHeader::from_bytes(&header_bytes)
         .with_context(|| format!("Corrupt header in {}", path.display()))?;
 
     // Cache the salt+file_id BEFORE decryption so it is preserved even if
@@ -437,16 +520,8 @@ pub fn decrypt_file_with_cache(
         );
     }
 
-    // 2. Retrieve or Derive Key (Argon2 Performance fixed)
-    let derived_key = {
-        if let Some(k) = key_cache.get(&header.salt) {
-            k.clone()
-        } else {
-            let k = derive_key(master_key, &header.salt)?;
-            key_cache.insert(header.salt, k.clone());
-            k
-        }
-    };
+    // 2. Retrieve or Derive Key (with thundering-herd protection)
+    let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;
 
     // 3. Split master key and setup cipher
     let (key_enc, _key_mac) = split_keys(&derived_key);
@@ -458,10 +533,10 @@ pub fn decrypt_file_with_cache(
     // 4. Chunked Decryption Loop
     if header.is_compressed() {
         let mut decoder = zstd::stream::write::Decoder::new(&mut temp_file)?.auto_flush();
-        decrypt_chunks(&mut file, &mut decoder, &cipher)?;
+        decrypt_chunks(&mut file, &mut decoder, &cipher, header.as_bytes())?;
         decoder.flush()?;
     } else {
-        decrypt_chunks(&mut file, &mut temp_file, &cipher)?;
+        decrypt_chunks(&mut file, &mut temp_file, &cipher, header.as_bytes())?;
     }
     drop(file);
 
@@ -475,10 +550,15 @@ pub fn decrypt_file_with_cache(
 /// destination.
 ///
 /// Chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
+///
+/// `header_bytes` is the raw 64-byte file header, included in every chunk's
+/// AAD to bind the ciphertext to the exact header that was present during
+/// encryption. Any header tampering will cause Poly1305 authentication failure.
 fn decrypt_chunks(
     file: &mut fs::File,
     writer: &mut dyn Write,
     cipher: &XChaCha20Poly1305,
+    header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
     let mut nonce_buf = [0u8; NONCE_LEN];
     let mut ct_buffer = vec![0u8; CHUNK_SIZE + 16]; // ciphertext + Poly1305 tag
@@ -511,9 +591,12 @@ fn decrypt_chunks(
 
         let is_last_chunk = bytes_read < ct_buffer.len();
 
-        let mut aad = [0u8; 9];
-        aad[..8].copy_from_slice(&chunk_idx.to_le_bytes());
-        aad[8] = u8::from(is_last_chunk);
+        // AAD must match what was used during encryption:
+        // full header (64B) + chunk_idx (8B) + is_last_chunk (1B)
+        let mut aad = [0u8; HEADER_LEN + 9];
+        aad[..HEADER_LEN].copy_from_slice(header_bytes);
+        aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
+        aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
         let nonce = XNonce::from(nonce_buf);
         let payload = chacha20poly1305::aead::Payload {
@@ -571,7 +654,7 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     // Read-only cache: mmap + rkyv zero-copy. No write during encryption.
     let reader = salt_cache::SaltCacheReader::load(repo.path());
 
-    let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
+    let key_cache: KeyCache = DashMap::new();
 
     // Generate a single batch salt for files that have no cache entry.
     let mut batch_salt = [0u8; SALT_LEN];
@@ -589,16 +672,8 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
                 (entry.salt, Some(entry.file_id))
             });
 
-        // Derive key — cached across threads to avoid redundant Argon2 work.
-        let derived_key = {
-            if let Some(k) = key_cache.get(&salt) {
-                k.clone()
-            } else {
-                let k = derive_key(key.as_bytes(), &salt)?;
-                key_cache.insert(salt, k.clone());
-                k
-            }
-        };
+        // Derive key — thundering-herd safe: only one thread per salt runs Argon2.
+        let derived_key = get_or_derive_key(&key_cache, key.as_bytes(), &salt)?;
 
         let header = encrypt_file(
             f,
@@ -647,7 +722,7 @@ pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     // Pre-operation report
     print_pre_report("Decrypting", &target_files, repo.path());
 
-    let key_cache: DashMap<[u8; SALT_LEN], Zeroizing<[u8; 32]>> = DashMap::new();
+    let key_cache: KeyCache = DashMap::new();
 
     // Write-only: mpsc channel collects salt/file_id from rayon threads.
     let (sender, saver) = salt_cache::create_writer(repo.path());
@@ -701,7 +776,7 @@ pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Cursor, Read, Write};
+    use std::io::{Read, Write};
 
     use tempfile::{NamedTempFile, TempPath};
 
@@ -733,19 +808,22 @@ mod tests {
         let salt = [0xAB; SALT_LEN];
         let header = FileHeader::new(true, salt, None);
 
+        // Write to buffer
         let mut buf = Vec::new();
-        header.write(&mut buf).unwrap();
-
+        header.write_to(&mut buf).unwrap();
         assert_eq!(buf.len(), HEADER_LEN);
 
-        let mut cursor = Cursor::new(buf);
-        let decoded = FileHeader::read(&mut cursor).unwrap();
+        // Roundtrip: bytes → from_bytes (zero-copy)
+        let raw: &[u8; HEADER_LEN] = buf.as_slice().try_into().unwrap();
+        let decoded = FileHeader::from_bytes(raw).unwrap();
 
+        assert_eq!(decoded.magic, *MAGIC);
         assert_eq!(decoded.version, VERSION);
         assert_eq!(decoded.flags, FLAG_COMPRESSED);
         assert_eq!(decoded.enc_algo, ENC_ALGO);
         assert_eq!(decoded.salt, salt);
         assert_eq!(decoded.file_id, header.file_id);
+        assert_eq!(decoded.reserved, [0u8; RESERVED_LEN]);
         assert!(decoded.is_compressed());
     }
 
@@ -919,6 +997,44 @@ mod tests {
     }
 
     #[test]
+    fn test_header_tamper_detected() {
+        let plaintext = b"Test data with header integrity check.";
+        let path = create_temp_file(plaintext);
+
+        let (key, salt) = get_test_key_and_salt();
+        let master_key = b"super_secret_password";
+
+        // Encrypt
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+        // Tamper with the header flags byte (flip the compressed bit at byte 6)
+        let mut encrypted_content = Vec::new();
+        let mut f = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        f.read_to_end(&mut encrypted_content).unwrap();
+
+        encrypted_content[6] ^= FLAG_COMPRESSED;
+
+        f.seek(std::io::SeekFrom::Start(0)).unwrap();
+        f.write_all(&encrypted_content).unwrap();
+        drop(f);
+
+        // Attempt to decrypt — should fail because header tampering changes
+        // the AAD, causing Poly1305 authentication failure.
+        let result = decrypt_file(&path, master_key);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Decryption failed")
+        );
+    }
+
+    #[test]
     fn test_deterministic_encrypt_with_fixed_salt_file_id() {
         let plaintext = b"Deterministic encryption test data.";
 
@@ -1045,7 +1161,7 @@ mod tests {
         assert_eq!(encrypted_perms.mode() & 0o777, 0o755);
 
         // Decrypt
-        let key_cache = DashMap::new();
+        let key_cache: KeyCache = DashMap::new();
         decrypt_file_with_cache(path, &key_cache, None, master_key).unwrap();
 
         // Check permissions after decryption
