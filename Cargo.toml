@@ -22,7 +22,7 @@ colored           = "3"
 config-file2      = "0.4.1"
 const-str         = "1"
 copy-metadata     = "0.3.0"
-dashmap           = "6.1.0"
+dashmap           = "6.2.1"
 fuck-backslash    = "0.1.0"
 ignore            = { version = "0.4.25", features = ["simd-accel"] }
 indicatif         = "0.18"
