@@ -3,7 +3,8 @@ on:
   push:
     tags:
       - "v*"
-
+permissions:
+  contents: write
 jobs:
   release:
     runs-on: ${{ matrix.os }}
@@ -11,7 +12,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: release rust project
         uses: lxl66566/rust-simple-release@main
         with:
@@ -23,4 +24,3 @@ jobs:
             x86_64-unknown-linux-gnu
             aarch64-apple-darwin
             x86_64-apple-darwin
-          token: ${{ secrets.GH_TOKEN }}
