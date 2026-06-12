@@ -4,7 +4,7 @@ use std::{
     process::{Command, Output},
 };
 
-use anyhow::Ok;
+use anyhow::{Context as _, Ok};
 use colored::Colorize;
 use git_simple_encrypt::{Cli, FileHeader, SetField, SubCommand};
 use rand::prelude::*;
@@ -474,6 +474,98 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
         let ciphertext = std::fs::read(temp_dir.join("data.txt"))?;
         assert_eq!(ciphertext, reference, "Ciphertext changed at cycle {cycle}");
     }
+
+    Ok(())
+}
+
+#[test]
+fn test_check_staged() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    std::fs::write(temp_dir.join("encrypted.txt"), "already encrypted")?;
+    std::fs::write(temp_dir.join("unencrypted.txt"), "not yet encrypted")?;
+    std::fs::write(temp_dir.join("plain.txt"), "not in crypt list")?;
+
+    run(
+        SubCommand::Add {
+            paths: ["encrypted.txt", "unencrypted.txt"]
+                .map(PathBuf::from)
+                .to_vec(),
+        },
+        temp_dir,
+    )?;
+
+    // Encrypt only encrypted.txt, leave unencrypted.txt as-is
+    run(
+        SubCommand::Encrypt {
+            paths: vec!["encrypted.txt".into()],
+        },
+        temp_dir,
+    )?;
+    assert!(temp_dir.join("encrypted.txt").is_encrypted());
+    assert!(temp_dir.join("unencrypted.txt").is_not_encrypted());
+
+    // Case 1: stage only the encrypted file → should pass
+    exec("git add encrypted.txt", temp_dir).context("git add encrypted.txt")?;
+    assert!(
+        run(
+            SubCommand::Check {
+                paths: vec![],
+                staged: true
+            },
+            temp_dir
+        )
+        .is_ok(),
+        "encrypted staged file should pass check"
+    );
+
+    // Case 2: also stage the unencrypted file (in crypt list) → should fail
+    exec("git add unencrypted.txt", temp_dir).context("git add unencrypted.txt")?;
+    assert!(
+        run(
+            SubCommand::Check {
+                paths: vec![],
+                staged: true
+            },
+            temp_dir
+        )
+        .is_err(),
+        "unencrypted staged file (in crypt list) should fail check"
+    );
+
+    // Clear index
+    exec("git rm --cached encrypted.txt unencrypted.txt", temp_dir).context("git rm --cached")?;
+
+    // Case 3: stage a file not in crypt list → should pass (nothing to check)
+    exec("git add plain.txt", temp_dir).context("git add plain.txt")?;
+    assert!(
+        run(
+            SubCommand::Check {
+                paths: vec![],
+                staged: true
+            },
+            temp_dir
+        )
+        .is_ok(),
+        "staged file not in crypt list should pass check"
+    );
+
+    // Clear index
+    exec("git rm --cached plain.txt", temp_dir).context("git rm --cached")?;
+
+    // Case 4: nothing staged → should pass
+    assert!(
+        run(
+            SubCommand::Check {
+                paths: vec![],
+                staged: true
+            },
+            temp_dir
+        )
+        .is_ok(),
+        "nothing staged should pass check"
+    );
 
     Ok(())
 }

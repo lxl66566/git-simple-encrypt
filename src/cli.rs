@@ -73,6 +73,9 @@ pub enum SubCommand {
         /// The files or folders to check. If empty, checks all files in the
         /// crypt list.
         paths: Vec<PathBuf>,
+        /// Only check files staged for commit (used by pre-commit hook).
+        #[arg(long, default_value_t = false)]
+        staged: bool,
     },
     /// Install a pre-commit hook to check encryption before committing.
     #[clap(alias("i"))]
