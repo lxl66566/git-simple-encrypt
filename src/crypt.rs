@@ -66,7 +66,6 @@ use chacha20poly1305::{
 };
 use dashmap::DashMap;
 use log::{debug, warn};
-use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 use rand::prelude::*;
 use rayon::prelude::*;
@@ -292,20 +291,17 @@ fn atomic_write_with_metadata(original_path: &Path, temp_file: NamedTempFile) ->
 
 /// Compute a repo-relative cache key from a file path.
 ///
-/// Uses `absolutize_from(repo_path)` to guarantee a correct absolute path
-/// (even if `list_files` returns relative paths), then computes the relative
-/// path via `diff_paths`. The result is raw OS-encoded bytes with `b'\\'`
-/// replaced by `b'/'` for cross-platform consistency.
+/// `list_files` already produces repo-relative paths, so the common case
+/// (relative input) avoids the absolutize+diff round-trip and is reused
+/// directly. Absolute inputs (e.g. user-supplied) are diffed against
+/// `repo_path`. The result is raw OS-encoded bytes with `b'\\'` replaced by
+/// `b'/'` for cross-platform consistency.
 fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
-    let abs_path = if file_path.is_absolute() {
-        file_path.into()
+    let relative = if file_path.is_absolute() {
+        diff_paths(file_path, repo_path).unwrap_or_else(|| file_path.to_path_buf())
     } else {
-        file_path
-            .absolutize_from(repo_path)
-            .unwrap_or_else(|_| file_path.into())
+        file_path.to_path_buf()
     };
-    let relative =
-        diff_paths(abs_path.as_ref(), repo_path).unwrap_or_else(|| abs_path.to_path_buf());
     let mut bytes = relative.into_os_string().into_encoded_bytes();
     for b in &mut bytes {
         if *b == b'\\' {
@@ -410,8 +406,16 @@ pub fn encrypt_file(
         Box::new(file)
     };
 
-    // 4. Chunked Encryption Loop — content-based nonce derivation with File_ID
+    // 4. Chunked Encryption Loop — content-based nonce derivation with File_ID.
+    //    AAD header (64B) is invariant across chunks, so we pre-fill it once
+    //    outside the loop and only patch the 9 trailing bytes per chunk.
     let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
+    let mut out_buf: Vec<u8> = Vec::with_capacity(NONCE_LEN + CHUNK_SIZE + 16);
+    let mut aad = {
+        let mut aad = [0u8; HEADER_LEN + 9];
+        aad[..HEADER_LEN].copy_from_slice(header.as_bytes());
+        aad
+    };
     let mut chunk_idx = 0u64;
 
     loop {
@@ -425,11 +429,7 @@ pub fn encrypt_file(
         }
 
         let is_last_chunk = bytes_read < CHUNK_SIZE;
-        // AAD includes the full 64-byte header + chunk_idx + is_last_chunk.
-        // This ensures any tampering with header fields (e.g. compressed flag)
-        // is detected during decryption via Poly1305 authentication failure.
-        let mut aad = [0u8; HEADER_LEN + 9];
-        aad[..HEADER_LEN].copy_from_slice(header.as_bytes());
+        // Only the trailing 9 bytes of AAD change per chunk.
         aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
@@ -446,9 +446,11 @@ pub fn encrypt_file(
             .encrypt(&nonce, payload)
             .map_err(|e| Error::EncryptFailed(e.to_string()))?;
 
-        // Write: nonce (24B) + ciphertext (includes 16B Poly1305 tag).
-        temp_file.write_all(&nonce_bytes)?;
-        temp_file.write_all(&ciphertext)?;
+        // Single write per chunk: nonce (24B) + ciphertext (incl. 16B Poly1305 tag).
+        out_buf.clear();
+        out_buf.extend_from_slice(&nonce_bytes);
+        out_buf.extend_from_slice(&ciphertext);
+        temp_file.write_all(&out_buf)?;
 
         chunk_idx += 1;
 
@@ -558,7 +560,16 @@ fn decrypt_chunks(
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
     let mut nonce_buf = [0u8; NONCE_LEN];
-    let mut ct_buffer = vec![0u8; CHUNK_SIZE + 16]; // ciphertext + Poly1305 tag
+    // Zeroizing so the (briefly buffered) ciphertext is scrubbed on return.
+    let mut ct_buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE + 16]); // ciphertext + Poly1305 tag
+    let ct_len = ct_buffer.len();
+    // Pre-fill the invariant header portion of AAD; only the last 9 bytes
+    // (chunk_idx + is_last_chunk) change per iteration.
+    let mut aad = {
+        let mut aad = [0u8; HEADER_LEN + 9];
+        aad[..HEADER_LEN].copy_from_slice(header_bytes);
+        aad
+    };
     let mut last_chunk_was_final = false;
     let mut chunk_idx = 0u64;
 
@@ -572,7 +583,7 @@ fn decrypt_chunks(
 
         // Read ciphertext + tag (up to CHUNK_SIZE + 16 bytes).
         let mut bytes_read = 0;
-        while bytes_read < ct_buffer.len() {
+        while bytes_read < ct_len {
             let n = file.read(&mut ct_buffer[bytes_read..])?;
             if n == 0 {
                 break;
@@ -584,12 +595,9 @@ fn decrypt_chunks(
             return Err(Error::TruncatedChunk);
         }
 
-        let is_last_chunk = bytes_read < ct_buffer.len();
+        let is_last_chunk = bytes_read < ct_len;
 
-        // AAD must match what was used during encryption:
-        // full header (64B) + chunk_idx (8B) + is_last_chunk (1B)
-        let mut aad = [0u8; HEADER_LEN + 9];
-        aad[..HEADER_LEN].copy_from_slice(header_bytes);
+        // Patch only the 9 trailing bytes of AAD per chunk.
         aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
