@@ -74,11 +74,10 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 use crate::{
-    Repo,
+    repo::Repo,
     salt_cache::{self, CachedEntry, SaltCacheSender},
     utils::{
-        create_progress_bar, is_file_encrypted, print_post_report, print_pre_report,
-        resolve_target_files,
+        Progress, is_file_encrypted, print_post_report, print_pre_report, resolve_target_files,
     },
 };
 
@@ -660,7 +659,7 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     let mut batch_salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut batch_salt);
 
-    let pb = create_progress_bar(target_files.len(), "Encrypt");
+    let pb = Progress::new(target_files.len(), "Encrypt");
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
@@ -727,7 +726,7 @@ pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
     // Write-only: mpsc channel collects salt/file_id from rayon threads.
     let (sender, saver) = salt_cache::create_writer(repo.path());
 
-    let pb = create_progress_bar(target_files.len(), "Decrypt");
+    let pb = Progress::new(target_files.len(), "Decrypt");
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 

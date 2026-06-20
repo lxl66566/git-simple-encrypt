@@ -2,7 +2,7 @@ use clap::Parser;
 use git_simple_encrypt::{Cli, run};
 use log::LevelFilter;
 
-fn main() -> anyhow::Result<()> {
+fn main() -> Result<(), git_simple_encrypt::Error> {
     log_init();
     run(Cli::parse())
 }

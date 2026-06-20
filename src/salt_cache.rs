@@ -97,6 +97,7 @@ impl SaltCacheReader {
     /// reader (all lookups will return `None`). This never fails — a missing
     /// or corrupt cache simply means we start fresh (new salts will be
     /// generated during encryption).
+    #[must_use]
     pub fn load(repo_path: &Path) -> Self {
         let path = cache_path(repo_path);
 
@@ -143,6 +144,7 @@ impl SaltCacheReader {
     /// computed by the caller.
     ///
     /// Returns `None` if no cache file exists or the key is not cached.
+    #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<CachedEntry> {
         let mmap = self.mmap.as_ref()?;
 
@@ -267,6 +269,7 @@ impl SaltCacheSaver {
 /// The sender is `Sync` and can be shared across rayon threads. The saver
 /// should be kept on the main thread and `.save()`d after parallel work
 /// completes.
+#[must_use]
 pub fn create_writer(repo_path: &Path) -> (SaltCacheSender, SaltCacheSaver) {
     let (tx, rx) = mpsc::channel();
     (

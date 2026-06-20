@@ -53,6 +53,7 @@ impl Config {
         Self::default().with_repo_path(path)
     }
     /// The path must be absolute.
+    #[must_use]
     pub fn with_repo_path(mut self, path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();
         self.repo_path = path.to_path_buf();

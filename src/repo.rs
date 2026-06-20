@@ -12,7 +12,7 @@ use rayon::prelude::*;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
-    utils::{create_progress_bar, is_file_encrypted, prompt_password, resolve_target_files},
+    utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files},
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -138,7 +138,7 @@ impl Repo {
             ":".dimmed()
         );
 
-        let pb = create_progress_bar(target_files.len(), "Check");
+        let pb = Progress::new(target_files.len(), "Check");
         let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
         target_files.par_iter().try_for_each(|f| -> Result<()> {

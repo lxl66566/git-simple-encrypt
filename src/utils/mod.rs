@@ -1,3 +1,7 @@
+mod progress;
+
+pub use progress::Progress;
+
 use std::{
     fs,
     io::{Read, Write},
@@ -6,10 +10,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use assert2::assert;
 use colored::Colorize;
 use ignore::{WalkBuilder, WalkState};
-use indicatif::{ProgressBar, ProgressStyle};
 use tempfile::NamedTempFile;
 
 use crate::crypt::{HEADER_LEN, MAGIC, is_encrypted_version};
@@ -17,6 +19,7 @@ use crate::crypt::{HEADER_LEN, MAGIC, is_encrypted_version};
 /// Format a byte array into a hex string
 #[allow(dead_code)]
 #[cfg(any(test, debug_assertions))]
+#[must_use]
 pub fn format_hex(value: &[u8]) -> String {
     use std::fmt::Write;
     value.iter().fold(String::new(), |mut output, b| {
@@ -153,21 +156,6 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
     }
 }
 
-/// Create a styled progress bar for encryption/decryption/checking.
-pub fn create_progress_bar(len: usize, prefix: &'static str) -> ProgressBar {
-    let pb = ProgressBar::new(len as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "{prefix:.bold} {bar:40.cyan/blue} {pos}/{len} {spinner} [{elapsed_precise}]",
-        )
-        .unwrap()
-        .progress_chars("#>-"),
-    );
-    pb.set_prefix(prefix);
-    pb.enable_steady_tick(std::time::Duration::from_millis(200));
-    pb
-}
-
 /// Check whether a single file has a valid GITSE encrypted header.
 /// Returns an error if the file cannot be read (IO error).
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
@@ -188,6 +176,7 @@ pub fn is_file_encrypted(path: &Path) -> Result<bool> {
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the
 /// crypt list from the config; otherwise, use the given paths.
+#[must_use]
 pub fn resolve_target_files(
     paths: &[PathBuf],
     crypt_list: &[String],
