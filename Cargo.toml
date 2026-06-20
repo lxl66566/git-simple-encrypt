@@ -13,21 +13,23 @@ rust-version = "1.85"
 version      = "3.0.1"
 
 [features]
-default = ["bin", "progress"]
+default = ["bin", "progress", "colored"]
 ## Enable the `git-se` binary: CLI parsing (`clap`) and logger initialization
 ## (`pretty_env_logger`). Disable for a leaner library-only build.
 bin = ["dep:clap", "dep:pretty_env_logger"]
+## Colored terminal output using `colored` crate. Disable for environments
+## that do not support ANSI escape codes (e.g. CI logs, GUI apps).
+colored = ["dep:colored"]
 ## Use `indicatif` progress bars during repo-wide encrypt/decrypt/check. When
 ## disabled, progress is reported via plain `log`/`println!` instead.
 progress = ["dep:indicatif"]
 
 [dependencies]
-anyhow            = "1.0"
 argon2            = "0.5.3"
 blake3            = "1"
 chacha20poly1305  = "0.10.1"
 clap              = { version = "4.6", optional = true, features = ["derive"] }
-colored           = "3"
+colored           = { version = "3", optional = true }
 config-file2      = "0.5"
 const-str         = "1"
 copy-metadata     = "0.3.0"
@@ -51,7 +53,9 @@ zeroize           = "1.9"
 zstd              = "0.13.3"
 
 [dev-dependencies]
+anyhow    = "1.0"
 assert2   = "0.4"
+colored   = "3"
 criterion = "0.8.2"
 tap       = "1"
 tempfile  = "3.26.0"

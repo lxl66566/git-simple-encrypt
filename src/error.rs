@@ -1,10 +1,9 @@
 //! Crate-wide error type.
 //!
 //! Library code returns [`Error`] (typed via `thiserror`) so downstream users
-//! can match on error kinds. Internal helpers may still use `anyhow` for
-//! ergonomic context chaining and convert to [`Error`] at the public API
-//! boundary via the [`Error::Other`] variant (or `?` thanks to the `From`
-//! impl).
+//! can match on error kinds. Internal helpers use other dedicated variants;
+//! [`Error::Other`] serves as a catch-all for opaque error messages from the
+//! binary layer (git config, path absolutization, etc.).
 
 use std::path::PathBuf;
 
@@ -110,9 +109,9 @@ pub enum Error {
     #[error("salt cache serialization error: {0}")]
     SaltCache(String),
 
-    /// Anything else, possibly chained from `anyhow::Error` with context.
-    #[error(transparent)]
-    Other(#[from] anyhow::Error),
+    /// Anything else — an opaque error message.
+    #[error("{0}")]
+    Other(String),
 }
 
 /// Convenience alias used throughout the crate.

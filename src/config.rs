@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use colored::Colorize;
 use config_file2::Storable;
 use fuck_backslash::FuckBackslash;
 use log::{debug, info};
@@ -8,7 +7,10 @@ use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    utils::style::Colorize,
+};
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
@@ -71,7 +73,7 @@ impl Config {
         let path = path
             .as_ref()
             .absolutize_from(&self.repo_path)
-            .map_err(|e| Error::Other(anyhow::anyhow!("path absolutize failed: {e}")))?;
+            .map_err(|e| Error::Other(format!("path absolutize failed: {e}")))?;
         debug!("adding path to crypt list: {}", path.display());
         if !path.exists() {
             return Err(Error::PathNotExist(path.into_owned()));
@@ -89,7 +91,7 @@ impl Config {
         }
         info!(
             "Add to encrypt list: {}",
-            format!("{}", path_relative_to_repo.display()).green()
+            path_relative_to_repo.display().to_string().green()
         );
         self.crypt_list
             .push(path_relative_to_repo.to_string_lossy().into_owned());
@@ -111,17 +113,18 @@ impl Config {
 mod tests {
     use std::{assert, fs};
 
-    use anyhow::Ok;
     use config_file2::LoadConfigFile;
     use tempfile::TempDir;
 
     use super::*;
 
     #[test]
-    fn test_add_one_file_to_crypt_list() -> anyhow::Result<()> {
+    fn test_add_one_file_to_crypt_list() -> crate::Result<()> {
         let temp_dir = TempDir::new()?.keep();
         let file_path = temp_dir.join("test.toml");
-        let mut config = Config::load_or_default(file_path)?.with_repo_path(&*temp_dir);
+        let mut config = Config::load_or_default(file_path)
+            .map_err(|e| Error::Config(e.to_string()))?
+            .with_repo_path(&*temp_dir);
 
         let path_to_add = temp_dir.join("testdir");
         fs::create_dir(&path_to_add)?;

@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, anyhow};
-use colored::Colorize;
 use config_file2::LoadConfigFile;
 use log::{info, warn};
 use parking_lot::Mutex;
@@ -10,7 +8,7 @@ use rayon::prelude::*;
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
-    utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files},
+    utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files, style::Colorize},
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -47,7 +45,7 @@ impl Repo {
         }
         if repo_path
             .file_name()
-            .ok_or_else(|| Error::Other(anyhow!("Filename not found")))?
+            .ok_or_else(|| Error::Other("Filename not found".to_string()))?
             == ".git"
         {
             repo_path.pop();
@@ -82,9 +80,11 @@ impl Repo {
     ///
     /// Returns an error if the key has not been configured.
     pub fn get_key(&self) -> Result<String> {
-        self.get_config("key")
-            .context("Key not found, please run `git-se p` (or `git-se set key <VALUE>`) first")
-            .map_err(Error::from)
+        self.get_config("key").map_err(|e| {
+            Error::Other(format!(
+                "Key not found, please run `git-se p` (or `git-se set key <VALUE>`) first: {e}"
+            ))
+        })
     }
 
     /// Set the key interactively by prompting on stdin.
@@ -162,7 +162,6 @@ impl Repo {
             );
             Ok(())
         } else {
-            // Print the list of unencrypted files
             println!(
                 "\n{} files are {}:",
                 not_encrypted.len().to_string().yellow(),
@@ -249,7 +248,7 @@ impl Repo {
             ));
         }
         String::from_utf8(output.stdout)
-            .map_err(|e| Error::Other(anyhow::anyhow!("git output not UTF-8: {e}")))
+            .map_err(|e| Error::Other(format!("git output not UTF-8: {e}")))
     }
 
     /// Write a value to `<prefix>.<key>` in the repo-local git config.

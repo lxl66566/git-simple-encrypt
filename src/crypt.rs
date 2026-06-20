@@ -58,7 +58,6 @@ use std::{
     },
 };
 
-use anyhow::Context as _;
 use argon2::Argon2;
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -193,9 +192,7 @@ impl FileHeader {
     /// for callers that already have a `Read` impl (e.g. integration tests).
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
         let mut buf = [0u8; HEADER_LEN];
-        reader
-            .read_exact(&mut buf)
-            .context("Failed to read header")?;
+        reader.read_exact(&mut buf)?;
         Ok(*Self::from_bytes(&buf)?)
     }
 
@@ -280,12 +277,9 @@ fn atomic_write_with_metadata(original_path: &Path, temp_file: NamedTempFile) ->
             e
         );
     }
-    temp_file.persist(original_path).with_context(|| {
-        format!(
-            "Failed to persist atomic write to {}",
-            original_path.display()
-        )
-    })?;
+    temp_file
+        .persist(original_path)
+        .map_err(|e| Error::AtomicPersist(original_path.to_path_buf(), e.to_string()))?;
     Ok(())
 }
 
@@ -387,8 +381,7 @@ pub fn encrypt_file(
     let file_id = file_id.unwrap_or_else(FileHeader::generate_file_id);
     let header = FileHeader::new(zstd.is_some(), *salt, file_id);
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp_file = NamedTempFile::new_in(parent_dir)
-        .with_context(|| "Failed to create temp file".to_string())?;
+    let mut temp_file = NamedTempFile::new_in(parent_dir)?;
 
     header.write_to(&mut temp_file)?;
 
@@ -503,8 +496,7 @@ pub fn decrypt_file_with_cache(
     }
 
     debug!("Decrypting: {}", path.display());
-    let header = FileHeader::from_bytes(&header_bytes)
-        .with_context(|| format!("Corrupt header in {}", path.display()))?;
+    let header = *FileHeader::from_bytes(&header_bytes)?;
 
     // Cache the salt+file_id BEFORE decryption so it is preserved even if
     // decryption fails halfway through.
@@ -525,8 +517,7 @@ pub fn decrypt_file_with_cache(
     let (key_enc, _key_mac) = split_keys(&derived_key);
     let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp_file = NamedTempFile::new_in(parent_dir)
-        .with_context(|| "Failed to create temp file".to_string())?;
+    let mut temp_file = NamedTempFile::new_in(parent_dir)?;
 
     // 4. Chunked Decryption Loop
     if header.is_compressed() {
@@ -691,17 +682,14 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
                 }
             };
 
-            let r: Result<_> = {
-                let raw = encrypt_file(
-                    f,
-                    &derived_key,
-                    &salt,
-                    cached_file_id,
-                    repo.conf.use_zstd.then_some(repo.conf.zstd_level),
-                )
-                .with_context(|| format!("Failed to encrypt {}", f.display()));
-                raw.map_err(Error::from)
-            };
+            let r = encrypt_file(
+                f,
+                &derived_key,
+                &salt,
+                cached_file_id,
+                repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+            )
+            .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
 
             match r {
                 Ok(Some(_)) => {}
@@ -784,19 +772,16 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
             let relative_key = cache_key(f, repo.path());
 
-            let r: Result<()> = {
-                let raw = decrypt_file_with_cache(
-                    f,
-                    &key_cache,
-                    Some(CacheRef {
-                        sender: &sender,
-                        key: &relative_key,
-                    }),
-                    key.as_bytes(),
-                )
-                .with_context(|| format!("Failed to decrypt {}", f.display()));
-                raw.map_err(Error::from)
-            };
+            let r = decrypt_file_with_cache(
+                f,
+                &key_cache,
+                Some(CacheRef {
+                    sender: &sender,
+                    key: &relative_key,
+                }),
+                key.as_bytes(),
+            )
+            .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
 
             if let Err(e) = r {
                 failed.fetch_add(1, Ordering::Relaxed);

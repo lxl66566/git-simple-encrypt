@@ -1,4 +1,5 @@
 mod progress;
+pub(crate) mod style;
 
 use std::{
     fs,
@@ -7,8 +8,6 @@ use std::{
     sync::mpsc,
 };
 
-use anyhow::Context as _;
-use colored::Colorize;
 use ignore::{WalkBuilder, WalkState};
 pub use progress::Progress;
 use tempfile::NamedTempFile;
@@ -17,6 +16,7 @@ use zeroize::Zeroizing;
 use crate::{
     crypt::{HEADER_LEN, MAGIC, is_encrypted_version},
     error::{Error, Result},
+    utils::style::Colorize,
 };
 
 /// Format a byte array into a hex string
@@ -35,8 +35,7 @@ pub fn format_hex(value: &[u8]) -> String {
 /// renaming. This prevents partial writes from corrupting the target file.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp_file =
-        NamedTempFile::new_in(parent).context("Failed to create temp file for atomic write")?;
+    let mut temp_file = NamedTempFile::new_in(parent)?;
     temp_file.write_all(data)?;
     temp_file
         .persist(path)
@@ -173,10 +172,7 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
 /// Check whether a single file has a valid GITSE encrypted header.
 /// Returns an error if the file cannot be read (IO error).
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
-    let mut file = fs::File::open(path).context(format!(
-        "Failed to open file for encryption check: {}",
-        path.display()
-    ))?;
+    let mut file = fs::File::open(path)?;
     let mut header_bytes = [0u8; HEADER_LEN];
     let bytes_read = file.read(&mut header_bytes)?;
     if bytes_read < HEADER_LEN {
