@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 
-use assert2::assert;
 use colored::Colorize;
 use config_file2::Storable;
 use fuck_backslash::FuckBackslash;
@@ -8,6 +7,8 @@ use log::{debug, info};
 use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 use serde::{Deserialize, Serialize};
+
+use crate::error::{Error, Result};
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
 
@@ -61,16 +62,20 @@ impl Config {
         self
     }
 
-    /// Add one path to crypt list
+    /// Add one path to crypt list.
     ///
-    /// path could be either relative or absolute.
-    pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) {
+    /// `path` may be either relative or absolute (it will be resolved against
+    /// `repo_path`). Returns an error if the path does not exist or cannot be
+    /// expressed as a repo-relative path.
+    pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) -> Result<()> {
         let path = path
             .as_ref()
             .absolutize_from(&self.repo_path)
-            .expect("path absolutize failed");
+            .map_err(|e| Error::Other(anyhow::anyhow!("path absolutize failed: {e}")))?;
         debug!("adding path to crypt list: {}", path.display());
-        assert!(path.exists(), "file or dir not exist: {:?}", path);
+        if !path.exists() {
+            return Err(Error::PathNotExist(path.into_owned()));
+        }
         let path_relative_to_repo = diff_paths(path.as_ref(), &self.repo_path)
             .unwrap_or_else(|| path.to_path_buf())
             .fuck_backslash();
@@ -79,27 +84,26 @@ impl Config {
             path.display(),
             self.repo_path.display()
         );
-        assert!(
-            !path_relative_to_repo.is_absolute(),
-            "get absolute path `{}`, please use relative path instead",
-            path_relative_to_repo.display()
-        );
+        if path_relative_to_repo.is_absolute() {
+            return Err(Error::PathNotRelative(path_relative_to_repo));
+        }
         info!(
             "Add to encrypt list: {}",
             format!("{}", path_relative_to_repo.display()).green()
         );
         self.crypt_list
             .push(path_relative_to_repo.to_string_lossy().into_owned());
+        Ok(())
     }
 
     /// Add the given paths to the encrypt list. This function will be called
     /// seldomly, so it's not a performance issue.
-    pub fn add_paths_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> anyhow::Result<()> {
+    pub fn add_paths_to_crypt_list(&mut self, paths: &[impl AsRef<Path>]) -> Result<()> {
         for x in paths {
-            self.add_one_path_to_crypt_list(x.as_ref());
+            self.add_one_path_to_crypt_list(x.as_ref())?;
         }
         debug!("store config to {}", self.config_path.display());
-        self.store().map_err(|e| anyhow::anyhow!(e))
+        self.store().map_err(|e| Error::Config(e.to_string()))
     }
 }
 
@@ -121,7 +125,7 @@ mod tests {
 
         let path_to_add = temp_dir.join("testdir");
         fs::create_dir(&path_to_add)?;
-        config.add_one_path_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref());
+        config.add_one_path_to_crypt_list(path_to_add.as_os_str().to_string_lossy().as_ref())?;
         println!("{:?}", config.crypt_list.first().unwrap());
         assert!(
             config

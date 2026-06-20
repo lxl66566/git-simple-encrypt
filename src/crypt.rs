@@ -58,7 +58,7 @@ use std::{
     },
 };
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::Context as _;
 use argon2::Argon2;
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
@@ -74,6 +74,7 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 use crate::{
+    error::{Error, Result},
     repo::Repo,
     salt_cache::{self, CachedEntry, SaltCacheSender},
     utils::{
@@ -170,16 +171,13 @@ impl FileHeader {
         let header: &Self = unsafe { &*(bytes.as_ptr().cast()) };
 
         if &header.magic != MAGIC {
-            return Err(anyhow!("Invalid magic bytes"));
+            return Err(Error::InvalidMagic);
         }
         if !is_encrypted_version(header.version) {
-            return Err(anyhow!("Unsupported version: {}", header.version));
+            return Err(Error::UnsupportedVersion(header.version));
         }
         if header.enc_algo != ENC_ALGO {
-            return Err(anyhow!(
-                "Unsupported encryption algorithm: {}",
-                header.enc_algo
-            ));
+            return Err(Error::UnsupportedAlgo(header.enc_algo));
         }
 
         Ok(header)
@@ -229,7 +227,7 @@ fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     let mut key = Zeroizing::new([0u8; 32]);
     Argon2::default()
         .hash_password_into(password, salt, &mut *key)
-        .map_err(|e| anyhow!("Argon2 key derivation failed: {e}"))?;
+        .map_err(|e| Error::Argon2(e.to_string()))?;
     Ok(key)
 }
 
@@ -352,7 +350,7 @@ fn get_or_derive_key(
     // all others block until the result is available.
     match lock.get_or_init(|| derive_key(master_key, salt).map_err(|e| e.to_string())) {
         Ok(key) => Ok(key.clone()),
-        Err(msg) => Err(anyhow!("{msg}")),
+        Err(msg) => Err(Error::Argon2(msg.to_string())),
     }
 }
 
@@ -446,7 +444,7 @@ pub fn encrypt_file(
 
         let ciphertext = cipher
             .encrypt(&nonce, payload)
-            .map_err(|e| anyhow!("Encryption failed: {e}"))?;
+            .map_err(|e| Error::EncryptFailed(e.to_string()))?;
 
         // Write: nonce (24B) + ciphertext (includes 16B Poly1305 tag).
         temp_file.write_all(&nonce_bytes)?;
@@ -583,9 +581,7 @@ fn decrypt_chunks(
         }
 
         if bytes_read == 0 {
-            return Err(anyhow!(
-                "Truncated chunk: nonce present but no ciphertext follows"
-            ));
+            return Err(Error::TruncatedChunk);
         }
 
         let is_last_chunk = bytes_read < ct_buffer.len();
@@ -604,7 +600,7 @@ fn decrypt_chunks(
         };
 
         let plaintext = Zeroizing::new(cipher.decrypt(&nonce, payload).map_err(|e| {
-            anyhow!("Decryption failed (wrong password, corrupt, or tampered data): {e}")
+            Error::DecryptFailed(e.to_string())
         })?);
 
         writer.write_all(&plaintext)?;
@@ -618,9 +614,7 @@ fn decrypt_chunks(
     }
 
     if !last_chunk_was_final {
-        return Err(anyhow!(
-            "File truncation detected! The ciphertext is incomplete."
-        ));
+        return Err(Error::FileTruncated);
     }
 
     Ok(())
@@ -641,11 +635,15 @@ fn decrypt_chunks(
 /// The cache is **read-only** during encryption; only the decrypt path
 /// writes to the cache.
 pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
-    let key = repo.get_key();
-    ensure!(!key.is_empty(), "Key must not be empty");
+    let key = repo.get_key()?;
+    if key.is_empty() {
+        return Err(Error::EmptyKey);
+    }
 
     let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
-    ensure!(!target_files.is_empty(), "No file to encrypt");
+    if target_files.is_empty() {
+        return Err(Error::NoFile("encrypt"));
+    }
 
     // Pre-operation report
     print_pre_report("Encrypting", &target_files, repo.path());
@@ -712,11 +710,15 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 /// via an mpsc channel so that a subsequent encrypt can reproduce identical
 /// ciphertext.
 pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
-    let key = repo.get_key();
-    ensure!(!key.is_empty(), "Master key must not be empty");
+    let key = repo.get_key()?;
+    if key.is_empty() {
+        return Err(Error::EmptyKey);
+    }
 
     let target_files = resolve_target_files(paths, &repo.conf.crypt_list, repo.path());
-    ensure!(!target_files.is_empty(), "No file to decrypt");
+    if target_files.is_empty() {
+        return Err(Error::NoFile("decrypt"));
+    }
 
     // Pre-operation report
     print_pre_report("Decrypting", &target_files, repo.path());
@@ -739,13 +741,16 @@ pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 
         let relative_key = cache_key(f, repo.path());
 
-        let decrypt_result = decrypt_file_with_cache(
-            f,
-            &key_cache,
-            Some((&sender, &relative_key)),
-            key.as_bytes(),
-        )
-        .with_context(|| format!("Failed to decrypt {}", f.display()));
+        let decrypt_result: crate::error::Result<()> = {
+            let r = decrypt_file_with_cache(
+                f,
+                &key_cache,
+                Some((&sender, &relative_key)),
+                key.as_bytes(),
+            )
+            .with_context(|| format!("Failed to decrypt {}", f.display()));
+            r.map_err(Error::from)
+        };
 
         if decrypt_result.is_err() {
             failed.fetch_add(1, Ordering::Relaxed);
@@ -991,7 +996,8 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Decryption failed")
+                .to_lowercase()
+                .contains("decryption failed")
         );
     }
 
@@ -1029,7 +1035,8 @@ mod tests {
             result
                 .unwrap_err()
                 .to_string()
-                .contains("Decryption failed")
+                .to_lowercase()
+                .contains("decryption failed")
         );
     }
 

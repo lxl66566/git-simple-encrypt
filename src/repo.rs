@@ -3,8 +3,7 @@ use std::{
     sync::{Mutex, OnceLock},
 };
 
-use anyhow::{Result, anyhow, ensure};
-use assert2::assert;
+use anyhow::{Context as _, anyhow};
 use colored::Colorize;
 use config_file2::LoadConfigFile;
 use log::{info, warn};
@@ -12,6 +11,7 @@ use rayon::prelude::*;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
+    error::{Error, Result},
     utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files},
 };
 
@@ -38,23 +38,19 @@ pub struct Repo {
 }
 
 impl Repo {
-    /// open a repo. The [`path`] param must be absolute path.
+    /// Open a repo. The `path` argument must be an absolute path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         debug_assert!(path.as_ref().is_absolute(), "given path must be absolute");
         let mut repo_path = path.as_ref().to_path_buf();
-        assert!(
-            repo_path.exists(),
-            "Repo not found: {}",
-            repo_path.display()
-        );
-        assert!(
-            repo_path.is_dir(),
-            "Not a directory: {}",
-            repo_path.display()
-        );
+        if !repo_path.exists() {
+            return Err(Error::RepoNotFound(repo_path));
+        }
+        if !repo_path.is_dir() {
+            return Err(Error::NotADirectory(repo_path));
+        }
         if repo_path
             .file_name()
-            .ok_or_else(|| anyhow!("Filename not found"))?
+            .ok_or_else(|| Error::Other(anyhow!("Filename not found")))?
             == ".git"
         {
             repo_path.pop();
@@ -67,7 +63,9 @@ impl Repo {
                 config_file_path.display()
             );
         }
-        let conf = Config::load_or_default(&config_file_path)?.with_repo_path(&repo_path);
+        let conf = Config::load_or_default(&config_file_path)
+            .map_err(|e| Error::Config(e.to_string()))?
+            .with_repo_path(&repo_path);
         Ok(Self {
             path: repo_path,
             conf,
@@ -83,12 +81,16 @@ impl Repo {
         self.path.join(path.as_ref())
     }
 
-    pub fn get_key(&self) -> String {
+    /// Read the master key from git config.
+    ///
+    /// Returns an error if the key has not been configured.
+    pub fn get_key(&self) -> Result<String> {
         self.get_config("key")
-            .expect("Key not found, please exec `git-se p` first.")
+            .context("Key not found, please run `git-se p` (or `git-se set key <VALUE>`) first")
+            .map_err(Error::from)
     }
 
-    /// set the key interactively
+    /// Set the key interactively by prompting on stdin.
     pub fn set_key_interactive(&self) -> Result<()> {
         let key = prompt_password("Please input your key: ")?;
         self.set_config("key", &key)?;
@@ -129,7 +131,9 @@ impl Repo {
             println!("No staged files need encryption check.");
             return Ok(());
         }
-        ensure!(!target_files.is_empty(), "No file to check");
+        if target_files.is_empty() {
+            return Err(Error::NoFile("check"));
+        }
 
         println!(
             "\n{} {} {}",
@@ -183,11 +187,7 @@ impl Repo {
                 total,
             );
 
-            Err(anyhow!(
-                "{} out of {} files are not encrypted",
-                not_encrypted.len(),
-                total
-            ))
+            Err(Error::FilesNotEncrypted(not_encrypted.len(), total))
         }
     }
 
@@ -203,11 +203,7 @@ impl Repo {
 
         // Check if hook already exists
         if hook_path.exists() {
-            return Err(anyhow!(
-                "A pre-commit hook already exists at {}. \
-                     Please remove it manually before installing.",
-                hook_path.display()
-            ));
+            return Err(Error::HookExists(hook_path));
         }
 
         std::fs::write(&hook_path, PRE_COMMIT_HOOK)?;
@@ -244,9 +240,8 @@ impl GitCommand for Repo {
             .args(args)
             .output()?;
         if !output.status.success() {
-            return Err(anyhow!(
-                "Git command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+            return Err(Error::Git(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
         Ok(())
@@ -261,12 +256,12 @@ impl GitCommand for Repo {
 
         let output = cmd.current_dir(&self.path).args(args).output()?;
         if !output.status.success() {
-            return Err(anyhow!(
-                "Git command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
+            return Err(Error::Git(
+                String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        Ok(String::from_utf8(output.stdout)?)
+        Ok(String::from_utf8(output.stdout)
+            .map_err(|e| Error::Other(anyhow::anyhow!("git output not UTF-8: {e}")))?)
     }
     fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;

@@ -98,6 +98,10 @@ pub enum Error {
     #[error("{0} out of {1} files are not encrypted")]
     FilesNotEncrypted(usize, usize),
 
+    /// Config file parse/serialize error.
+    #[error("config error: {0}")]
+    Config(String),
+
     /// Generic I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),

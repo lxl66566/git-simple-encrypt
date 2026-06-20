@@ -9,12 +9,13 @@ use std::{
     sync::mpsc,
 };
 
-use anyhow::{Context, Result};
+use anyhow::Context as _;
 use colored::Colorize;
 use ignore::{WalkBuilder, WalkState};
 use tempfile::NamedTempFile;
 
 use crate::crypt::{HEADER_LEN, MAGIC, is_encrypted_version};
+use crate::error::{Error, Result};
 
 /// Format a byte array into a hex string
 #[allow(dead_code)]
@@ -33,22 +34,27 @@ pub fn format_hex(value: &[u8]) -> String {
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent)
-        .with_context(|| "Failed to create temp file for atomic write")?;
+        .context("Failed to create temp file for atomic write")?;
     temp_file.write_all(data)?;
-    temp_file
-        .persist(path)
-        .with_context(|| format!("Failed to persist atomic write to {}", path.display()))?;
+    temp_file.persist(path).map_err(|e| {
+        Error::AtomicPersist(path.to_path_buf(), e.to_string())
+    })?;
     Ok(())
 }
 
-/// Prompt the user for a password
+/// Prompt the user for a password.
+///
+/// Returns an empty-password error if the user enters only whitespace.
 pub fn prompt_password(prompt: &str) -> Result<String> {
     print!("{prompt}");
     std::io::stdout().flush()?;
     let mut password = String::new();
     std::io::stdin().read_line(&mut password)?;
-    assert!(!password.is_empty(), "Password must not be empty");
-    Ok(password.trim().to_string())
+    let trimmed = password.trim();
+    if trimmed.is_empty() {
+        return Err(Error::EmptyPassword);
+    }
+    Ok(trimmed.to_string())
 }
 
 /// If the given path is a file, return the file name. Otherwise, return the
@@ -159,12 +165,10 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
 /// Check whether a single file has a valid GITSE encrypted header.
 /// Returns an error if the file cannot be read (IO error).
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
-    let mut file = fs::File::open(path).with_context(|| {
-        format!(
-            "Failed to open file for encryption check: {}",
-            path.display()
-        )
-    })?;
+    let mut file = fs::File::open(path).context(format!(
+        "Failed to open file for encryption check: {}",
+        path.display()
+    ))?;
     let mut header_bytes = [0u8; HEADER_LEN];
     let bytes_read = file.read(&mut header_bytes)?;
     if bytes_read < HEADER_LEN {
