@@ -93,8 +93,8 @@ impl Repo {
     /// Set the key interactively by prompting on stdin.
     pub fn set_key_interactive(&self) -> Result<()> {
         let key = prompt_password("Please input your key: ")?;
-        self.set_config("key", &key)?;
-        info!("Set key: `{key}`");
+        self.set_config("key", key.as_str())?;
+        info!("Master key updated.");
         Ok(())
     }
 

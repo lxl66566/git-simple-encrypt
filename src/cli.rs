@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand};
 use config_file2::Storable;
 use log::{debug, info, warn};
 
+use crate::error::{Error, Result};
 use crate::repo::{GitCommand, Repo};
 
 #[derive(Parser, Clone, Debug)]
@@ -99,18 +100,18 @@ pub enum SetField {
 }
 
 impl SetField {
-    /// Set a field.
+    /// Apply the field update to the given repo's config.
     ///
     /// # Errors
     ///
-    /// Returns an error if fail to exec git command or fail to write to config
-    /// file.
-    pub fn set(&self, repo: &mut Repo) -> anyhow::Result<()> {
+    /// Returns an error if the underlying git command or the config file write
+    /// fails.
+    pub fn set(&self, repo: &mut Repo) -> Result<()> {
         match self {
             Self::Key { value } => {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
                 repo.set_config("key", value)?;
-                info!("key set to `{value}`");
+                info!("Master key updated.");
             }
             Self::EnableZstd { value } => {
                 repo.conf.use_zstd = *value;
@@ -122,8 +123,9 @@ impl SetField {
             }
         }
         debug!("store config to {}", repo.conf.config_path.display());
-        repo.conf.store()?;
-
+        repo.conf
+            .store()
+            .map_err(|e| Error::Config(e.to_string()))?;
         Ok(())
     }
 }

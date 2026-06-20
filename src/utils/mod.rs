@@ -13,6 +13,7 @@ use anyhow::Context as _;
 use colored::Colorize;
 use ignore::{WalkBuilder, WalkState};
 use tempfile::NamedTempFile;
+use zeroize::Zeroizing;
 
 use crate::crypt::{HEADER_LEN, MAGIC, is_encrypted_version};
 use crate::error::{Error, Result};
@@ -44,8 +45,10 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 
 /// Prompt the user for a password.
 ///
-/// Returns an empty-password error if the user enters only whitespace.
-pub fn prompt_password(prompt: &str) -> Result<String> {
+/// Returns an empty-password error if the user enters only whitespace. The
+/// returned string is wrapped in [`Zeroizing`] so the plaintext is scrubbed
+/// from memory on drop.
+pub fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
     print!("{prompt}");
     std::io::stdout().flush()?;
     let mut password = String::new();
@@ -54,7 +57,10 @@ pub fn prompt_password(prompt: &str) -> Result<String> {
     if trimmed.is_empty() {
         return Err(Error::EmptyPassword);
     }
-    Ok(trimmed.to_string())
+    // Scrub the raw input buffer too.
+    let result = Zeroizing::new(trimmed.to_string());
+    zeroize::Zeroize::zeroize(&mut password);
+    Ok(result)
 }
 
 /// If the given path is a file, return the file name. Otherwise, return the

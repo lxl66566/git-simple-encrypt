@@ -136,15 +136,11 @@ const _: () = assert!(std::mem::size_of::<FileHeader>() == HEADER_LEN);
 const _: () = assert!(std::mem::align_of::<FileHeader>() == 1);
 
 impl FileHeader {
+    /// Construct a header with explicit `file_id`. Callers are responsible for
+    /// generating (or looking up the cached) `file_id` so that re-encryption is
+    /// deterministic.
     #[must_use]
-    pub fn new(compressed: bool, salt: [u8; SALT_LEN], file_id: Option<[u8; FILE_ID_LEN]>) -> Self {
-        let file_id = file_id.unwrap_or_else(|| {
-            let mut rng = rand::rng();
-            let mut id = [0u8; FILE_ID_LEN];
-            rng.fill_bytes(&mut id);
-            id
-        });
-
+    pub fn new(compressed: bool, salt: [u8; SALT_LEN], file_id: [u8; FILE_ID_LEN]) -> Self {
         let mut flags = 0u8;
         if compressed {
             flags |= FLAG_COMPRESSED;
@@ -159,6 +155,15 @@ impl FileHeader {
             file_id,
             reserved: [0u8; RESERVED_LEN],
         }
+    }
+
+    /// Generate a fresh random `file_id` using the system RNG.
+    #[must_use]
+    pub fn generate_file_id() -> [u8; FILE_ID_LEN] {
+        let mut rng = rand::rng();
+        let mut id = [0u8; FILE_ID_LEN];
+        rng.fill_bytes(&mut id);
+        id
     }
 
     /// Zero-copy: validate and cast `&[u8; 64]` → `&FileHeader`.
@@ -383,13 +388,8 @@ pub fn encrypt_file(
     debug!("Encrypting: {}", path.display());
 
     // 2. Generate File_ID (random if not cached) and prepare Header & Temp File
-    let file_id = file_id.unwrap_or_else(|| {
-        let mut rng = rand::rng();
-        let mut id = [0u8; FILE_ID_LEN];
-        rng.fill_bytes(&mut id);
-        id
-    });
-    let header = FileHeader::new(zstd.is_some(), *salt, Some(file_id));
+    let file_id = file_id.unwrap_or_else(FileHeader::generate_file_id);
+    let header = FileHeader::new(zstd.is_some(), *salt, file_id);
     let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent_dir)
         .with_context(|| "Failed to create temp file".to_string())?;
@@ -634,7 +634,7 @@ fn decrypt_chunks(
 ///
 /// The cache is **read-only** during encryption; only the decrypt path
 /// writes to the cache.
-pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
+pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key()?;
     if key.is_empty() {
         return Err(Error::EmptyKey);
@@ -709,7 +709,7 @@ pub fn encrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
 /// The `salt+file_id` of each successfully parsed encrypted file is captured
 /// via an mpsc channel so that a subsequent encrypt can reproduce identical
 /// ciphertext.
-pub fn decrypt_repo(repo: &'static Repo, paths: &[PathBuf]) -> Result<()> {
+pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key()?;
     if key.is_empty() {
         return Err(Error::EmptyKey);
@@ -810,7 +810,8 @@ mod tests {
     #[test]
     fn test_header_serialization() {
         let salt = [0xAB; SALT_LEN];
-        let header = FileHeader::new(true, salt, None);
+        let file_id = FileHeader::generate_file_id();
+        let header = FileHeader::new(true, salt, file_id);
 
         // Write to buffer
         let mut buf = Vec::new();

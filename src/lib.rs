@@ -33,13 +33,12 @@ pub fn run(cli: Cli) -> Result<()> {
     if !cli.repo.is_absolute() {
         return Err(Error::RepoPathNotAbsolute(cli.repo.clone()));
     }
-    let repo = Repo::open(&cli.repo)?;
-    let repo = Box::leak(Box::new(repo));
+    let mut repo = Repo::open(&cli.repo)?;
     match cli.command {
-        SubCommand::Encrypt { paths } => encrypt_repo(repo, &paths)?,
-        SubCommand::Decrypt { paths } => decrypt_repo(repo, &paths)?,
+        SubCommand::Encrypt { paths } => encrypt_repo(&repo, &paths)?,
+        SubCommand::Decrypt { paths } => decrypt_repo(&repo, &paths)?,
         SubCommand::Add { paths } => repo.conf.add_paths_to_crypt_list(&paths)?,
-        SubCommand::Set { field } => field.set(repo)?,
+        SubCommand::Set { field } => field.set(&mut repo)?,
         SubCommand::Pwd => repo.set_key_interactive()?,
         SubCommand::Check { paths, staged } => repo.check(&paths, staged)?,
         SubCommand::Install => repo.install_hook()?,
