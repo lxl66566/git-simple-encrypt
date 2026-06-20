@@ -139,7 +139,7 @@ impl FileHeader {
     /// generating (or looking up the cached) `file_id` so that re-encryption is
     /// deterministic.
     #[must_use]
-    pub fn new(compressed: bool, salt: [u8; SALT_LEN], file_id: [u8; FILE_ID_LEN]) -> Self {
+    pub const fn new(compressed: bool, salt: [u8; SALT_LEN], file_id: [u8; FILE_ID_LEN]) -> Self {
         let mut flags = 0u8;
         if compressed {
             flags |= FLAG_COMPRESSED;
@@ -351,7 +351,7 @@ fn get_or_derive_key(
     // all others block until the result is available.
     match lock.get_or_init(|| derive_key(master_key, salt).map_err(|e| e.to_string())) {
         Ok(key) => Ok(key.clone()),
-        Err(msg) => Err(Error::Argon2(msg.to_string())),
+        Err(msg) => Err(Error::Argon2(msg.clone())),
     }
 }
 
@@ -406,9 +406,9 @@ pub fn encrypt_file(
         Box::new(file)
     };
 
-    // 4. Chunked Encryption Loop — content-based nonce derivation with File_ID.
-    //    AAD header (64B) is invariant across chunks, so we pre-fill it once
-    //    outside the loop and only patch the 9 trailing bytes per chunk.
+    // 4. Chunked Encryption Loop — content-based nonce derivation with File_ID. AAD
+    //    header (64B) is invariant across chunks, so we pre-fill it once outside
+    //    the loop and only patch the 9 trailing bytes per chunk.
     let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
     let mut out_buf: Vec<u8> = Vec::with_capacity(NONCE_LEN + CHUNK_SIZE + 16);
     let mut aad = {
@@ -606,9 +606,11 @@ fn decrypt_chunks(
             aad: &aad,
         };
 
-        let plaintext = Zeroizing::new(cipher.decrypt(&nonce, payload).map_err(|e| {
-            Error::DecryptFailed(e.to_string())
-        })?);
+        let plaintext = Zeroizing::new(
+            cipher
+                .decrypt(&nonce, payload)
+                .map_err(|e| Error::DecryptFailed(e.to_string()))?,
+        );
 
         writer.write_all(&plaintext)?;
 
@@ -1222,5 +1224,72 @@ mod tests {
         // Check permissions after decryption
         let decrypted_perms = fs::metadata(path).unwrap().permissions();
         assert_eq!(decrypted_perms.mode() & 0o777, 0o755);
+    }
+
+    #[test]
+    fn test_empty_file_roundtrip() {
+        // Edge case: 0-byte plaintext. The encrypt loop should produce a
+        // single last (empty) chunk; decrypt should yield back 0 bytes.
+        let plaintext = b"";
+        let path = create_temp_file(plaintext);
+
+        let (key, salt) = get_test_key_and_salt();
+        let master_key = b"super_secret_password";
+
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+        // Header + one chunk (24B nonce + 16B tag of empty plaintext).
+        let enc = fs::read(&path).unwrap();
+        assert_eq!(enc.len(), HEADER_LEN + NONCE_LEN + 16);
+
+        decrypt_file(&path, master_key).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), plaintext);
+    }
+
+    #[test]
+    fn test_wrong_password_decrypt_fails() {
+        let plaintext = b"data encrypted under one password";
+        let path = create_temp_file(plaintext);
+
+        let (key, salt) = get_test_key_and_salt();
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+        // Decrypt with a different password: AEAD authentication must fail.
+        let result = decrypt_file(&path, b"a_completely_different_password");
+        assert!(matches!(result, Err(Error::DecryptFailed(_))));
+
+        // And the original file must be untouched (atomic writeback did not run).
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(&bytes[..MAGIC.len()], MAGIC);
+    }
+
+    #[test]
+    fn test_truncated_ciphertext_after_nonce() {
+        // Header + 24-byte nonce + 0 bytes of ciphertext -> TruncatedChunk.
+        let plaintext = b"abc";
+        let path = create_temp_file(plaintext);
+        let (key, salt) = get_test_key_and_salt();
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+        // Truncate the file to keep only header + nonce (drop ct + tag).
+        let trunc_len = HEADER_LEN + NONCE_LEN;
+        let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(trunc_len as u64).unwrap();
+        drop(f);
+
+        let result = decrypt_file(&path, b"super_secret_password");
+        assert!(matches!(result, Err(Error::TruncatedChunk)));
+    }
+
+    #[test]
+    fn test_truncated_before_first_nonce() {
+        // File smaller than HEADER_LEN: decrypt_file_with_cache should treat
+        // it as "not encrypted" and return Ok without touching it.
+        let path = create_temp_file(b"tiny");
+        let key_cache: KeyCache = DashMap::new();
+        let res = decrypt_file_with_cache(&path, &key_cache, None, b"any");
+        assert!(res.is_ok());
+        // Plaintext unchanged.
+        assert_eq!(fs::read(&path).unwrap(), b"tiny");
     }
 }

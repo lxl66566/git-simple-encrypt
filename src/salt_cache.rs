@@ -74,9 +74,10 @@ pub struct CachedEntry {
 }
 
 /// Borrowed reference to a salt-cache writer + the repo-relative key for a
-/// single file. Passed into [`crate::crypt::decrypt_file_with_cache`] so that
-/// the decrypt path can record `(salt, file_id)` for deterministic
-/// re-encryption.
+/// single file.
+///
+/// Passed into [`crate::crypt::decrypt_file_with_cache`] so that the decrypt
+/// path can record `(salt, file_id)` for deterministic re-encryption.
 #[derive(Clone, Copy)]
 pub struct CacheRef<'a> {
     /// The thread-safe sender that forwards entries to the persister thread.

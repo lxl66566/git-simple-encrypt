@@ -14,16 +14,15 @@ pub mod utils;
 mod cli;
 
 #[cfg(feature = "bin")]
+pub use crate::cli::{Cli, SetField, SubCommand};
+#[cfg(feature = "bin")]
 use crate::crypt::{decrypt_repo, encrypt_repo};
 #[cfg(feature = "bin")]
 use crate::repo::Repo;
-
-pub use crate::error::{Error, Result};
-
-pub use crate::crypt::FileHeader;
-
-#[cfg(feature = "bin")]
-pub use crate::cli::{Cli, SetField, SubCommand};
+pub use crate::{
+    crypt::FileHeader,
+    error::{Error, Result},
+};
 
 /// Dispatch a parsed CLI invocation.
 ///

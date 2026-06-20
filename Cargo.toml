@@ -1,16 +1,16 @@
 [package]
-authors     = ["lxl66566 <lxl66566@gmail.com>"]
-categories  = ["cryptography"]
-description = "Encrypt/decrypt files in your git repo using only one password"
-edition     = "2024"
+authors      = ["lxl66566 <lxl66566@gmail.com>"]
+categories   = ["cryptography"]
+description  = "Encrypt/decrypt files in your git repo using only one password"
+edition      = "2024"
+homepage     = "https://github.com/lxl66566/git-simple-encrypt"
+keywords     = ["git", "encryption"]
+license      = "MIT"
+name         = "git-simple-encrypt"
+readme       = "./README.md"
+repository   = "https://github.com/lxl66566/git-simple-encrypt"
 rust-version = "1.85"
-homepage    = "https://github.com/lxl66566/git-simple-encrypt"
-keywords    = ["git", "encryption"]
-license     = "MIT"
-name        = "git-simple-encrypt"
-readme      = "./README.md"
-repository  = "https://github.com/lxl66566/git-simple-encrypt"
-version     = "3.0.0"
+version      = "3.0.1"
 
 [features]
 default = ["bin", "progress"]
@@ -28,7 +28,7 @@ blake3            = "1"
 chacha20poly1305  = "0.10.1"
 clap              = { version = "4.6", optional = true, features = ["derive"] }
 colored           = "3"
-config-file2      = "0.4.1"
+config-file2      = "0.5"
 const-str         = "1"
 copy-metadata     = "0.3.0"
 dashmap           = "6.1.0"
@@ -47,7 +47,7 @@ rkyv              = "0.8"
 serde             = { version = "1", features = ["derive"] }
 tempfile          = "3.26.0"
 thiserror         = "2.0.18"
-zeroize           = "1.8.2"
+zeroize           = "1.9"
 zstd              = "0.13.3"
 
 [dev-dependencies]
@@ -56,16 +56,9 @@ criterion = "0.8.2"
 tap       = "1"
 tempfile  = "3.26.0"
 
-[lints.rust]
-unsafe_code = "warn"
-
-[lints.clippy]
-all      = "warn"
-pedantic = "warn"
-
 [[bin]]
-name = "git-se"
-path = "src/main.rs"
+name              = "git-se"
+path              = "src/main.rs"
 required-features = ["bin"]
 
 [lib]

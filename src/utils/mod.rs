@@ -1,7 +1,5 @@
 mod progress;
 
-pub use progress::Progress;
-
 use std::{
     fs,
     io::{Read, Write},
@@ -12,11 +10,14 @@ use std::{
 use anyhow::Context as _;
 use colored::Colorize;
 use ignore::{WalkBuilder, WalkState};
+pub use progress::Progress;
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
-use crate::crypt::{HEADER_LEN, MAGIC, is_encrypted_version};
-use crate::error::{Error, Result};
+use crate::{
+    crypt::{HEADER_LEN, MAGIC, is_encrypted_version},
+    error::{Error, Result},
+};
 
 /// Format a byte array into a hex string
 #[allow(dead_code)]
@@ -34,12 +35,12 @@ pub fn format_hex(value: &[u8]) -> String {
 /// renaming. This prevents partial writes from corrupting the target file.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp_file = NamedTempFile::new_in(parent)
-        .context("Failed to create temp file for atomic write")?;
+    let mut temp_file =
+        NamedTempFile::new_in(parent).context("Failed to create temp file for atomic write")?;
     temp_file.write_all(data)?;
-    temp_file.persist(path).map_err(|e| {
-        Error::AtomicPersist(path.to_path_buf(), e.to_string())
-    })?;
+    temp_file
+        .persist(path)
+        .map_err(|e| Error::AtomicPersist(path.to_path_buf(), e.to_string()))?;
     Ok(())
 }
 
@@ -133,8 +134,8 @@ pub fn print_pre_report(action: &str, files: &[impl AsRef<Path>], repo_path: &Pa
     );
 
     for f in &files[..count.min(REPORT_LIST_LIMIT)] {
-        let relative = pathdiff::diff_paths(f.as_ref(), repo_path)
-            .unwrap_or_else(|| f.as_ref().to_path_buf());
+        let relative =
+            pathdiff::diff_paths(f.as_ref(), repo_path).unwrap_or_else(|| f.as_ref().to_path_buf());
         println!("  {}", relative.display());
     }
 

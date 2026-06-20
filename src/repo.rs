@@ -69,6 +69,7 @@ impl Repo {
         })
     }
 
+    #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -107,18 +108,14 @@ impl Repo {
         let target_files = if staged {
             let staged_output =
                 self.run_with_output(&["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?;
-            let staged_files: Vec<PathBuf> = staged_output
+            let crypt_files = resolve_target_files(&[], &self.conf.crypt_list, self.path());
+
+            staged_output
                 .lines()
                 .map(|line| self.path.join(line.trim()))
                 .filter(|p| p.exists())
-                .collect();
-
-            let crypt_files = resolve_target_files(&[], &self.conf.crypt_list, self.path());
-
-            staged_files
-                .into_iter()
                 .filter(|f| crypt_files.contains(f))
-                .collect::<Vec<_>>()
+                .collect()
         } else {
             resolve_target_files(paths, &self.conf.crypt_list, self.path())
         };
@@ -251,8 +248,8 @@ impl Repo {
                 String::from_utf8_lossy(&output.stderr).into_owned(),
             ));
         }
-        Ok(String::from_utf8(output.stdout)
-            .map_err(|e| Error::Other(anyhow::anyhow!("git output not UTF-8: {e}")))?)
+        String::from_utf8(output.stdout)
+            .map_err(|e| Error::Other(anyhow::anyhow!("git output not UTF-8: {e}")))
     }
 
     /// Write a value to `<prefix>.<key>` in the repo-local git config.
@@ -275,9 +272,13 @@ impl Repo {
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use path_absolutize::Absolutize;
+    use tempfile::TempDir;
 
     use super::*;
+    use crate::crypt::HEADER_LEN;
 
     #[test]
     fn test_repo_open() -> Result<()> {
@@ -285,6 +286,75 @@ mod tests {
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
         let repo = Repo::open(Path::new("./.git").absolutize()?)?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
+        Ok(())
+    }
+
+    fn init_temp_repo() -> TempDir {
+        let dir = TempDir::new().unwrap();
+        // `git init` so that .git/ exists for hook installation & config.
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        dir
+    }
+
+    #[test]
+    fn test_set_get_config_roundtrip() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let repo = Repo::open(&repo_path)?;
+
+        repo.set_config("key", "hunter2")?;
+        let read_back = repo.get_config("key")?;
+        assert_eq!(read_back, "hunter2");
+        Ok(())
+    }
+
+    #[test]
+    fn test_install_hook_creates_file() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let repo = Repo::open(&repo_path)?;
+
+        repo.install_hook()?;
+        let hook = repo_path.join(".git").join("hooks").join("pre-commit");
+        assert!(hook.exists());
+        let content = std::fs::read(&hook)?;
+        assert!(
+            content.starts_with(b"#!/bin/sh"),
+            "hook should be a shell script"
+        );
+
+        // Second install must fail (idempotency guard).
+        let second = repo.install_hook();
+        assert!(matches!(second, Err(Error::HookExists(_))));
+        Ok(())
+    }
+
+    #[test]
+    fn test_check_reports_unencrypted() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+
+        // Add a plaintext file to the crypt list.
+        std::fs::write(repo_path.join("plain.txt"), b"hello")?;
+        repo.conf.add_one_path_to_crypt_list("plain.txt")?;
+
+        // check should return FilesNotEncrypted.
+        let result = repo.check(&[], false);
+        assert!(matches!(result, Err(Error::FilesNotEncrypted(1, 1))));
+
+        // Encrypt the file (cheap path: just give it a valid 64-byte GITSE header so
+        // is_file_encrypted returns true), then check passes.
+        let mut fake_header = vec![0u8; HEADER_LEN];
+        fake_header[..5].copy_from_slice(b"GITSE");
+        fake_header[5] = 3; // version
+        std::fs::write(repo_path.join("plain.txt"), fake_header).unwrap();
+        let result = repo.check(&[], false);
+        assert!(result.is_ok());
         Ok(())
     }
 }

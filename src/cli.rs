@@ -4,8 +4,10 @@ use clap::{Parser, Subcommand};
 use config_file2::Storable;
 use log::{debug, info, warn};
 
-use crate::error::{Error, Result};
-use crate::repo::Repo;
+use crate::{
+    error::{Error, Result},
+    repo::Repo,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
@@ -137,5 +139,19 @@ fn validate_bool(value: &str) -> Result<bool, String> {
         "true" | "1" => Ok(true),
         "false" | "0" => Ok(false),
         _ => Err("value should be `true`, `false`, `1` or `0`".into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use assert2::assert;
+
+    use super::*;
+
+    #[test]
+    fn repo_path_parser_resolves_relative() {
+        // "." should absolutize to the current working directory.
+        let parsed = repo_path_parser(".").unwrap();
+        assert!(parsed.is_absolute());
     }
 }
