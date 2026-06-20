@@ -1,12 +1,10 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, anyhow};
 use colored::Colorize;
 use config_file2::LoadConfigFile;
 use log::{info, warn};
+use parking_lot::Mutex;
 use rayon::prelude::*;
 
 use crate::{
@@ -34,7 +32,6 @@ pub struct Repo {
     /// The absolute path of the opened repo.
     pub path: PathBuf,
     pub conf: Config,
-    pub key_sha: OnceLock<Box<[u8]>>,
 }
 
 impl Repo {
@@ -69,7 +66,6 @@ impl Repo {
         Ok(Self {
             path: repo_path,
             conf,
-            key_sha: OnceLock::new(),
         })
     }
 
@@ -146,9 +142,8 @@ impl Repo {
         let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
         target_files.par_iter().try_for_each(|f| -> Result<()> {
-            if !is_file_encrypted(f)?
-                && let Ok(mut list) = not_encrypted.lock()
-            {
+            if !is_file_encrypted(f)? {
+                let mut list = not_encrypted.lock();
                 let relative = pathdiff::diff_paths(f, &self.path).unwrap_or_else(|| f.clone());
                 list.push(relative);
             }
@@ -158,7 +153,7 @@ impl Repo {
 
         pb.finish_and_clear();
 
-        let not_encrypted = not_encrypted.into_inner().unwrap();
+        let not_encrypted = not_encrypted.into_inner();
         let total = target_files.len();
         let encrypted_count = total - not_encrypted.len();
 
@@ -208,7 +203,9 @@ impl Repo {
 
         std::fs::write(&hook_path, PRE_COMMIT_HOOK)?;
 
-        // Set executable permission on unix
+        // Set executable permission on unix. Windows users need Git for Windows
+        // (msys-based) which executes the sh hook regardless of the executable
+        // bit; a normal `write` is sufficient there.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -224,17 +221,9 @@ impl Repo {
         );
         Ok(())
     }
-}
 
-pub trait GitCommand {
-    fn run(&self, args: &[&str]) -> Result<()>;
-    fn run_with_output(&self, args: &[&str]) -> Result<String>;
-    fn set_config(&self, key: &str, value: &str) -> Result<()>;
-    fn get_config(&self, key: &str) -> Result<String>;
-}
-
-impl GitCommand for Repo {
-    fn run(&self, args: &[&str]) -> Result<()> {
+    /// Run a `git` command in the repo, discarding its stdout/stderr.
+    pub fn run(&self, args: &[&str]) -> Result<()> {
         let output = std::process::Command::new("git")
             .current_dir(&self.path)
             .args(args)
@@ -246,10 +235,12 @@ impl GitCommand for Repo {
         }
         Ok(())
     }
-    fn run_with_output(&self, args: &[&str]) -> Result<String> {
+
+    /// Run a `git` command and return its trimmed stdout as a `String`.
+    pub fn run_with_output(&self, args: &[&str]) -> Result<String> {
         let mut cmd = std::process::Command::new("git");
 
-        // we need to check English output in test
+        // Force English output in tests so we can match on stderr reliably.
         if cfg!(test) {
             cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
         }
@@ -263,11 +254,19 @@ impl GitCommand for Repo {
         Ok(String::from_utf8(output.stdout)
             .map_err(|e| Error::Other(anyhow::anyhow!("git output not UTF-8: {e}")))?)
     }
-    fn set_config(&self, key: &str, value: &str) -> Result<()> {
+
+    /// Write a value to `<prefix>.<key>` in the repo-local git config.
+    ///
+    /// Note: the value is stored verbatim (no trimming), so callers should
+    /// sanitize it themselves if needed. This matters for the `key` field,
+    /// which holds a user-supplied password and must not be silently modified.
+    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
-        self.run(&["config", "--local", &temp, value.trim()])
+        self.run(&["config", "--local", &temp, value])
     }
-    fn get_config(&self, key: &str) -> Result<String> {
+
+    /// Read `<prefix>.<key>` from the repo-local git config.
+    pub fn get_config(&self, key: &str) -> Result<String> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
         self.run_with_output(&["config", "--get", &temp])
             .map(|x| x.trim().to_string())

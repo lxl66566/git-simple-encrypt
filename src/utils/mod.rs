@@ -123,7 +123,7 @@ const REPORT_LIST_LIMIT: usize = 10;
 /// Print a pre-operation report listing the target files and total count.
 /// If the list exceeds `REPORT_LIST_LIMIT`, show the first few and summarize
 /// the rest as "... and N more files".
-pub fn print_pre_report(action: &str, files: &[PathBuf], repo_path: &Path) {
+pub fn print_pre_report(action: &str, files: &[impl AsRef<Path>], repo_path: &Path) {
     let count = files.len();
     println!(
         "\n{} {} {}",
@@ -133,7 +133,8 @@ pub fn print_pre_report(action: &str, files: &[PathBuf], repo_path: &Path) {
     );
 
     for f in &files[..count.min(REPORT_LIST_LIMIT)] {
-        let relative = pathdiff::diff_paths(f, repo_path).unwrap_or_else(|| f.clone());
+        let relative = pathdiff::diff_paths(f.as_ref(), repo_path)
+            .unwrap_or_else(|| f.as_ref().to_path_buf());
         println!("  {}", relative.display());
     }
 

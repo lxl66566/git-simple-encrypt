@@ -75,7 +75,7 @@ use zeroize::Zeroizing;
 use crate::{
     error::{Error, Result},
     repo::Repo,
-    salt_cache::{self, CachedEntry, SaltCacheSender},
+    salt_cache::{self, CacheRef, CachedEntry},
     utils::{
         Progress, is_file_encrypted, print_post_report, print_pre_report, resolve_target_files,
     },
@@ -473,15 +473,14 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
 }
 
 /// Decrypt a single file using streaming chunked decryption, with a thread-safe
-/// cache for derived keys and an optional cache sender for deterministic
+/// cache for derived keys and an optional cache reference for deterministic
 /// re-encryption.
 ///
-/// The `cache` tuple contains `(sender, relative_key)` — the caller is
-/// responsible for computing the repo-relative path key.
+/// Pass `cache = None` to skip recording `(salt, file_id)` for the file.
 pub fn decrypt_file_with_cache(
     path: &Path,
     key_cache: &KeyCache,
-    cache: Option<(&SaltCacheSender, &[u8])>,
+    cache: Option<CacheRef<'_>>,
     master_key: &[u8],
 ) -> Result<()> {
     let mut file = fs::File::open(path)?;
@@ -509,9 +508,9 @@ pub fn decrypt_file_with_cache(
 
     // Cache the salt+file_id BEFORE decryption so it is preserved even if
     // decryption fails halfway through.
-    if let Some((sender, key)) = cache {
-        sender.insert(
-            key,
+    if let Some(cache) = cache {
+        cache.sender.insert(
+            cache.key,
             CachedEntry {
                 salt: header.salt,
                 file_id: header.file_id,
@@ -669,33 +668,54 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
-    let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
-        let relative_key = cache_key(f, repo.path());
-        let (salt, cached_file_id) = reader
-            .get(&relative_key)
-            .map_or((batch_salt, None), |entry| {
-                (entry.salt, Some(entry.file_id))
-            });
+    let result = {
+        let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
+        target_files.par_iter().for_each(|f| {
+            let relative_key = cache_key(f, repo.path());
+            let (salt, cached_file_id) = reader
+                .get(&relative_key)
+                .map_or((batch_salt, None), |entry| {
+                    (entry.salt, Some(entry.file_id))
+                });
 
-        // Derive key — thundering-herd safe: only one thread per salt runs Argon2.
-        let derived_key = get_or_derive_key(&key_cache, key.as_bytes(), &salt)?;
+            // Derive key — thundering-herd safe: only one thread per salt runs Argon2.
+            let derived_key = match get_or_derive_key(&key_cache, key.as_bytes(), &salt) {
+                Ok(k) => k,
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    errors.lock().push(e);
+                    pb.inc(1);
+                    return;
+                }
+            };
 
-        let header = encrypt_file(
-            f,
-            &derived_key,
-            &salt,
-            cached_file_id,
-            repo.conf.use_zstd.then_some(repo.conf.zstd_level),
-        )
-        .with_context(|| format!("Failed to encrypt {}", f.display()))?;
+            let r: Result<_> = {
+                let raw = encrypt_file(
+                    f,
+                    &derived_key,
+                    &salt,
+                    cached_file_id,
+                    repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+                )
+                .with_context(|| format!("Failed to encrypt {}", f.display()));
+                raw.map_err(Error::from)
+            };
 
-        if header.is_none() {
-            skipped.fetch_add(1, Ordering::Relaxed);
-        }
+            match r {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    errors.lock().push(e);
+                }
+            }
 
-        pb.inc(1);
-        Ok(())
-    });
+            pb.inc(1);
+        });
+        errors.into_inner()
+    };
 
     pb.finish_and_clear();
 
@@ -706,7 +726,9 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         failed.load(Ordering::Relaxed),
     );
 
-    result?;
+    if let Some(first) = result.into_iter().next() {
+        return Err(first);
+    }
 
     Ok(())
 }
@@ -740,33 +762,49 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
-    let result = target_files.par_iter().try_for_each(|f| -> Result<()> {
-        if !is_file_encrypted(f)? {
-            skipped.fetch_add(1, Ordering::Relaxed);
+    let result = {
+        let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
+        target_files.par_iter().for_each(|f| {
+            match is_file_encrypted(f) {
+                Ok(true) => {}
+                Ok(false) => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                    pb.inc(1);
+                    return;
+                }
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    errors.lock().push(e);
+                    pb.inc(1);
+                    return;
+                }
+            }
+
+            let relative_key = cache_key(f, repo.path());
+
+            let r: Result<()> = {
+                let raw = decrypt_file_with_cache(
+                    f,
+                    &key_cache,
+                    Some(CacheRef {
+                        sender: &sender,
+                        key: &relative_key,
+                    }),
+                    key.as_bytes(),
+                )
+                .with_context(|| format!("Failed to decrypt {}", f.display()));
+                raw.map_err(Error::from)
+            };
+
+            if let Err(e) = r {
+                failed.fetch_add(1, Ordering::Relaxed);
+                errors.lock().push(e);
+            }
+
             pb.inc(1);
-            return Ok(());
-        }
-
-        let relative_key = cache_key(f, repo.path());
-
-        let decrypt_result: crate::error::Result<()> = {
-            let r = decrypt_file_with_cache(
-                f,
-                &key_cache,
-                Some((&sender, &relative_key)),
-                key.as_bytes(),
-            )
-            .with_context(|| format!("Failed to decrypt {}", f.display()));
-            r.map_err(Error::from)
-        };
-
-        if decrypt_result.is_err() {
-            failed.fetch_add(1, Ordering::Relaxed);
-        }
-
-        pb.inc(1);
-        decrypt_result
-    });
+        });
+        errors.into_inner()
+    };
 
     // Drop sender to close the channel, then persist the cache.
     drop(sender);
@@ -781,7 +819,9 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         failed.load(Ordering::Relaxed),
     );
 
-    result?;
+    if let Some(first) = result.into_iter().next() {
+        return Err(first);
+    }
 
     Ok(())
 }

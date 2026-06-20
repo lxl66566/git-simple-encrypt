@@ -5,9 +5,9 @@ use config_file2::Storable;
 use log::{debug, info, warn};
 
 use crate::error::{Error, Result};
-use crate::repo::{GitCommand, Repo};
+use crate::repo::Repo;
 
-#[derive(Parser, Clone, Debug)]
+#[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None, after_help = r#"Examples:
 git-se p                    # Set/update master password
 git-se add file.txt  mydir  # Add files/folders to the encryption list
@@ -31,20 +31,11 @@ pub struct Cli {
 fn repo_path_parser(path: &str) -> Result<PathBuf, String> {
     match path_absolutize::Absolutize::absolutize(Path::new(path)) {
         Ok(p) => Ok(p.into_owned()),
-        Err(e) => Err(format!("{e}")),
+        Err(e) => Err(e.to_string()),
     }
 }
 
-impl Default for Cli {
-    fn default() -> Self {
-        Self {
-            command: SubCommand::Pwd,
-            repo: PathBuf::from("."),
-        }
-    }
-}
-
-#[derive(Subcommand, Debug, Clone)]
+#[derive(Subcommand, Debug)]
 pub enum SubCommand {
     /// Encrypt all files with crypt attr.
     #[clap(alias("e"))]
@@ -83,7 +74,7 @@ pub enum SubCommand {
     Install,
 }
 
-#[derive(Debug, Subcommand, Clone)]
+#[derive(Debug, Subcommand)]
 pub enum SetField {
     /// Set key
     Key { value: String },

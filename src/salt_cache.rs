@@ -46,6 +46,7 @@
 
 use std::{
     collections::HashMap,
+    fmt,
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -70,6 +71,27 @@ const CACHE_FILENAME: &str = "git-simple-encrypt-salt-cache";
 pub struct CachedEntry {
     pub salt: [u8; SALT_LEN],
     pub file_id: [u8; FILE_ID_LEN],
+}
+
+/// Borrowed reference to a salt-cache writer + the repo-relative key for a
+/// single file. Passed into [`crate::crypt::decrypt_file_with_cache`] so that
+/// the decrypt path can record `(salt, file_id)` for deterministic
+/// re-encryption.
+#[derive(Clone, Copy)]
+pub struct CacheRef<'a> {
+    /// The thread-safe sender that forwards entries to the persister thread.
+    pub sender: &'a SaltCacheSender,
+    /// Forward-slash-normalized repo-relative path bytes for this file.
+    pub key: &'a [u8],
+}
+
+impl fmt::Debug for CacheRef<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CacheRef")
+            .field("sender", &"SaltCacheSender")
+            .field("key", &String::from_utf8_lossy(self.key))
+            .finish()
+    }
 }
 
 /// Returns the cache file path for the given repo.
