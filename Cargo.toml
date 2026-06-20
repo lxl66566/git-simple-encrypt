@@ -3,6 +3,7 @@ authors      = ["lxl66566 <lxl66566@gmail.com>"]
 categories   = ["cryptography"]
 description  = "Encrypt/decrypt files in your git repo using only one password"
 edition      = "2024"
+exclude      = [".github"]
 homepage     = "https://github.com/lxl66566/git-simple-encrypt"
 keywords     = ["git", "encryption"]
 license      = "MIT"
