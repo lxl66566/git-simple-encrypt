@@ -222,32 +222,54 @@ impl SaltCacheSender {
 ///
 /// This type is **not** `Sync` — it should only be used on the main thread
 /// after rayon work completes.
+///
+/// # Drop safety
+///
+/// [`Drop`] is implemented as a safety net: if [`save`](Self::save) is not
+/// called (e.g. due to a panic during parallel decryption), any entries
+/// already buffered in the channel are still persisted. This honors the
+/// module-level contract that partial progress is preserved on error.
 pub struct SaltCacheSaver {
-    rx: mpsc::Receiver<(Vec<u8>, CachedEntry)>,
+    /// `Option` so [`save_inner`] can take it exactly once; subsequent `Drop`
+    /// becomes a no-op.
+    rx: Option<mpsc::Receiver<(Vec<u8>, CachedEntry)>>,
     repo_path: PathBuf,
 }
 
 impl SaltCacheSaver {
     /// Persist all collected entries to disk (best-effort, atomic).
     ///
-    /// 1. Drops the internal sender (via the paired `SaltCacheSender` going out
-    ///    of scope in the caller) so the channel closes.
-    /// 2. Collects all `(key, entry)` pairs from the channel.
-    /// 3. Merges with any existing on-disk cache (existing entries are kept
+    /// 1. Collects all `(key, entry)` pairs currently buffered in the channel
+    ///    via [`mpsc::Receiver::try_iter`] (non-blocking — by the time this is
+    ///    called, all rayon workers have finished, so every sent entry is
+    ///    already buffered).
+    /// 2. Merges with any existing on-disk cache (existing entries are kept
     ///    only if no new entry overrides them).
-    /// 4. Serializes via rkyv and writes atomically to
+    /// 3. Serializes via rkyv and writes atomically to
     ///    `<repo>/.git/<CACHE_FILENAME>`.
     ///
-    /// Errors are logged but not propagated because cache persistence is
-    /// non-critical: losing the cache only means the next encryption uses
-    /// fresh salts.
-    pub fn save(self) {
-        let Self { rx, repo_path } = self;
+    /// Safe to call exactly once; a paired [`Drop`] impl guards the
+    /// panic-on-drop path. Errors are logged but not propagated because cache
+    /// persistence is non-critical: losing the cache only means the next
+    /// encryption uses fresh salts.
+    pub fn save(mut self) {
+        self.save_inner();
+    }
 
-        // Collect all entries sent through the channel. The sender side must
-        // have been dropped (or going to be dropped) by the caller before
-        // this call, otherwise `into_iter()` will block.
-        let mut entries: HashMap<Vec<u8>, CachedEntry> = rx.into_iter().collect();
+    fn save_inner(&mut self) {
+        // `take()` ensures the body runs at most once across `save()` + `Drop`.
+        let Some(rx) = self.rx.take() else {
+            return;
+        };
+
+        // Use `try_iter` (non-blocking) rather than `into_iter` so that:
+        //   - explicit `save()` does not require the caller to drop the sender first
+        //     (removing a brittle ordering contract);
+        //   - the `Drop` impl cannot deadlock if the paired `SaltCacheSender` is
+        //     dropped after `self` under non-2024 drop ordering.
+        // All rayon workers have returned by the time we get here, so every
+        // sent entry is already in the channel buffer.
+        let mut entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
 
         if entries.is_empty() {
             debug!("No cache entries to save");
@@ -256,7 +278,7 @@ impl SaltCacheSaver {
 
         // Merge with existing cache on disk (keep existing entries only when
         // no new entry covers the same path).
-        let path = cache_path(&repo_path);
+        let path = cache_path(&self.repo_path);
         if path.exists()
             && let Ok(existing_bytes) = std::fs::read(&path)
             && let Ok(existing) =
@@ -291,17 +313,24 @@ impl SaltCacheSaver {
 ///
 /// The sender is `Sync` and can be shared across rayon threads. The saver
 /// should be kept on the main thread and `.save()`d after parallel work
-/// completes.
+/// completes. If `.save()` is not called, [`SaltCacheSaver::drop`] will
+/// persist any buffered entries as a safety net.
 #[must_use]
 pub fn create_writer(repo_path: &Path) -> (SaltCacheSender, SaltCacheSaver) {
     let (tx, rx) = mpsc::channel();
     (
         SaltCacheSender { tx },
         SaltCacheSaver {
-            rx,
+            rx: Some(rx),
             repo_path: repo_path.to_path_buf(),
         },
     )
+}
+
+impl Drop for SaltCacheSaver {
+    fn drop(&mut self) {
+        self.save_inner();
+    }
 }
 
 #[cfg(test)]
