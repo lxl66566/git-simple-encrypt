@@ -11,7 +11,7 @@ name         = "git-simple-encrypt"
 readme       = "./README.md"
 repository   = "https://github.com/lxl66566/git-simple-encrypt"
 rust-version = "1.85"
-version      = "3.0.1"
+version      = "3.0.2"
 
 [features]
 default = ["bin", "progress", "colored"]
