@@ -20,7 +20,7 @@ use crate::crypt::{decrypt_repo, encrypt_repo};
 #[cfg(feature = "bin")]
 use crate::repo::Repo;
 pub use crate::{
-    crypt::FileHeader,
+    crypt::{BatchSummary, FileHeader},
     error::{Error, Result},
 };
 
