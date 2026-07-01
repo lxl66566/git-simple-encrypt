@@ -9,8 +9,8 @@ use chacha20poly1305::{XChaCha20Poly1305, aead::KeyInit};
 use dashmap::DashMap;
 use log::debug;
 use rand::Rng;
-use rayon::prelude::*;
 use tempfile::NamedTempFile;
+use youpipe::prelude::*;
 
 use crate::{
     crypt::{
@@ -100,20 +100,25 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
-    sources.par_iter().for_each(|src| {
-        let Some(dst) = mapper(src) else { return };
+    scope(|s| {
+        s.pipe(sources)
+            .with_workload(Workload::Unbalanced)
+            .map(|src| {
+                let Some(dst) = mapper(&src) else { return };
 
-        match decrypt_file_to_with_key_cache(src, &dst, &key_cache, master_key) {
-            Ok(Some(_)) => {
-                succeeded.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(None) => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                errors.lock().push((src.clone(), e));
-            }
-        }
+                match decrypt_file_to_with_key_cache(&src, &dst, &key_cache, master_key) {
+                    Ok(Some(_)) => {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        errors.lock().push((src, e));
+                    }
+                }
+            })
+            .collect()
     });
 
     let errors = errors.into_inner();
@@ -158,20 +163,25 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
-    sources.par_iter().for_each(|src| {
-        let Some(dst) = mapper(src) else { return };
+    scope(|s| {
+        s.pipe(sources)
+            .with_workload(Workload::Unbalanced)
+            .map(|src| {
+                let Some(dst) = mapper(&src) else { return };
 
-        match encrypt_file_to(src, &dst, &derived_key, batch_salt, None, zstd) {
-            Ok(Some(_)) => {
-                succeeded.fetch_add(1, Ordering::Relaxed);
-            }
-            Ok(None) => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            }
-            Err(e) => {
-                errors.lock().push((src.clone(), e));
-            }
-        }
+                match encrypt_file_to(&src, &dst, &derived_key, batch_salt, None, zstd) {
+                    Ok(Some(_)) => {
+                        succeeded.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(None) => {
+                        skipped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        errors.lock().push((src, e));
+                    }
+                }
+            })
+            .collect()
     });
 
     let errors = errors.into_inner();

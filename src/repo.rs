@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use config_file2::LoadConfigFile;
 use log::{info, warn};
 use parking_lot::Mutex;
-use rayon::prelude::*;
+use youpipe::prelude::*;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
@@ -135,23 +135,38 @@ impl Repo {
             ":".dimmed()
         );
 
-        let pb = Progress::new(target_files.len(), "Check");
+        let total = target_files.len();
+        let pb = Progress::new(total, "Check");
         let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let io_error: Mutex<Option<Error>> = Mutex::new(None);
 
-        target_files.par_iter().try_for_each(|f| -> Result<()> {
-            if !is_file_encrypted(f)? {
-                let mut list = not_encrypted.lock();
-                let relative = pathdiff::diff_paths(f, &self.path).unwrap_or_else(|| f.clone());
-                list.push(relative);
-            }
-            pb.inc(1);
-            Ok(())
-        })?;
+        scope(|s| {
+            s.pipe(target_files)
+                .map(|f| {
+                    match is_file_encrypted(&f) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let mut list = not_encrypted.lock();
+                            let relative =
+                                pathdiff::diff_paths(&f, &self.path).unwrap_or(f);
+                            list.push(relative);
+                        }
+                        Err(e) => {
+                            io_error.lock().get_or_insert(e);
+                        }
+                    }
+                    pb.inc(1);
+                })
+                .collect()
+        });
+
+        if let Some(e) = io_error.into_inner() {
+            return Err(e);
+        }
 
         pb.finish_and_clear();
 
         let not_encrypted = not_encrypted.into_inner();
-        let total = target_files.len();
         let encrypted_count = total - not_encrypted.len();
 
         if not_encrypted.is_empty() {

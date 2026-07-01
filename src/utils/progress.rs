@@ -11,7 +11,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 
 /// Monomorphic progress handle used by repo-wide operations.
 ///
-/// `Send + Sync` so it can be shared (by reference) across rayon workers.
+/// `Send + Sync` so it can be shared (by reference) across parallel workers.
 pub struct Progress {
     #[cfg(feature = "progress")]
     inner: ProgressBar,

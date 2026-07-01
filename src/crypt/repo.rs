@@ -6,7 +6,7 @@ use std::{
 use dashmap::DashMap;
 use pathdiff::diff_paths;
 use rand::prelude::*;
-use rayon::prelude::*;
+use youpipe::prelude::*;
 
 use crate::{
     crypt::{
@@ -59,51 +59,57 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let mut batch_salt = [0u8; SALT_LEN];
     rand::rng().fill_bytes(&mut batch_salt);
 
-    let pb = Progress::new(target_files.len(), "Encrypt");
+    let total = target_files.len();
+    let pb = Progress::new(total, "Encrypt");
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        target_files.par_iter().for_each(|f| {
-            let relative_key = cache_key(f, repo.path());
-            let (salt, cached_file_id) = reader
-                .get(&relative_key)
-                .map_or((batch_salt, None), |entry| {
-                    (entry.salt, Some(entry.file_id))
-                });
+        scope(|s| {
+            s.pipe(target_files)
+                .with_workload(Workload::Unbalanced)
+                .map(|f| {
+                    let relative_key = cache_key(&f, repo.path());
+                    let (salt, cached_file_id) = reader
+                        .get(&relative_key)
+                        .map_or((batch_salt, None), |entry| {
+                            (entry.salt, Some(entry.file_id))
+                        });
 
-            let derived_key = match get_or_derive_key(&key_cache, key.as_bytes(), &salt) {
-                Ok(k) => k,
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
+                    let derived_key = match get_or_derive_key(&key_cache, key.as_bytes(), &salt) {
+                        Ok(k) => k,
+                        Err(e) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            errors.lock().push(e);
+                            pb.inc(1);
+                            return;
+                        }
+                    };
+
+                    let r = encrypt_file(
+                        &f,
+                        &derived_key,
+                        &salt,
+                        cached_file_id,
+                        repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+                    )
+                    .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
+
+                    match r {
+                        Ok(Some(_)) => {}
+                        Ok(None) => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            errors.lock().push(e);
+                        }
+                    }
+
                     pb.inc(1);
-                    return;
-                }
-            };
-
-            let r = encrypt_file(
-                f,
-                &derived_key,
-                &salt,
-                cached_file_id,
-                repo.conf.use_zstd.then_some(repo.conf.zstd_level),
-            )
-            .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
-
-            match r {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                }
-            }
-
-            pb.inc(1);
+                })
+                .collect()
         });
         errors.into_inner()
     };
@@ -112,7 +118,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     print_post_report(
         "Encrypt",
-        target_files.len(),
+        total,
         skipped.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
     );
@@ -141,47 +147,53 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let key_cache: KeyCache = DashMap::new();
     let (sender, saver) = salt_cache::create_writer(repo.path());
 
-    let pb = Progress::new(target_files.len(), "Decrypt");
+    let total = target_files.len();
+    let pb = Progress::new(total, "Decrypt");
     let skipped = AtomicUsize::new(0);
     let failed = AtomicUsize::new(0);
 
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        target_files.par_iter().for_each(|f| {
-            match is_file_encrypted(f) {
-                Ok(true) => {}
-                Ok(false) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
+        scope(|s| {
+            s.pipe(target_files)
+                .with_workload(Workload::Unbalanced)
+                .map(|f| {
+                    match is_file_encrypted(&f) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            skipped.fetch_add(1, Ordering::Relaxed);
+                            pb.inc(1);
+                            return;
+                        }
+                        Err(e) => {
+                            failed.fetch_add(1, Ordering::Relaxed);
+                            errors.lock().push(e);
+                            pb.inc(1);
+                            return;
+                        }
+                    }
+
+                    let relative_key = cache_key(&f, repo.path());
+
+                    let r = decrypt_file_with_cache(
+                        &f,
+                        &key_cache,
+                        Some(CacheRef {
+                            sender: &sender,
+                            key: &relative_key,
+                        }),
+                        key.as_bytes(),
+                    )
+                    .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
+
+                    if let Err(e) = r {
+                        failed.fetch_add(1, Ordering::Relaxed);
+                        errors.lock().push(e);
+                    }
+
                     pb.inc(1);
-                    return;
-                }
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                    pb.inc(1);
-                    return;
-                }
-            }
-
-            let relative_key = cache_key(f, repo.path());
-
-            let r = decrypt_file_with_cache(
-                f,
-                &key_cache,
-                Some(CacheRef {
-                    sender: &sender,
-                    key: &relative_key,
-                }),
-                key.as_bytes(),
-            )
-            .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
-
-            if let Err(e) = r {
-                failed.fetch_add(1, Ordering::Relaxed);
-                errors.lock().push(e);
-            }
-
-            pb.inc(1);
+                })
+                .collect()
         });
         errors.into_inner()
     };
@@ -193,7 +205,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     print_post_report(
         "Decrypt",
-        target_files.len(),
+        total,
         skipped.load(Ordering::Relaxed),
         failed.load(Ordering::Relaxed),
     );
