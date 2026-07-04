@@ -192,7 +192,7 @@ impl SaltCacheReader {
 // Write Path — mpsc collection + rkyv serialization
 // ---------------------------------------------------------------------------
 
-/// Thread-safe sender for cache entries, safe to share across rayon workers.
+/// Thread-safe sender for cache entries, safe to share across parallel workers.
 ///
 /// Workers call [`insert`](Self::insert) to send `(key, entry)` pairs
 /// through an internal `mpsc` channel. After all parallel work completes,
@@ -221,7 +221,7 @@ impl SaltCacheSender {
 /// merge with any existing on-disk cache, and serialize via rkyv.
 ///
 /// This type is **not** `Sync` — it should only be used on the main thread
-/// after rayon work completes.
+/// after parallel work completes.
 ///
 /// # Drop safety
 ///
@@ -241,7 +241,7 @@ impl SaltCacheSaver {
     ///
     /// 1. Collects all `(key, entry)` pairs currently buffered in the channel
     ///    via [`mpsc::Receiver::try_iter`] (non-blocking — by the time this is
-    ///    called, all rayon workers have finished, so every sent entry is
+    ///    called, all parallel workers have finished, so every sent entry is
     ///    already buffered).
     /// 2. Merges with any existing on-disk cache (existing entries are kept
     ///    only if no new entry overrides them).
@@ -267,7 +267,7 @@ impl SaltCacheSaver {
         //     (removing a brittle ordering contract);
         //   - the `Drop` impl cannot deadlock if the paired `SaltCacheSender` is
         //     dropped after `self` under non-2024 drop ordering.
-        // All rayon workers have returned by the time we get here, so every
+        // All parallel workers have returned by the time we get here, so every
         // sent entry is already in the channel buffer.
         let mut entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
 
@@ -311,7 +311,7 @@ impl SaltCacheSaver {
 
 /// Create a paired sender/saver for collecting cache entries.
 ///
-/// The sender is `Sync` and can be shared across rayon threads. The saver
+/// The sender is `Sync` and can be shared across parallel workers. The saver
 /// should be kept on the main thread and `.save()`d after parallel work
 /// completes. If `.save()` is not called, [`SaltCacheSaver::drop`] will
 /// persist any buffered entries as a safety net.
