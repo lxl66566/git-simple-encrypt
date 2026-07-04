@@ -1,0 +1,20 @@
+# Performance overrides required by the youpipe dependency.
+#
+# `[profile.release]` in `Cargo.toml` sets `opt-level = "s"` and
+# `panic = "abort"` to minimise binary size — the right default for a
+# end-user CLI. However youpipe's hot paths (the fork/join dispatcher,
+# the work-stealing scan, the leaf loops) are tuned for `opt-level = 3`
+# auto-vectorisation, and its panic-safety (`LeafGuard` / `ForEachGuard`
+# inside `par_index_*`) *requires* unwinding: under `panic = "abort"`
+# every `catch_unwind` becomes a no-op and those guards never run.
+# youpipe's own `.cargo/config.toml` forces the same flags, but that
+# file is only loaded for builds inside the youpipe workspace — when
+# git-se pulls youpipe as a path dependency the override does not apply.
+#
+# Cargo's `[build] rustflags` are appended after the profile-derived
+# flags and rustc takes the last `-C` value for each setting, so this
+# reliably overrides `[profile.release]` without editing `Cargo.toml`.
+# Set `RUSTFLAGS` in the environment to re-enable size-optimised builds
+# for release packaging.
+[build]
+rustflags = ["-C", "opt-level=3", "-C", "panic=unwind"]

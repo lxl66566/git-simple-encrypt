@@ -8,7 +8,10 @@ use youpipe::prelude::*;
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
-    utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files, style::Colorize},
+    utils::{
+        Progress, is_file_encrypted, oversubscribed_pool, prompt_password, resolve_target_files,
+        style::Colorize,
+    },
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -140,8 +143,9 @@ impl Repo {
         let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
         let io_error: Mutex<Option<Error>> = Mutex::new(None);
 
+        let pool = oversubscribed_pool(8);
         scope(|s| {
-            s.pipe(target_files).with_oversubscribe(8).for_each(|f| {
+            s.pipe(target_files).with_compute_pool(pool).for_each(|f| {
                 match is_file_encrypted(&f) {
                     Ok(true) => {}
                     Ok(false) => {

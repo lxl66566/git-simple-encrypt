@@ -20,6 +20,7 @@ use crate::{
         stream::decrypt_body,
     },
     error::{Error, Result},
+    utils::oversubscribed_pool,
 };
 
 /// Summary of a batch encrypt/decrypt run.
@@ -100,9 +101,10 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
+    let pool = oversubscribed_pool(2);
     scope(|s| {
         s.pipe(sources)
-            .with_oversubscribe(2)
+            .with_compute_pool(pool)
             .with_workload(Workload::Unbalanced)
             .for_each(|src| {
                 let Some(dst) = mapper(&src) else { return };
@@ -163,9 +165,10 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
+    let pool = oversubscribed_pool(2);
     scope(|s| {
         s.pipe(sources)
-            .with_oversubscribe(2)
+            .with_compute_pool(pool)
             .with_workload(Workload::Unbalanced)
             .for_each(|src| {
                 let Some(dst) = mapper(&src) else { return };

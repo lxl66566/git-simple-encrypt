@@ -11,6 +11,7 @@ use std::{
 use ignore::{WalkBuilder, WalkState};
 pub use progress::Progress;
 use tempfile::NamedTempFile;
+use youpipe::ComputePool;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -18,6 +19,26 @@ use crate::{
     error::{Error, Result},
     utils::style::Colorize,
 };
+
+/// Build a long-lived [`ComputePool`] sized to `factor × num_cpus`.
+///
+/// This is the persistent-pool counterpart of youpipe's
+/// `with_oversubscribe(factor)`: same sizing rule (`factor ×
+/// available_parallelism`), but the pool is owned by the caller and reused
+/// across `.for_each()` / `.collect()` calls instead of being created and
+/// dropped on every terminal invocation.
+///
+/// Why prefer this over `with_oversubscribe` for blocking-IO workloads
+/// (file encrypt/decrypt, batch `stat`): youpipe's transient pool pays
+/// thread-spawn + `wait_until_primed` + terminate-join on **every** call.
+/// For a one-shot CLI run that cost is paid once per process either way,
+/// but the persistent form is strictly cheaper and keeps workers' caches
+/// warm if a process ever calls the pipeline more than once.
+#[must_use]
+pub(crate) fn oversubscribed_pool(factor: usize) -> ComputePool {
+    let ncpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    ComputePool::new(ncpus * factor)
+}
 
 /// Format a byte array into a hex string
 #[allow(dead_code)]

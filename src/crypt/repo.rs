@@ -18,7 +18,8 @@ use crate::{
     repo::Repo,
     salt_cache::{self, CacheRef},
     utils::{
-        Progress, is_file_encrypted, print_post_report, print_pre_report, resolve_target_files,
+        Progress, is_file_encrypted, oversubscribed_pool, print_post_report, print_pre_report,
+        resolve_target_files,
     },
 };
 
@@ -66,9 +67,10 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
+        let pool = oversubscribed_pool(2);
         scope(|s| {
             s.pipe(target_files)
-                .with_oversubscribe(2)
+                .with_compute_pool(pool)
                 .with_workload(Workload::Unbalanced)
                 .for_each(|f| {
                     let relative_key = cache_key(&f, repo.path());
@@ -154,9 +156,10 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
+        let pool = oversubscribed_pool(2);
         scope(|s| {
             s.pipe(target_files)
-                .with_oversubscribe(2)
+                .with_compute_pool(pool)
                 .with_workload(Workload::Unbalanced)
                 .for_each(|f| {
                     match is_file_encrypted(&f) {
