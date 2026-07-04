@@ -2,7 +2,7 @@ use std::io::{Read, Write};
 
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
-    aead::{Aead, KeyInit, Payload},
+    aead::{AeadInPlace, KeyInit},
 };
 use zeroize::Zeroizing;
 
@@ -24,8 +24,13 @@ fn encrypt_chunks(
     file_id: &[u8; FILE_ID_LEN],
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
-    let mut buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE]);
-    let mut out_buf: Vec<u8> = Vec::with_capacity(NONCE_LEN + CHUNK_SIZE + 16);
+    // Reusable plaintext/ciphertext buffer. `encrypt_in_place` overwrites the
+    // plaintext chunk with its ciphertext and appends the 16 B Poly1305 tag,
+    // so the capacity reserves CHUNK_SIZE + TAG_LEN up front — zero allocation
+    // and zero copy per chunk (the old `encrypt()` + `extend_from_slice` path
+    // allocated a fresh Vec and memcopied the whole chunk every iteration).
+    const TAG_LEN: usize = 16;
+    let mut buffer: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(CHUNK_SIZE + TAG_LEN));
     let mut aad = {
         let mut aad = [0u8; HEADER_LEN + 9];
         aad[..HEADER_LEN].copy_from_slice(header_bytes);
@@ -34,6 +39,9 @@ fn encrypt_chunks(
     let mut chunk_idx = 0u64;
 
     loop {
+        // Restore a full CHUNK_SIZE window for reading; `encrypt_in_place`
+        // changes the length each iteration, so resize at the top.
+        buffer.resize(CHUNK_SIZE, 0);
         let mut bytes_read = 0;
         while bytes_read < CHUNK_SIZE {
             let n = reader.read(&mut buffer[bytes_read..])?;
@@ -47,22 +55,20 @@ fn encrypt_chunks(
         aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
+        // Nonce is derived from the *plaintext* chunk, so compute it before
+        // `encrypt_in_place` overwrites the buffer with ciphertext.
         let nonce_bytes = derive_nonce(key_mac, file_id, &buffer[..bytes_read], chunk_idx);
         let nonce = XNonce::from(nonce_bytes);
 
-        let payload = Payload {
-            msg: &buffer[..bytes_read],
-            aad: &aad,
-        };
-
-        let ciphertext = cipher
-            .encrypt(&nonce, payload)
+        // Drop the zero-padding tail so the buffer holds exactly the plaintext,
+        // then encrypt in place: buffer becomes ciphertext+tag (len += 16).
+        buffer.truncate(bytes_read);
+        cipher
+            .encrypt_in_place(&nonce, &aad, &mut *buffer)
             .map_err(|e| Error::EncryptFailed(e.to_string()))?;
 
-        out_buf.clear();
-        out_buf.extend_from_slice(&nonce_bytes);
-        out_buf.extend_from_slice(&ciphertext);
-        writer.write_all(&out_buf)?;
+        writer.write_all(&nonce_bytes)?;
+        writer.write_all(&buffer)?;
 
         chunk_idx += 1;
 
@@ -84,9 +90,13 @@ fn decrypt_chunks(
     cipher: &XChaCha20Poly1305,
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
+    // Each encrypted chunk is plaintext (<= CHUNK_SIZE) + 16 B tag.
+    // `decrypt_in_place` overwrites it in place with the plaintext, so this
+    // single buffer is reused for every chunk — no per-chunk Vec allocation.
+    const TAG_LEN: usize = 16;
+    let ct_len = CHUNK_SIZE + TAG_LEN;
     let mut nonce_buf = [0u8; NONCE_LEN];
-    let mut ct_buffer = Zeroizing::new(vec![0u8; CHUNK_SIZE + 16]);
-    let ct_len = ct_buffer.len();
+    let mut ct_buffer: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(ct_len));
     let mut aad = {
         let mut aad = [0u8; HEADER_LEN + 9];
         aad[..HEADER_LEN].copy_from_slice(header_bytes);
@@ -102,6 +112,7 @@ fn decrypt_chunks(
             Err(e) => return Err(e.into()),
         }
 
+        ct_buffer.resize(ct_len, 0);
         let mut bytes_read = 0;
         while bytes_read < ct_len {
             let n = reader.read(&mut ct_buffer[bytes_read..])?;
@@ -116,23 +127,17 @@ fn decrypt_chunks(
         }
 
         let is_last_chunk = bytes_read < ct_len;
+        ct_buffer.truncate(bytes_read);
 
         aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
         let nonce = XNonce::from(nonce_buf);
-        let payload = chacha20poly1305::aead::Payload {
-            msg: &ct_buffer[..bytes_read],
-            aad: &aad,
-        };
+        cipher
+            .decrypt_in_place(&nonce, &aad, &mut *ct_buffer)
+            .map_err(|e| Error::DecryptFailed(e.to_string()))?;
 
-        let plaintext = Zeroizing::new(
-            cipher
-                .decrypt(&nonce, payload)
-                .map_err(|e| Error::DecryptFailed(e.to_string()))?,
-        );
-
-        writer.write_all(&plaintext)?;
+        writer.write_all(&ct_buffer)?;
 
         chunk_idx += 1;
 

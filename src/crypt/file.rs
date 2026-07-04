@@ -59,7 +59,13 @@ pub fn encrypt_file_to(
     debug!("Encrypting {} → {}", src.display(), dst.display());
 
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dst_parent)?;
+    // Skip the stat+mkdir round-trip when the destination already lives in a
+    // directory the source is in (the in-place path, or same-dir writes) —
+    // that directory necessarily exists.
+    let src_parent = src.parent().unwrap_or_else(|| Path::new("."));
+    if src_parent != dst_parent {
+        fs::create_dir_all(dst_parent)?;
+    }
     let mut temp_file = NamedTempFile::new_in(dst_parent)?;
 
     let header = encrypt_into(
@@ -100,7 +106,11 @@ pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Opti
     let derived_key = super::key::derive_key(master_key, &header.salt)?;
 
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dst_parent)?;
+    // See encrypt_file_to: skip mkdir when src and dst share a parent.
+    let src_parent = src.parent().unwrap_or_else(|| Path::new("."));
+    if src_parent != dst_parent {
+        fs::create_dir_all(dst_parent)?;
+    }
     let mut temp_file = NamedTempFile::new_in(dst_parent)?;
 
     let (key_enc, _) = split_keys(&derived_key);
