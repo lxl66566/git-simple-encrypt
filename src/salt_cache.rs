@@ -35,14 +35,13 @@
 //!
 //! # Lifecycle
 //!
-//! - **Decrypt**: Create sender → workers send entries → saver persists
-//!   (atomically)
-//! - **Encrypt**: Create reader (mmap, read-only) → workers look up cached
-//!   values. **No write** is performed during encryption.
-//! - **On error**: Cache is saved with whatever entries were captured before
-//!   the failure, preserving partial progress.
-//! - **Stale entries**: Entries for files that no longer exist are harmless
-//!   (looked up by key, simply not found) and do not affect correctness.
+//! - **Decrypt**: Create sender → workers send entries → saver persists (atomically)
+//! - **Encrypt**: Create reader (mmap, read-only) → workers look up cached values. **No write** is
+//!   performed during encryption.
+//! - **On error**: Cache is saved with whatever entries were captured before the failure,
+//!   preserving partial progress.
+//! - **Stale entries**: Entries for files that no longer exist are harmless (looked up by key,
+//!   simply not found) and do not affect correctness.
 
 use std::{
     collections::HashMap,
@@ -136,22 +135,22 @@ impl SaltCacheReader {
                             Ok(_) => {
                                 debug!("Loaded salt cache from {}", path.display());
                                 Some(mmap)
-                            }
+                            },
                             Err(e) => {
                                 warn!("Corrupted salt cache at {}: {e}", path.display());
                                 None
-                            }
+                            },
                         }
-                    }
+                    },
                     Err(e) => {
                         warn!("Failed to mmap salt cache at {}: {e}", path.display());
                         None
-                    }
+                    },
                 },
                 Err(e) => {
                     warn!("Failed to open salt cache at {}: {e}", path.display());
                     None
-                }
+                },
             }
         } else {
             debug!("Salt cache not found at {}", path.display());
@@ -239,14 +238,12 @@ pub struct SaltCacheSaver {
 impl SaltCacheSaver {
     /// Persist all collected entries to disk (best-effort, atomic).
     ///
-    /// 1. Collects all `(key, entry)` pairs currently buffered in the channel
-    ///    via [`mpsc::Receiver::try_iter`] (non-blocking — by the time this is
-    ///    called, all rayon workers have finished, so every sent entry is
-    ///    already buffered).
-    /// 2. Merges with any existing on-disk cache (existing entries are kept
-    ///    only if no new entry overrides them).
-    /// 3. Serializes via rkyv and writes atomically to
-    ///    `<repo>/.git/<CACHE_FILENAME>`.
+    /// 1. Collects all `(key, entry)` pairs currently buffered in the channel via
+    ///    [`mpsc::Receiver::try_iter`] (non-blocking — by the time this is called, all rayon
+    ///    workers have finished, so every sent entry is already buffered).
+    /// 2. Merges with any existing on-disk cache (existing entries are kept only if no new entry
+    ///    overrides them).
+    /// 3. Serializes via rkyv and writes atomically to `<repo>/.git/<CACHE_FILENAME>`.
     ///
     /// Safe to call exactly once; a paired [`Drop`] impl guards the
     /// panic-on-drop path. Errors are logged but not propagated because cache
@@ -263,10 +260,10 @@ impl SaltCacheSaver {
         };
 
         // Use `try_iter` (non-blocking) rather than `into_iter` so that:
-        //   - explicit `save()` does not require the caller to drop the sender first
-        //     (removing a brittle ordering contract);
-        //   - the `Drop` impl cannot deadlock if the paired `SaltCacheSender` is
-        //     dropped after `self` under non-2024 drop ordering.
+        //   - explicit `save()` does not require the caller to drop the sender first (removing a
+        //     brittle ordering contract);
+        //   - the `Drop` impl cannot deadlock if the paired `SaltCacheSender` is dropped after
+        //     `self` under non-2024 drop ordering.
         // All rayon workers have returned by the time we get here, so every
         // sent entry is already in the channel buffer.
         let mut entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
@@ -301,10 +298,10 @@ impl SaltCacheSaver {
                         path.display()
                     );
                 }
-            }
+            },
             Err(e) => {
                 warn!("Failed to serialize salt cache: {e}");
-            }
+            },
         }
     }
 }
@@ -318,13 +315,10 @@ impl SaltCacheSaver {
 #[must_use]
 pub fn create_writer(repo_path: &Path) -> (SaltCacheSender, SaltCacheSaver) {
     let (tx, rx) = mpsc::channel();
-    (
-        SaltCacheSender { tx },
-        SaltCacheSaver {
-            rx: Some(rx),
-            repo_path: repo_path.to_path_buf(),
-        },
-    )
+    (SaltCacheSender { tx }, SaltCacheSaver {
+        rx: Some(rx),
+        repo_path: repo_path.to_path_buf(),
+    })
 }
 
 impl Drop for SaltCacheSaver {
@@ -438,8 +432,8 @@ mod tests {
         let repo = dir.path();
         std::fs::create_dir_all(repo.join(".git")).unwrap();
 
-        let entry_a = make_entry(0xAA, 0xBB);
-        let entry_b = make_entry(0xCC, 0xDD);
+        let entry_a = make_entry(0xaa, 0xbb);
+        let entry_b = make_entry(0xcc, 0xdd);
 
         // Save initial entry.
         {

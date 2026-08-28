@@ -105,20 +105,18 @@ impl SetField {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
                 repo.set_config("key", value)?;
                 info!("Master key updated.");
-            }
+            },
             Self::EnableZstd { value } => {
                 repo.conf.use_zstd = *value;
                 info!("zstd compression enabled: {value}");
-            }
+            },
             Self::ZstdLevel { value } => {
                 repo.conf.zstd_level = *value;
                 info!("zstd compression level set to {value}");
-            }
+            },
         }
         debug!("store config to {}", repo.conf.config_path.display());
-        repo.conf
-            .store()
-            .map_err(|e| Error::Config(e.to_string()))?;
+        repo.conf.save().map_err(|e| Error::Config(e.to_string()))?;
         Ok(())
     }
 }

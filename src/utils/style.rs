@@ -36,18 +36,23 @@ impl<'a> Colorize for &'a str {
     fn bold(self) -> String {
         self.to_string()
     }
+
     fn green(self) -> String {
         self.to_string()
     }
+
     fn red(self) -> String {
         self.to_string()
     }
+
     fn yellow(self) -> String {
         self.to_string()
     }
+
     fn cyan(self) -> String {
         self.to_string()
     }
+
     fn dimmed(self) -> String {
         self.to_string()
     }
@@ -58,18 +63,23 @@ impl Colorize for String {
     fn bold(self) -> String {
         self
     }
+
     fn green(self) -> String {
         self
     }
+
     fn red(self) -> String {
         self
     }
+
     fn yellow(self) -> String {
         self
     }
+
     fn cyan(self) -> String {
         self
     }
+
     fn dimmed(self) -> String {
         self
     }

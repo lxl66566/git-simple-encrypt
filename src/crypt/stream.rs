@@ -15,7 +15,7 @@ use crate::{
 /// each with the cipher, and write `[NONCE | CIPHERTEXT | TAG]` to `writer`.
 fn encrypt_chunks(
     reader: &mut dyn Read,
-    writer: &mut dyn std::io::Write,
+    writer: &mut dyn Write,
     cipher: &XChaCha20Poly1305,
     key_mac: &[u8; 32],
     file_id: &[u8; FILE_ID_LEN],
@@ -83,7 +83,7 @@ fn encrypt_chunks(
 /// Chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
 fn decrypt_chunks(
     reader: &mut dyn Read,
-    writer: &mut dyn std::io::Write,
+    writer: &mut dyn Write,
     cipher: &XChaCha20Poly1305,
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
@@ -105,7 +105,7 @@ fn decrypt_chunks(
 
     loop {
         match reader.read_exact(&mut nonce_buf) {
-            Ok(()) => {}
+            Ok(()) => {},
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
@@ -154,7 +154,7 @@ fn decrypt_chunks(
 /// Decrypt the body (with optional Zstd decompression)
 pub(super) fn decrypt_body(
     reader: &mut dyn Read,
-    writer: &mut dyn std::io::Write,
+    writer: &mut dyn Write,
     cipher: &XChaCha20Poly1305,
     header: &FileHeader,
 ) -> Result<()> {
@@ -169,7 +169,7 @@ pub(super) fn decrypt_body(
 }
 
 /// Encrypt data from `reader` into `writer` using streaming chunked encryption.
-pub fn encrypt_into<R: Read, W: std::io::Write>(
+pub fn encrypt_into<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     derived_key: &[u8; 32],
@@ -209,7 +209,7 @@ pub fn encrypt_into<R: Read, W: std::io::Write>(
 }
 
 /// Decrypt data from `reader` into `writer`.
-pub fn decrypt_into<R: Read, W: std::io::Write>(
+pub fn decrypt_into<R: Read, W: Write>(
     reader: &mut R,
     writer: &mut W,
     master_key: &[u8],

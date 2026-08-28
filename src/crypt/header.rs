@@ -44,8 +44,8 @@ pub struct FileHeader {
     pub reserved: [u8; RESERVED_LEN],
 }
 
-const _: () = assert!(std::mem::size_of::<FileHeader>() == HEADER_LEN);
-const _: () = assert!(std::mem::align_of::<FileHeader>() == 1);
+const _: () = assert!(size_of::<FileHeader>() == HEADER_LEN);
+const _: () = assert!(align_of::<FileHeader>() == 1);
 
 impl FileHeader {
     #[must_use]

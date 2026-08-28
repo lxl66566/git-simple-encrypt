@@ -55,6 +55,7 @@ impl Config {
     pub fn new(path: impl AsRef<Path>) -> Self {
         Self::default().with_repo_path(path)
     }
+
     /// The path must be absolute.
     #[must_use]
     pub fn with_repo_path(mut self, path: impl AsRef<Path>) -> Self {
@@ -70,10 +71,7 @@ impl Config {
     /// `repo_path`). Returns an error if the path does not exist or cannot be
     /// expressed as a repo-relative path.
     pub fn add_one_path_to_crypt_list(&mut self, path: impl AsRef<Path>) -> Result<()> {
-        let path = path
-            .as_ref()
-            .absolutize_from(&self.repo_path)
-            .map_err(|e| Error::Other(format!("path absolutize failed: {e}")))?;
+        let path = path.as_ref().absolutize_from(&self.repo_path);
         debug!("adding path to crypt list: {}", path.display());
         if !path.exists() {
             return Err(Error::PathNotExist(path.into_owned()));
@@ -105,7 +103,7 @@ impl Config {
             self.add_one_path_to_crypt_list(x.as_ref())?;
         }
         debug!("store config to {}", self.config_path.display());
-        self.store().map_err(|e| Error::Config(e.to_string()))
+        self.save().map_err(|e| Error::Config(e.to_string()))
     }
 }
 
@@ -119,7 +117,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_add_one_file_to_crypt_list() -> crate::Result<()> {
+    fn test_add_one_file_to_crypt_list() -> Result<()> {
         let temp_dir = TempDir::new()?.keep();
         let file_path = temp_dir.join("test.toml");
         let mut config = Config::load_or_default(file_path)

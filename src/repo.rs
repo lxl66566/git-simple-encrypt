@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use config_file2::LoadConfigFile;
 use log::{info, warn};
 use parking_lot::Mutex;
-use rayon::prelude::*;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},

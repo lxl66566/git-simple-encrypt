@@ -5,8 +5,8 @@ use std::{
 
 use dashmap::DashMap;
 use pathdiff::diff_paths;
-use rand::prelude::*;
-use rayon::prelude::*;
+use rand::prelude::Rng;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     crypt::{
@@ -80,7 +80,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
                     errors.lock().push(e);
                     pb.inc(1);
                     return;
-                }
+                },
             };
 
             let r = encrypt_file(
@@ -93,14 +93,14 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
             .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
 
             match r {
-                Ok(Some(_)) => {}
+                Ok(Some(_)) => {},
                 Ok(None) => {
                     skipped.fetch_add(1, Ordering::Relaxed);
-                }
+                },
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
                     errors.lock().push(e);
-                }
+                },
             }
 
             pb.inc(1);
@@ -149,18 +149,18 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
         target_files.par_iter().for_each(|f| {
             match is_file_encrypted(f) {
-                Ok(true) => {}
+                Ok(true) => {},
                 Ok(false) => {
                     skipped.fetch_add(1, Ordering::Relaxed);
                     pb.inc(1);
                     return;
-                }
+                },
                 Err(e) => {
                     failed.fetch_add(1, Ordering::Relaxed);
                     errors.lock().push(e);
                     pb.inc(1);
                     return;
-                }
+                },
             }
 
             let relative_key = cache_key(f, repo.path());

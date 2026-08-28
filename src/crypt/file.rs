@@ -169,13 +169,10 @@ pub fn decrypt_file_with_cache(
     let header = *FileHeader::from_bytes(&header_bytes)?;
 
     if let Some(cache) = cache {
-        cache.sender.insert(
-            cache.key,
-            CachedEntry {
-                salt: header.salt,
-                file_id: header.file_id,
-            },
-        );
+        cache.sender.insert(cache.key, CachedEntry {
+            salt: header.salt,
+            file_id: header.file_id,
+        });
     }
 
     let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;

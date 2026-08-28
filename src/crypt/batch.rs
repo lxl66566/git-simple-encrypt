@@ -9,7 +9,7 @@ use chacha20poly1305_simd::XChaCha20Poly1305;
 use dashmap::DashMap;
 use log::debug;
 use rand::Rng;
-use rayon::prelude::*;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -106,13 +106,13 @@ where
         match decrypt_file_to_with_key_cache(src, &dst, &key_cache, master_key) {
             Ok(Some(_)) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
-            }
+            },
             Ok(None) => {
                 skipped.fetch_add(1, Ordering::Relaxed);
-            }
+            },
             Err(e) => {
                 errors.lock().push((src.clone(), e));
-            }
+            },
         }
     });
 
@@ -164,13 +164,13 @@ where
         match encrypt_file_to(src, &dst, &derived_key, batch_salt, None, zstd) {
             Ok(Some(_)) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
-            }
+            },
             Ok(None) => {
                 skipped.fetch_add(1, Ordering::Relaxed);
-            }
+            },
             Err(e) => {
                 errors.lock().push((src.clone(), e));
-            }
+            },
         }
     });
 

@@ -18,16 +18,13 @@
 //! Per-chunk nonces are derived from the file's random `File_ID` and the
 //! chunk's own plaintext content using keyed Blake3:
 //!
-//! 1. A random 16-byte `File_ID` is generated once per file and stored in the
-//!    header. This ensures that even if two different files have identical
-//!    plaintext at chunk 0, they produce different nonces and ciphertexts.
-//! 2. The Argon2-derived master key is split via `blake3::derive_key` into
-//!    `Key_ENC` (for XChaCha20-Poly1305 encryption) and `Key_MAC` (for nonce
-//!    generation).
-//! 3. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i ||
-//!    chunk_idx_le)[0..24]`
-//! 4. The 24-byte nonce is stored in plaintext at the head of each encrypted
-//!    chunk.
+//! 1. A random 16-byte `File_ID` is generated once per file and stored in the header. This ensures
+//!    that even if two different files have identical plaintext at chunk 0, they produce different
+//!    nonces and ciphertexts.
+//! 2. The Argon2-derived master key is split via `blake3::derive_key` into `Key_ENC` (for
+//!    XChaCha20-Poly1305 encryption) and `Key_MAC` (for nonce generation).
+//! 3. For each chunk `i`: `Nonce_i = Blake3_keyed(Key_MAC, File_ID || M_i || chunk_idx_le)[0..24]`
+//! 4. The 24-byte nonce is stored in plaintext at the head of each encrypted chunk.
 //!
 //! Different plaintext always produces a different nonce (within the same
 //! file). The `File_ID` ensures cross-file uniqueness. The chunk index prevents

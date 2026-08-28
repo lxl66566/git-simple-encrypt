@@ -38,7 +38,7 @@ fn create_temp_file(content: &[u8]) -> TempPath {
 
 #[test]
 fn test_header_serialization() {
-    let salt = [0xAB; SALT_LEN];
+    let salt = [0xab; SALT_LEN];
     let file_id = FileHeader::generate_file_id();
     let header = FileHeader::new(true, salt, file_id);
 
@@ -80,7 +80,7 @@ fn test_nonce_derivation_deterministic() {
     let nonce_key2 = derive_nonce(&key_mac2, &file_id, plaintext, 0);
     assert_ne!(nonce0_a, nonce_key2);
 
-    let file_id2 = [0xAAu8; FILE_ID_LEN];
+    let file_id2 = [0xaau8; FILE_ID_LEN];
     let nonce_file2 = derive_nonce(&key_mac, &file_id2, plaintext, 0);
     assert_ne!(nonce0_a, nonce_file2);
 
@@ -186,7 +186,7 @@ fn test_tamper_resistance() {
         .unwrap();
     f.read_to_end(&mut encrypted_content).unwrap();
 
-    encrypted_content[HEADER_LEN + 5] ^= 0xFF;
+    encrypted_content[HEADER_LEN + 5] ^= 0xff;
 
     f.seek(std::io::SeekFrom::Start(0)).unwrap();
     f.write_all(&encrypted_content).unwrap();
@@ -553,10 +553,10 @@ fn test_encrypt_file_to_in_place_matches_encrypt_file() {
     let (key, salt) = get_test_key_and_salt();
 
     let p1 = create_temp_file(plaintext);
-    encrypt_file(&p1, &key, &salt, Some([0xAA; FILE_ID_LEN]), None).unwrap();
+    encrypt_file(&p1, &key, &salt, Some([0xaa; FILE_ID_LEN]), None).unwrap();
 
     let p2 = create_temp_file(plaintext);
-    encrypt_file_to(&p2, &p2, &key, salt, Some([0xAA; FILE_ID_LEN]), None).unwrap();
+    encrypt_file_to(&p2, &p2, &key, salt, Some([0xaa; FILE_ID_LEN]), None).unwrap();
 
     assert_eq!(std::fs::read(&p1).unwrap(), std::fs::read(&p2).unwrap());
 }

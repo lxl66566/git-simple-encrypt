@@ -82,11 +82,11 @@ fn test_basic() -> anyhow::Result<()> {
     let temp_dir = pwd.path();
 
     // Create a new file and stage it for commit
-    std::fs::create_dir(temp_dir.join("dir"))?;
-    std::fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
-    std::fs::write(temp_dir.join("t2.txt"), "6".repeat(100))?;
-    std::fs::write(temp_dir.join("t3.txt"), "do not crypt")?;
-    std::fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
+    fs::create_dir(temp_dir.join("dir"))?;
+    fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
+    fs::write(temp_dir.join("t2.txt"), "6".repeat(100))?;
+    fs::write(temp_dir.join("t3.txt"), "do not crypt")?;
+    fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
     assert!(temp_dir.join("t1.txt").is_file());
     assert!(temp_dir.join("t2.txt").is_file());
 
@@ -102,8 +102,8 @@ fn test_basic() -> anyhow::Result<()> {
     run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     // Test
-    temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
-    dbg!(std::fs::read_to_string(temp_dir.join("git_simple_encrypt.toml")).unwrap());
+    temp_dir.read_dir()?.for_each(|x| println!("{x:?}"));
+    dbg!(fs::read_to_string(temp_dir.join("git_simple_encrypt.toml")).unwrap());
     assert!(temp_dir.join("t1.txt").is_encrypted());
     assert!(temp_dir.join("t2.txt").is_compressed());
     assert!(temp_dir.join("t3.txt").is_not_encrypted());
@@ -114,27 +114,21 @@ fn test_basic() -> anyhow::Result<()> {
     println!("{}", "After Decrypt".green());
 
     // Test decrypt result
-    temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
+    temp_dir.read_dir()?.for_each(|x| println!("{x:?}"));
     assert!(temp_dir.join("t1.txt").is_not_encrypted());
     assert!(temp_dir.join("t2.txt").is_not_encrypted());
     assert!(temp_dir.join("t3.txt").is_not_encrypted());
     assert!(temp_dir.join("dir/t4.txt").is_not_encrypted());
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t1.txt"))?,
+        fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
     );
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t2.txt"))?,
+        fs::read_to_string(temp_dir.join("t2.txt"))?,
         "6".repeat(100)
     );
-    assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t3.txt"))?,
-        "do not crypt"
-    );
-    assert_eq!(
-        std::fs::read_to_string(temp_dir.join("dir/t4.txt"))?,
-        "dir test"
-    );
+    assert_eq!(fs::read_to_string(temp_dir.join("t3.txt"))?, "do not crypt");
+    assert_eq!(fs::read_to_string(temp_dir.join("dir/t4.txt"))?, "dir test");
     Ok(())
 }
 
@@ -143,9 +137,9 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    std::fs::create_dir(temp_dir.join("dir"))?;
-    std::fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
-    std::fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
+    fs::create_dir(temp_dir.join("dir"))?;
+    fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
+    fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
 
     // Add file
     run(
@@ -161,11 +155,11 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     // Test
-    temp_dir.read_dir()?.for_each(|x| println!("{:?}", x));
+    temp_dir.read_dir()?.for_each(|x| println!("{x:?}"));
     temp_dir
         .join("dir")
         .read_dir()?
-        .for_each(|x| println!("{:?}", x));
+        .for_each(|x| println!("{x:?}"));
     assert!(temp_dir.join("t1.txt").is_encrypted());
     assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
@@ -181,29 +175,27 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     assert!(temp_dir.join("t1.txt").is_not_encrypted());
     assert!(temp_dir.join("dir/t4.txt").is_not_encrypted());
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t1.txt"))?,
+        fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
     );
-    assert_eq!(
-        std::fs::read_to_string(temp_dir.join("dir/t4.txt"))?,
-        "dir test"
-    );
+    assert_eq!(fs::read_to_string(temp_dir.join("dir/t4.txt"))?, "dir test");
 
     Ok(())
 }
 
 #[test]
-#[ignore = "This test takes too long to run, and it's not necessary to run it every time. You can run it manually if you want."]
+#[ignore = "This test takes too long to run, and it's not necessary to run it every time. You can \
+            run it manually if you want."]
 fn test_many_files() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
     let dir = temp_dir.join("dir");
-    std::fs::create_dir(&dir)?;
+    fs::create_dir(&dir)?;
     let files = (1..2000)
         .map(|i| {
-            dir.join(format!("file{}.txt", i))
-                .tap(|f| std::fs::write(f, "Hello").unwrap())
+            dir.join(format!("file{i}.txt"))
+                .tap(|f| fs::write(f, "Hello").unwrap())
         })
         .collect::<Vec<PathBuf>>();
 
@@ -224,7 +216,7 @@ fn test_many_files() -> anyhow::Result<()> {
     for _ in 1..10 {
         let file_name = files.choose(&mut rand::rng()).unwrap();
         println!("Testing file: {}", file_name.display());
-        assert_eq!(std::fs::read_to_string(file_name)?, "Hello");
+        assert_eq!(fs::read_to_string(file_name)?, "Hello");
     }
 
     Ok(())
@@ -236,11 +228,11 @@ fn test_large_file_encrypt_decrypt() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    let mut rng = rand::rngs::SmallRng::from_seed([42; 32]);
+    let mut rng = SmallRng::from_seed([42; 32]);
     let original_data: Vec<u8> = (0..FILE_SIZE).map(|_| rng.random::<u8>()).collect();
 
     let file_path = temp_dir.join("large.bin");
-    std::fs::write(&file_path, &original_data)?;
+    fs::write(&file_path, &original_data)?;
 
     run(
         SubCommand::Add {
@@ -253,7 +245,7 @@ fn test_large_file_encrypt_decrypt() -> anyhow::Result<()> {
     assert!(file_path.is_encrypted());
     run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
 
-    let decrypted_data = std::fs::read(&file_path)?;
+    let decrypted_data = fs::read(&file_path)?;
     assert_eq!(decrypted_data, original_data);
     assert!(file_path.is_not_encrypted());
 
@@ -265,9 +257,9 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    std::fs::create_dir(temp_dir.join("dir"))?;
-    std::fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
-    std::fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
+    fs::create_dir(temp_dir.join("dir"))?;
+    fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
+    fs::write(temp_dir.join("dir/t4.txt"), "dir test")?;
 
     // Add file
     run(
@@ -323,7 +315,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
 
     let file_path = temp_dir.join("secret.txt");
     let original_content = b"Hello, this is a secret message that must be authenticated!";
-    std::fs::write(&file_path, original_content)?;
+    fs::write(&file_path, original_content)?;
 
     run(
         SubCommand::Add {
@@ -334,15 +326,15 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
     assert!(file_path.is_encrypted());
-    let mut encrypted_data = std::fs::read(&file_path)?;
-    assert!(!encrypted_data.is_empty());
+    let mut encrypted_data = fs::read(&file_path)?;
+    assert_ne!(encrypted_data, [] as [u8; 0]);
 
     // 篡改：翻转中间的一个字节
     let mid = encrypted_data.len() / 2;
-    encrypted_data[mid] ^= 0xFF;
+    encrypted_data[mid] ^= 0xff;
 
     // 写回篡改后的数据
-    std::fs::write(&file_path, &encrypted_data)?;
+    fs::write(&file_path, &encrypted_data)?;
 
     // 尝试解密，应该失败（AAD 校验不通过）
     let decrypt_result = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
@@ -352,9 +344,9 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     assert!(file_path.is_encrypted());
 
     // 另一种篡改方式：截断文件末尾 10 个字节
-    let mut encrypted_data2 = std::fs::read(&file_path)?;
+    let mut encrypted_data2 = fs::read(&file_path)?;
     encrypted_data2.truncate(encrypted_data2.len().saturating_sub(10));
-    std::fs::write(&file_path, &encrypted_data2)?;
+    fs::write(&file_path, &encrypted_data2)?;
 
     let decrypt_result2 = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
     dbg!(&decrypt_result);
@@ -368,10 +360,10 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    std::fs::create_dir(temp_dir.join("dir"))?;
-    std::fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
-    std::fs::write(temp_dir.join("t2.txt"), "6".repeat(100))?;
-    std::fs::write(temp_dir.join("dir/t3.txt"), "nested file")?;
+    fs::create_dir(temp_dir.join("dir"))?;
+    fs::write(temp_dir.join("t1.txt"), "Hello, world!")?;
+    fs::write(temp_dir.join("t2.txt"), "6".repeat(100))?;
+    fs::write(temp_dir.join("dir/t3.txt"), "nested file")?;
 
     // Add files
     run(
@@ -387,31 +379,31 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     assert!(temp_dir.join("t2.txt").is_compressed());
     assert!(temp_dir.join("dir/t3.txt").is_encrypted());
 
-    let enc1_t1 = std::fs::read(temp_dir.join("t1.txt"))?;
-    let enc1_t2 = std::fs::read(temp_dir.join("t2.txt"))?;
-    let enc1_t3 = std::fs::read(temp_dir.join("dir/t3.txt"))?;
+    let enc1_t1 = fs::read(temp_dir.join("t1.txt"))?;
+    let enc1_t2 = fs::read(temp_dir.join("t2.txt"))?;
+    let enc1_t3 = fs::read(temp_dir.join("dir/t3.txt"))?;
 
     // ---- Decrypt ----
     run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t1.txt"))?,
+        fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
     );
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t2.txt"))?,
+        fs::read_to_string(temp_dir.join("t2.txt"))?,
         "6".repeat(100)
     );
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("dir/t3.txt"))?,
+        fs::read_to_string(temp_dir.join("dir/t3.txt"))?,
         "nested file"
     );
 
     // ---- Re-encrypt (should produce identical ciphertext) ----
     run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
 
-    let enc2_t1 = std::fs::read(temp_dir.join("t1.txt"))?;
-    let enc2_t2 = std::fs::read(temp_dir.join("t2.txt"))?;
-    let enc2_t3 = std::fs::read(temp_dir.join("dir/t3.txt"))?;
+    let enc2_t1 = fs::read(temp_dir.join("t1.txt"))?;
+    let enc2_t2 = fs::read(temp_dir.join("t2.txt"))?;
+    let enc2_t3 = fs::read(temp_dir.join("dir/t3.txt"))?;
 
     assert_eq!(
         enc1_t1, enc2_t1,
@@ -429,15 +421,15 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     // Verify the files still decrypt correctly
     run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t1.txt"))?,
+        fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
     );
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("t2.txt"))?,
+        fs::read_to_string(temp_dir.join("t2.txt"))?,
         "6".repeat(100)
     );
     assert_eq!(
-        std::fs::read_to_string(temp_dir.join("dir/t3.txt"))?,
+        fs::read_to_string(temp_dir.join("dir/t3.txt"))?,
         "nested file"
     );
 
@@ -449,7 +441,7 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    std::fs::write(temp_dir.join("data.txt"), "persistent data")?;
+    fs::write(temp_dir.join("data.txt"), "persistent data")?;
 
     run(
         SubCommand::Add {
@@ -460,18 +452,18 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
 
     // Encrypt and capture ciphertext from 3 decrypt→encrypt cycles
     run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
-    let reference = std::fs::read(temp_dir.join("data.txt"))?;
+    let reference = fs::read(temp_dir.join("data.txt"))?;
 
     for cycle in 1..=3 {
         run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
         assert_eq!(
-            std::fs::read_to_string(temp_dir.join("data.txt"))?,
+            fs::read_to_string(temp_dir.join("data.txt"))?,
             "persistent data",
             "Data corrupted at cycle {cycle}"
         );
 
         run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
-        let ciphertext = std::fs::read(temp_dir.join("data.txt"))?;
+        let ciphertext = fs::read(temp_dir.join("data.txt"))?;
         assert_eq!(ciphertext, reference, "Ciphertext changed at cycle {cycle}");
     }
 
@@ -483,9 +475,9 @@ fn test_check_staged() -> anyhow::Result<()> {
     let pwd = test_init();
     let temp_dir = pwd.path();
 
-    std::fs::write(temp_dir.join("encrypted.txt"), "already encrypted")?;
-    std::fs::write(temp_dir.join("unencrypted.txt"), "not yet encrypted")?;
-    std::fs::write(temp_dir.join("plain.txt"), "not in crypt list")?;
+    fs::write(temp_dir.join("encrypted.txt"), "already encrypted")?;
+    fs::write(temp_dir.join("unencrypted.txt"), "not yet encrypted")?;
+    fs::write(temp_dir.join("plain.txt"), "not in crypt list")?;
 
     run(
         SubCommand::Add {

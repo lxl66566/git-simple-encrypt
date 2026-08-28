@@ -1,6 +1,6 @@
 [package]
 name         = "git-simple-encrypt"
-version      = "3.0.2"
+version      = "3.0.3"
 edition      = "2024"
 rust-version = "1.89"
 description  = "Encrypt/decrypt files in your git repo using only one password"
@@ -21,22 +21,22 @@ path              = "src/main.rs"
 required-features = ["bin"]
 
 [dependencies]
-argon2                = "0.5.3"
+argon2                = "0.6"
 blake3                = "1"
 chacha20poly1305-simd = { version = "0.3", features = ["zeroize"] }
 clap                  = { version = "4.6", features = ["derive"], optional = true }
 colored               = { version = "3", optional = true }
-config-file2          = "0.5"
+config-file2          = "0.7"
 const-str             = "1"
-copy-metadata         = "0.3.0"
-dashmap               = "6.1.0"
-fuck-backslash        = "0.1.0"
-ignore                = { version = "0.4.25", features = ["simd-accel"] }
+copy-metadata         = "0.3"
+dashmap               = "6"
+fuck-backslash        = "0.1"
+ignore                = { version = "0.4", features = ["simd-accel"] }
 indicatif             = { version = "0.18", optional = true }
 log                   = "0.4"
 memmap2               = "0.9"
 parking_lot           = "0.12.5"
-path-absolutize       = "3"
+path-absolutize       = "4"
 pathdiff              = "0.2"
 pretty_env_logger     = { version = "0.5", optional = true }
 rand                  = "0.10"
@@ -44,17 +44,17 @@ rayon                 = "1"
 rkyv                  = "0.8"
 serde                 = { version = "1", features = ["derive"] }
 tempfile              = "3.26.0"
-thiserror             = "2.0.18"
+thiserror             = "2"
 zeroize               = "1.9"
-zstd                  = "0.13.3"
+zstd                  = "0.13"
 
 [dev-dependencies]
 anyhow    = "1.0"
 assert2   = "0.4"
 colored   = "3"
-criterion = "0.8.2"
+criterion = "0.8"
 tap       = "1"
-tempfile  = "3.26.0"
+tempfile  = "3"
 
 [features]
 default  = ["bin", "colored", "progress"]
