@@ -5,7 +5,7 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use chacha20poly1305::{XChaCha20Poly1305, aead::KeyInit};
+use chacha20poly1305_simd::XChaCha20Poly1305;
 use dashmap::DashMap;
 use log::debug;
 use rand::Rng;
@@ -34,7 +34,7 @@ pub struct BatchSummary {
 
 impl BatchSummary {
     #[must_use]
-    pub fn is_ok(&self) -> bool {
+    pub const fn is_ok(&self) -> bool {
         self.errors.is_empty()
     }
 }
@@ -72,7 +72,7 @@ fn decrypt_file_to_with_key_cache(
     let mut temp_file = NamedTempFile::new_in(dst_parent)?;
 
     let (key_enc, _) = split_keys(&derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = XChaCha20Poly1305::new(*key_enc);
     decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
 
     drop(src_file);

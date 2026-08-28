@@ -1,9 +1,6 @@
 use std::io::{Read, Write};
 
-use chacha20poly1305::{
-    XChaCha20Poly1305, XNonce,
-    aead::{AeadInPlace, KeyInit},
-};
+use chacha20poly1305_simd::XChaCha20Poly1305;
 use zeroize::Zeroizing;
 
 use crate::{
@@ -24,11 +21,12 @@ fn encrypt_chunks(
     file_id: &[u8; FILE_ID_LEN],
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
-    // Reusable plaintext/ciphertext buffer. `encrypt_in_place` overwrites the
-    // plaintext chunk with its ciphertext and appends the 16 B Poly1305 tag,
-    // so the capacity reserves CHUNK_SIZE + TAG_LEN up front — zero allocation
-    // and zero copy per chunk (the old `encrypt()` + `extend_from_slice` path
-    // allocated a fresh Vec and memcopied the whole chunk every iteration).
+    // Reusable plaintext/ciphertext buffer. `encrypt_in_place` overwrites
+    // the plaintext chunk with its ciphertext and appends the 16 B Poly1305
+    // tag, so the capacity reserves CHUNK_SIZE + TAG_LEN up front — zero
+    // allocation and zero copy per chunk (the old `encrypt()` +
+    // `extend_from_slice` path allocated a fresh Vec and memcopied the whole
+    // chunk every iteration).
     const TAG_LEN: usize = 16;
     let mut buffer: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(CHUNK_SIZE + TAG_LEN));
     let mut aad = {
@@ -57,8 +55,7 @@ fn encrypt_chunks(
 
         // Nonce is derived from the *plaintext* chunk, so compute it before
         // `encrypt_in_place` overwrites the buffer with ciphertext.
-        let nonce_bytes = derive_nonce(key_mac, file_id, &buffer[..bytes_read], chunk_idx);
-        let nonce = XNonce::from(nonce_bytes);
+        let nonce = derive_nonce(key_mac, file_id, &buffer[..bytes_read], chunk_idx);
 
         // Drop the zero-padding tail so the buffer holds exactly the plaintext,
         // then encrypt in place: buffer becomes ciphertext+tag (len += 16).
@@ -67,7 +64,7 @@ fn encrypt_chunks(
             .encrypt_in_place(&nonce, &aad, &mut *buffer)
             .map_err(|e| Error::EncryptFailed(e.to_string()))?;
 
-        writer.write_all(&nonce_bytes)?;
+        writer.write_all(&nonce)?;
         writer.write_all(&buffer)?;
 
         chunk_idx += 1;
@@ -91,8 +88,9 @@ fn decrypt_chunks(
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
     // Each encrypted chunk is plaintext (<= CHUNK_SIZE) + 16 B tag.
-    // `decrypt_in_place` overwrites it in place with the plaintext, so this
-    // single buffer is reused for every chunk — no per-chunk Vec allocation.
+    // `decrypt_in_place` overwrites it in place with the plaintext and
+    // strips the tag, so this single buffer is reused for every chunk — no
+    // per-chunk Vec allocation.
     const TAG_LEN: usize = 16;
     let ct_len = CHUNK_SIZE + TAG_LEN;
     let mut nonce_buf = [0u8; NONCE_LEN];
@@ -122,7 +120,7 @@ fn decrypt_chunks(
             bytes_read += n;
         }
 
-        if bytes_read == 0 {
+        if bytes_read < TAG_LEN {
             return Err(Error::TruncatedChunk);
         }
 
@@ -132,9 +130,8 @@ fn decrypt_chunks(
         aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
-        let nonce = XNonce::from(nonce_buf);
         cipher
-            .decrypt_in_place(&nonce, &aad, &mut *ct_buffer)
+            .decrypt_in_place(&nonce_buf, &aad, &mut *ct_buffer)
             .map_err(|e| Error::DecryptFailed(e.to_string()))?;
 
         writer.write_all(&ct_buffer)?;
@@ -185,7 +182,7 @@ pub fn encrypt_into<R: Read, W: std::io::Write>(
     header.write_to(writer)?;
 
     let (key_enc, key_mac) = split_keys(derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = XChaCha20Poly1305::new(*key_enc);
 
     if let Some(level) = zstd {
         let mut encoder = zstd::stream::read::Encoder::new(reader, i32::from(level))?;
@@ -221,7 +218,7 @@ pub fn decrypt_into<R: Read, W: std::io::Write>(
 
     let derived_key = derive_key(master_key, &header.salt)?;
     let (key_enc, _) = split_keys(&derived_key);
-    let cipher = XChaCha20Poly1305::new(key_enc.as_ref().into());
+    let cipher = XChaCha20Poly1305::new(*key_enc);
 
     decrypt_body(reader, writer, &cipher, &header)?;
     Ok(header)
