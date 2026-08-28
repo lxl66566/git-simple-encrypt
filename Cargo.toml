@@ -1,35 +1,30 @@
 [package]
-authors      = ["lxl66566 <lxl66566@gmail.com>"]
-categories   = ["cryptography"]
-description  = "Encrypt/decrypt files in your git repo using only one password"
-edition      = "2024"
-exclude      = [".github"]
-homepage     = "https://github.com/lxl66566/git-simple-encrypt"
-keywords     = ["git", "encryption"]
-license      = "MIT"
 name         = "git-simple-encrypt"
-readme       = "./README.md"
-repository   = "https://github.com/lxl66566/git-simple-encrypt"
-rust-version = "1.89"
 version      = "3.0.2"
+edition      = "2024"
+rust-version = "1.89"
+description  = "Encrypt/decrypt files in your git repo using only one password"
+readme       = "./README.md"
+homepage     = "https://github.com/lxl66566/git-simple-encrypt"
+repository   = "https://github.com/lxl66566/git-simple-encrypt"
+license      = "MIT"
+keywords     = ["encryption", "git"]
+categories   = ["cryptography"]
+exclude      = [".github"]
 
-[features]
-default = ["bin", "progress", "colored"]
-## Enable the `git-se` binary: CLI parsing (`clap`) and logger initialization
-## (`pretty_env_logger`). Disable for a leaner library-only build.
-bin = ["dep:clap", "dep:pretty_env_logger"]
-## Colored terminal output using `colored` crate. Disable for environments
-## that do not support ANSI escape codes (e.g. CI logs, GUI apps).
-colored = ["dep:colored"]
-## Use `indicatif` progress bars during repo-wide encrypt/decrypt/check. When
-## disabled, progress is reported via plain `log`/`println!` instead.
-progress = ["dep:indicatif"]
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name              = "git-se"
+path              = "src/main.rs"
+required-features = ["bin"]
 
 [dependencies]
 argon2                = "0.5.3"
 blake3                = "1"
 chacha20poly1305-simd = { version = "0.3", features = ["zeroize"] }
-clap                  = { version = "4.6", optional = true, features = ["derive"] }
+clap                  = { version = "4.6", features = ["derive"], optional = true }
 colored               = { version = "3", optional = true }
 config-file2          = "0.5"
 const-str             = "1"
@@ -61,16 +56,34 @@ criterion = "0.8.2"
 tap       = "1"
 tempfile  = "3.26.0"
 
-[[bin]]
-name              = "git-se"
-path              = "src/main.rs"
-required-features = ["bin"]
+[features]
+default  = ["bin", "colored", "progress"]
+## Enable the `git-se` binary: CLI parsing (`clap`) and logger initialization
+## (`pretty_env_logger`). Disable for a leaner library-only build.
+bin      = ["dep:clap", "dep:pretty_env_logger"]
+## Colored terminal output using `colored` crate. Disable for environments
+## that do not support ANSI escape codes (e.g. CI logs, GUI apps).
+colored  = ["dep:colored"]
+## Use `indicatif` progress bars during repo-wide encrypt/decrypt/check. When
+## disabled, progress is reported via plain `log`/`println!` instead.
+progress = ["dep:indicatif"]
 
-[lib]
-path = "src/lib.rs"
+[lints.clippy]
+all                     = { level = "warn", priority = -1 }
+cargo                   = { level = "warn", priority = -1 }
+doc_markdown            = "allow"
+missing_errors_doc      = "allow"
+missing_panics_doc      = "allow"
+multiple_crate_versions = "allow"
+pedantic                = { level = "warn", priority = -1 }
+wildcard_imports        = "allow"
+
+[lints.rust]
+unsafe_code           = "allow"
+unused_qualifications = "warn"
 
 [profile.release]
-lto       = true
 opt-level = "s"
-panic     = "abort"
 strip     = true
+lto       = true
+panic     = "abort"
