@@ -40,8 +40,9 @@ path-absolutize       = "4"
 pathdiff              = "0.2"
 pretty_env_logger     = { version = "0.5", optional = true }
 rand                  = "0.10"
-rayon                 = "1"
+rayon                 = { version = "1", optional = true }
 rkyv                  = "0.8"
+youpipe               = { version = "0.5.0", default-features = false }
 serde                 = { version = "1", features = ["derive"] }
 tempfile              = "3.26.0"
 thiserror             = "2"
@@ -67,6 +68,8 @@ colored  = ["dep:colored"]
 ## Use `indicatif` progress bars during repo-wide encrypt/decrypt/check. When
 ## disabled, progress is reported via plain `log`/`println!` instead.
 progress = ["dep:indicatif"]
+## Use rayon instead of youpipe as the parallel backend (for A/B benchmarking).
+rayon-backend = ["dep:rayon"]
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }

@@ -3,12 +3,14 @@ use std::path::{Path, PathBuf};
 use config_file2::LoadConfigFile;
 use log::{info, warn};
 use parking_lot::Mutex;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
-    utils::{Progress, is_file_encrypted, prompt_password, resolve_target_files, style::Colorize},
+    utils::{
+        Progress, is_file_encrypted, parallel, prompt_password, resolve_target_files,
+        style::Colorize,
+    },
 };
 
 pub const GIT_CONFIG_PREFIX: &str =
@@ -137,16 +139,23 @@ impl Repo {
 
         let pb = Progress::new(target_files.len(), "Check");
         let not_encrypted: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+        let errors: Mutex<Vec<Error>> = Mutex::new(Vec::new());
 
-        target_files.par_iter().try_for_each(|f| -> Result<()> {
-            if !is_file_encrypted(f)? {
-                let mut list = not_encrypted.lock();
-                let relative = pathdiff::diff_paths(f, &self.path).unwrap_or_else(|| f.clone());
-                list.push(relative);
+        parallel::for_each(&target_files, |f| {
+            match is_file_encrypted(f) {
+                Ok(false) => {
+                    let mut list = not_encrypted.lock();
+                    let relative = pathdiff::diff_paths(f, &self.path).unwrap_or_else(|| f.clone());
+                    list.push(relative);
+                },
+                Ok(true) => {},
+                Err(e) => errors.lock().push(e),
             }
             pb.inc(1);
-            Ok(())
-        })?;
+        });
+        if let Some(first) = errors.into_inner().into_iter().next() {
+            return Err(first);
+        }
 
         pb.finish_and_clear();
 

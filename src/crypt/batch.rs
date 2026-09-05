@@ -9,7 +9,6 @@ use chacha20poly1305_simd::XChaCha20Poly1305;
 use dashmap::DashMap;
 use log::debug;
 use rand::Rng;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -20,6 +19,7 @@ use crate::{
         stream::decrypt_body,
     },
     error::{Error, Result},
+    utils::parallel,
 };
 
 /// Summary of a batch encrypt/decrypt run.
@@ -100,7 +100,7 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
-    sources.par_iter().for_each(|src| {
+    parallel::for_each(&sources, |src| {
         let Some(dst) = mapper(src) else { return };
 
         match decrypt_file_to_with_key_cache(src, &dst, &key_cache, master_key) {
@@ -158,7 +158,7 @@ where
     let skipped = AtomicUsize::new(0);
     let succeeded = AtomicUsize::new(0);
 
-    sources.par_iter().for_each(|src| {
+    parallel::for_each(&sources, |src| {
         let Some(dst) = mapper(src) else { return };
 
         match encrypt_file_to(src, &dst, &derived_key, batch_salt, None, zstd) {

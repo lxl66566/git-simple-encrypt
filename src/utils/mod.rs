@@ -1,3 +1,4 @@
+pub(crate) mod parallel;
 mod progress;
 pub(crate) mod style;
 

@@ -6,7 +6,6 @@ use std::{
 use dashmap::DashMap;
 use pathdiff::diff_paths;
 use rand::prelude::Rng;
-use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 use crate::{
     crypt::{
@@ -18,7 +17,8 @@ use crate::{
     repo::Repo,
     salt_cache::{self, CacheRef},
     utils::{
-        Progress, is_file_encrypted, print_post_report, print_pre_report, resolve_target_files,
+        Progress, is_file_encrypted, parallel, print_post_report, print_pre_report,
+        resolve_target_files,
     },
 };
 
@@ -65,7 +65,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        target_files.par_iter().for_each(|f| {
+        parallel::for_each(&target_files, |f| {
             let relative_key = cache_key(f, repo.path());
             let (salt, cached_file_id) = reader
                 .get(&relative_key)
@@ -147,7 +147,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        target_files.par_iter().for_each(|f| {
+        parallel::for_each(&target_files, |f| {
             match is_file_encrypted(f) {
                 Ok(true) => {},
                 Ok(false) => {
