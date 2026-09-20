@@ -95,6 +95,9 @@ pub enum SetField {
 impl SetField {
     /// Apply the field update to the given repo's config.
     ///
+    /// `Key` only touches the git config (no toml write); the other fields
+    /// mutate the in-memory conf and persist it to the config file.
+    ///
     /// # Errors
     ///
     /// Returns an error if the underlying git command or the config file write
@@ -105,20 +108,28 @@ impl SetField {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
                 repo.set_config("key", value)?;
                 info!("Master key updated.");
+                // The key lives in git config, not in the toml; nothing to
+                // persist in the config file.
+                Ok(())
             },
             Self::EnableZstd { value } => {
                 repo.conf.use_zstd = *value;
                 info!("zstd compression enabled: {value}");
+                save_conf(repo)
             },
             Self::ZstdLevel { value } => {
                 repo.conf.zstd_level = *value;
                 info!("zstd compression level set to {value}");
+                save_conf(repo)
             },
         }
-        debug!("store config to {}", repo.conf.config_path.display());
-        repo.conf.save().map_err(|e| Error::Config(e.to_string()))?;
-        Ok(())
     }
+}
+
+/// Persist the config toml after an in-memory mutation.
+fn save_conf(repo: &Repo) -> Result<()> {
+    debug!("store config to {}", repo.conf.config_path.display());
+    repo.conf.save().map_err(|e| Error::Config(e.to_string()))
 }
 
 fn validate_zstd_level(value: &str) -> Result<u8, String> {
