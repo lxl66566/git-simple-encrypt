@@ -56,10 +56,6 @@ pub enum Error {
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgo(u8),
 
-    /// Header could not be parsed / validated.
-    #[error("corrupt header in {0}")]
-    CorruptHeader(PathBuf),
-
     /// XChaCha20-Poly1305 encryption failure.
     #[error("encryption failed: {0}")]
     EncryptFailed(String),
@@ -104,10 +100,6 @@ pub enum Error {
     /// Generic I/O error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
-
-    /// Rkyv (de)serialization failure for the salt cache.
-    #[error("salt cache serialization error: {0}")]
-    SaltCache(String),
 
     /// Anything else — an opaque error message.
     #[error("{0}")]
