@@ -380,6 +380,51 @@ fn test_empty_file_roundtrip() {
 }
 
 #[test]
+fn test_exact_chunk_size_multiple_roundtrip() {
+    // Plaintext lengths that are exact multiples of CHUNK_SIZE carry no short
+    // final chunk, so termination relies on the explicit empty trailing chunk
+    // (is_last_chunk = bytes_read < CHUNK_SIZE holds at EOF). Lock the exact
+    // ciphertext layout as a format regression:
+    // HEADER + n * (NONCE + CHUNK_SIZE + TAG) + empty chunk (NONCE + TAG).
+    for n in [1usize, 2, 3] {
+        let plaintext: Vec<u8> = (0..=255u8).cycle().take(n * CHUNK_SIZE).collect();
+        let path = create_temp_file(&plaintext);
+
+        let (key, salt) = get_test_key_and_salt();
+        let master_key = b"super_secret_password";
+
+        encrypt_file(&path, &key, &salt, None, None).unwrap();
+
+        let enc = std::fs::read(&path).unwrap();
+        assert_eq!(
+            enc.len(),
+            HEADER_LEN + n * (NONCE_LEN + CHUNK_SIZE + 16) + NONCE_LEN + 16,
+            "n = {n}: unexpected ciphertext length"
+        );
+
+        decrypt_file(&path, master_key).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), plaintext, "n = {n}");
+    }
+}
+
+#[test]
+fn test_exact_chunk_size_multiple_roundtrip_compressed() {
+    // Compressed variant, n = 1: the compressed stream length is
+    // unpredictable, so only the roundtrip is asserted (the uncompressed
+    // test above locks the chunk layout).
+    let plaintext: Vec<u8> = b"A".repeat(CHUNK_SIZE);
+    let path = create_temp_file(&plaintext);
+
+    let (key, salt) = get_test_key_and_salt();
+    let master_key = b"super_secret_password";
+
+    encrypt_file(&path, &key, &salt, None, Some(3)).unwrap();
+
+    decrypt_file(&path, master_key).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), plaintext);
+}
+
+#[test]
 fn test_wrong_password_decrypt_fails() {
     let plaintext = b"data encrypted under one password";
     let path = create_temp_file(plaintext);
