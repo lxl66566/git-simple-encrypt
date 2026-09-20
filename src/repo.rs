@@ -108,8 +108,18 @@ impl Repo {
     /// when files are not encrypted, suitable for CI usage.
     pub fn check(&self, paths: &[PathBuf], staged: bool) -> Result<()> {
         let target_files = if staged {
-            let staged_output =
-                self.run_with_output(&["diff", "--cached", "--name-only", "--diff-filter=ACMR"])?;
+            // `git -c` options must precede the subcommand. Disable path
+            // quoting: with git's default `core.quotepath = true`, non-ASCII
+            // paths are emitted as C-quoted octal escapes, which never match
+            // a real path and would silently drop the file from the check.
+            let staged_output = self.run_with_output(&[
+                "-c",
+                "core.quotepath=false",
+                "diff",
+                "--cached",
+                "--name-only",
+                "--diff-filter=ACMR",
+            ])?;
             let crypt_files = resolve_target_files(&[], &self.conf.crypt_list, self.path());
 
             staged_output

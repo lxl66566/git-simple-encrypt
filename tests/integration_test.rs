@@ -1,4 +1,6 @@
 use std::{
+    env,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -71,6 +73,45 @@ where
     fn is_compressed(&self) -> bool {
         let mut f = fs::File::open(self.as_ref()).unwrap();
         FileHeader::read_from(&mut f).unwrap().is_compressed()
+    }
+}
+
+/// Temporarily isolate git's config lookup for the current process (and thus
+/// for every git subprocess spawned by the library under test).
+///
+/// Simulates a default-config user: empty `HOME`, no XDG config and no system
+/// config, so `core.quotepath` falls back to its default `true` even when the
+/// machine's global git config sets it to `false` (which would mask BUG-1).
+/// Previous values are restored on drop, even on panic.
+struct IsolatedGitConfig(Vec<(&'static str, Option<OsString>)>);
+
+impl IsolatedGitConfig {
+    fn new(empty_home: &Path) -> Self {
+        const KEYS: [&str; 3] = ["HOME", "GIT_CONFIG_NOSYSTEM", "XDG_CONFIG_HOME"];
+        let guard = Self(KEYS.iter().map(|&k| (k, env::var_os(k))).collect());
+        // SAFETY: the temporary values only affect git subprocesses spawned
+        // by tests and are benign for them (git works fine without a global
+        // config; no commit is made in tests, so no identity is needed).
+        unsafe {
+            env::set_var("HOME", empty_home);
+            env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+            env::remove_var("XDG_CONFIG_HOME");
+        }
+        guard
+    }
+}
+
+impl Drop for IsolatedGitConfig {
+    fn drop(&mut self) {
+        // SAFETY: see `IsolatedGitConfig::new`
+        unsafe {
+            for (key, value) in self.0.drain(..) {
+                match value {
+                    Some(v) => env::set_var(key, v),
+                    None => env::remove_var(key),
+                }
+            }
+        }
     }
 }
 
@@ -558,6 +599,48 @@ fn test_check_staged() -> anyhow::Result<()> {
         .is_ok(),
         "nothing staged should pass check"
     );
+
+    Ok(())
+}
+
+/// Regression test for BUG-1: a staged plaintext file with a non-ASCII name
+/// must still be detected under git's default `core.quotepath = true`, where
+/// `git diff --name-only` emits C-quoted octal-escaped paths that would
+/// otherwise never match a real path and silently skip the check.
+#[test]
+fn test_check_staged_non_ascii_under_default_git_config() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    // Simulate a default-config user so a machine-global
+    // `core.quotepath = false` cannot mask the bug.
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    fs::write(temp_dir.join("密.txt"), "not yet encrypted")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["密.txt".into()],
+        },
+        temp_dir,
+    )?;
+    exec("git add 密.txt", temp_dir).context("git add 密.txt")?;
+
+    let result = run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: true,
+        },
+        temp_dir,
+    );
+    let err = result.expect_err("staged non-ASCII plaintext must fail check");
+    let err = err
+        .downcast_ref::<git_simple_encrypt::Error>()
+        .expect("should be a library error");
+    assert!(matches!(
+        err,
+        git_simple_encrypt::Error::FilesNotEncrypted(1, 1)
+    ));
 
     Ok(())
 }
