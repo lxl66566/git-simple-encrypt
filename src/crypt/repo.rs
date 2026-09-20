@@ -40,6 +40,17 @@ pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// Wrap a per-file failure with the operation and file path for context.
+///
+/// `AtomicPersist` is passed through unchanged: its `Display` already embeds
+/// the destination path, so re-wrapping would print the path twice.
+fn with_file_context(action: &str, file: &Path, e: Error) -> Error {
+    match e {
+        Error::AtomicPersist(..) => e,
+        e => Error::Other(format!("Failed to {action} {}: {e}", file.display())),
+    }
+}
+
 /// Encrypt given files in the repo.
 pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key()?;
@@ -91,7 +102,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
                 cached_file_id,
                 repo.conf.use_zstd.then_some(repo.conf.zstd_level),
             )
-            .map_err(|e| Error::Other(format!("Failed to encrypt {}: {e}", f.display())));
+            .map_err(|e| with_file_context("encrypt", f, e));
 
             match r {
                 Ok(Some(_)) => {},
@@ -180,7 +191,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
                 }),
                 key.as_bytes(),
             )
-            .map_err(|e| Error::Other(format!("Failed to decrypt {}: {e}", f.display())));
+            .map_err(|e| with_file_context("decrypt", f, e));
 
             if let Err(e) = r {
                 failed.fetch_add(1, Ordering::Relaxed);

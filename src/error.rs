@@ -102,6 +102,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     /// Anything else — an opaque error message.
+    /// String payload, no source chain; kept for v3 API compatibility.
     #[error("{0}")]
     Other(String),
 }
