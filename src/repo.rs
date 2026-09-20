@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use config_file2::LoadConfigFile;
 use log::{info, warn};
@@ -120,7 +123,14 @@ impl Repo {
                 "--name-only",
                 "--diff-filter=ACMR",
             ])?;
-            let crypt_files = resolve_target_files(&[], &self.conf.crypt_list, self.path());
+            // Hash set: staged files are tested against every crypt entry, so
+            // membership must be O(1) instead of Vec::contains's linear scan.
+            // Both sides use repo-root-joined paths (std Path equality is
+            // component-based, so separator style does not matter).
+            let crypt_files: HashSet<PathBuf> =
+                resolve_target_files(&[], &self.conf.crypt_list, self.path())
+                    .into_iter()
+                    .collect();
 
             staged_output
                 .lines()
