@@ -1,4 +1,4 @@
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 
 use chacha20poly1305_simd::XChaCha20Poly1305;
 use zeroize::Zeroizing;
@@ -10,6 +10,28 @@ use crate::{
     },
     error::{Error, Result},
 };
+
+/// Write the full byte sequence of `bufs` in order via vectored writes,
+/// retrying across short writes. Stable stand-in for the (still unstable)
+/// `Write::write_all_vectored`.
+fn write_all_vectored(writer: &mut dyn Write, bufs: &mut [IoSlice<'_>]) -> Result<()> {
+    // Reborrow as a shrinkable view: `advance_slices` drops fully-written
+    // prefix slices, so the loop ends once every byte is written.
+    let mut rest = &mut *bufs;
+    while !rest.is_empty() {
+        match writer.write_vectored(rest)? {
+            0 => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                )
+                .into())
+            },
+            n => IoSlice::advance_slices(&mut rest, n),
+        }
+    }
+    Ok(())
+}
 
 /// Streaming encryption loop: read plaintext chunks from `reader`, encrypt
 /// each with the cipher, and write `[NONCE | CIPHERTEXT | TAG]` to `writer`.
@@ -64,8 +86,10 @@ fn encrypt_chunks(
             .encrypt_in_place(&nonce, &aad, &mut *buffer)
             .map_err(|e| Error::EncryptFailed(e.to_string()))?;
 
-        writer.write_all(&nonce)?;
-        writer.write_all(&buffer)?;
+        // Single vectored write per chunk: `[NONCE | CIPHERTEXT+TAG]` reaches
+        // the writer in one call instead of two syscalls on unbuffered `File`s.
+        let mut bufs = [IoSlice::new(&nonce), IoSlice::new(&buffer)];
+        write_all_vectored(writer, &mut bufs)?;
 
         chunk_idx += 1;
 
