@@ -93,7 +93,7 @@ impl Config {
         // Entries are stored as repo-relative `/`-separated lossy strings;
         // compare in exactly that form so a path never enters the list twice
         // (duplicates would inflate the skip count and dirty the config).
-        if self.crypt_list.iter().any(|x| *x == path_str) {
+        if self.crypt_list.contains(&path_str) {
             debug!("already in crypt list, skipping: {path_str}");
             return Ok(());
         }
