@@ -4,7 +4,7 @@ pub(crate) mod style;
 
 use std::{
     fs,
-    io::{ErrorKind, Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -15,7 +15,7 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 use crate::{
-    crypt::{HEADER_LEN, MAGIC, is_encrypted_version},
+    crypt::{is_encrypted_header, read_header_bytes},
     error::{Error, Result},
     utils::style::Colorize,
 };
@@ -181,14 +181,9 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
 /// Returns an error if the file cannot be read (IO error).
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
     let mut file = fs::File::open(path)?;
-    let mut header_bytes = [0u8; HEADER_LEN];
-    // Same read_exact pre-check as the encrypt/decrypt paths; a file shorter
-    // than the header cannot be encrypted.
-    match file.read_exact(&mut header_bytes) {
-        Ok(()) => Ok(&header_bytes[0..5] == MAGIC && is_encrypted_version(header_bytes[5])),
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
-        Err(e) => Err(e.into()),
-    }
+    // Shared sniff helper: a file shorter than the header cannot be
+    // encrypted (Ok(None)); real IO errors propagate.
+    Ok(read_header_bytes(&mut file)?.is_some_and(|bytes| is_encrypted_header(&bytes)))
 }
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the

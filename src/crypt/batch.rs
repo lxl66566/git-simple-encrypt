@@ -1,22 +1,16 @@
 use std::{
-    fs,
-    io::Read,
     path::{Path, PathBuf},
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use chacha20poly1305_simd::XChaCha20Poly1305;
 use dashmap::DashMap;
-use log::debug;
 use rand::Rng;
-use tempfile::NamedTempFile;
 
 use crate::{
     crypt::{
-        file::{encrypt_file_to, persist_temp_file},
-        header::{FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
-        key::{KeyCache, get_or_derive_key, split_key_enc},
-        stream::decrypt_body,
+        file::{decrypt_file_impl, encrypt_file_to},
+        header::SALT_LEN,
+        key::{KeyCache, KeyDerivation},
     },
     error::{Error, Result},
     utils::parallel,
@@ -39,49 +33,8 @@ impl BatchSummary {
     }
 }
 
-/// Internal: decrypt `src` → `dst` using a shared Argon2 key cache.
-#[allow(dead_code)]
-fn decrypt_file_to_with_key_cache(
-    src: &Path,
-    dst: &Path,
-    key_cache: &KeyCache,
-    master_key: &[u8],
-) -> Result<Option<FileHeader>> {
-    let mut src_file = fs::File::open(src)?;
-
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if src_file.read_exact(&mut header_bytes).is_err() {
-        debug!(
-            "File too small to be encrypted, skipping: {}",
-            src.display()
-        );
-        return Ok(None);
-    }
-    if &header_bytes[0..5] != MAGIC || !is_encrypted_version(header_bytes[5]) {
-        debug!("File not encrypted (no magic), skipping: {}", src.display());
-        return Ok(None);
-    }
-
-    debug!("Decrypting {} → {}", src.display(), dst.display());
-
-    let header = *FileHeader::from_bytes(&header_bytes)?;
-    let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;
-
-    let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(dst_parent)?;
-    let mut temp_file = NamedTempFile::new_in(dst_parent)?;
-
-    let key_enc = split_key_enc(&derived_key);
-    let cipher = XChaCha20Poly1305::new(*key_enc);
-    decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
-
-    drop(src_file);
-    persist_temp_file(temp_file, dst, Some(src))?;
-
-    Ok(Some(header))
-}
-
 /// Decrypt multiple files in parallel, each to a caller-determined destination.
+// Test-only until the module goes public (follow-up commit).
 #[allow(dead_code, clippy::unnecessary_wraps)]
 pub fn decrypt_files_to<I, P, F>(sources: I, master_key: &[u8], mapper: F) -> Result<BatchSummary>
 where
@@ -101,9 +54,20 @@ where
     let succeeded = AtomicUsize::new(0);
 
     parallel::for_each(&sources, |src| {
-        let Some(dst) = mapper(src) else { return };
+        // A mapper returning None excludes the file from the batch (counted
+        // as skipped so total == succeeded + skipped + failed).
+        let Some(dst) = mapper(src) else {
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return;
+        };
 
-        match decrypt_file_to_with_key_cache(src, &dst, &key_cache, master_key) {
+        match decrypt_file_impl(
+            src,
+            &dst,
+            master_key,
+            KeyDerivation::Shared(&key_cache),
+            None,
+        ) {
             Ok(Some(_)) => {
                 succeeded.fetch_add(1, Ordering::Relaxed);
             },

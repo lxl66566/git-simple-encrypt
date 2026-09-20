@@ -1,6 +1,6 @@
 use std::{
     fs,
-    io::{Read, Seek, SeekFrom},
+    io::{Seek, SeekFrom},
     path::Path,
 };
 
@@ -10,8 +10,8 @@ use tempfile::NamedTempFile;
 
 use crate::{
     crypt::{
-        header::{FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
-        key::{KeyCache, get_or_derive_key, split_key_enc},
+        header::{FILE_ID_LEN, FileHeader, SALT_LEN, is_encrypted_header, read_header_bytes},
+        key::{KeyCache, KeyDerivation, split_key_enc},
         stream::{decrypt_body, encrypt_into},
     },
     error::{Error, Result},
@@ -46,10 +46,8 @@ pub fn encrypt_file_to(
 ) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if src_file.read_exact(&mut header_bytes).is_ok()
-        && &header_bytes[0..5] == MAGIC
-        && is_encrypted_version(header_bytes[5])
+    if let Some(bytes) = read_header_bytes(&mut src_file)?
+        && is_encrypted_header(&bytes)
     {
         warn!("Source file already encrypted, skipping: {}", src.display());
         return Ok(None);
@@ -85,27 +83,53 @@ pub fn encrypt_file_to(
     Ok(Some(header))
 }
 
-/// Decrypt `src` into `dst`.
-pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Option<FileHeader>> {
+/// Decrypt `src` into `dst` — the single implementation behind every
+/// decrypt entry point (public wrappers, batch, and repo paths).
+///
+/// Caller-specific differences are parameterized:
+/// - `derivation`: fresh Argon2 per call vs deduplicated via a shared [`KeyCache`];
+/// - `salt_cache`: optionally record `(salt, file_id)` for deterministic re-encryption.
+///
+/// Returns `Ok(None)` when `src` is not encrypted by this tool (too short,
+/// foreign magic, or unsupported version), so callers can tell skip from
+/// failure without a separate header pre-read.
+pub(super) fn decrypt_file_impl(
+    src: &Path,
+    dst: &Path,
+    master_key: &[u8],
+    derivation: KeyDerivation<'_>,
+    salt_cache: Option<CacheRef<'_>>,
+) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if src_file.read_exact(&mut header_bytes).is_err() {
+    let Some(header_bytes) = read_header_bytes(&mut src_file)? else {
         debug!(
             "File too small to be encrypted, skipping: {}",
             src.display()
         );
         return Ok(None);
-    }
-    if &header_bytes[0..5] != MAGIC || !is_encrypted_version(header_bytes[5]) {
+    };
+    if !is_encrypted_header(&header_bytes) {
         debug!("File not encrypted (no magic), skipping: {}", src.display());
         return Ok(None);
     }
 
     debug!("Decrypting {} → {}", src.display(), dst.display());
-
     let header = *FileHeader::from_bytes(&header_bytes)?;
-    let derived_key = super::key::derive_key(master_key, &header.salt)?;
+
+    // Record (salt, file_id) before decryption: even if the body fails to
+    // decrypt, the entry matches the on-disk header, so persisting early is
+    // harmless and preserves partial progress.
+    if let Some(cache) = salt_cache {
+        cache.sender.insert(cache.key, CachedEntry {
+            salt: header.salt,
+            file_id: header.file_id,
+        });
+    }
+
+    let derived_key = derivation.derive(master_key, &header.salt)?;
+    let key_enc = split_key_enc(&derived_key);
+    let cipher = XChaCha20Poly1305::new(*key_enc);
 
     let dst_parent = dst.parent().unwrap_or_else(|| Path::new("."));
     // See encrypt_file_to: skip mkdir when src and dst share a parent.
@@ -115,14 +139,17 @@ pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Opti
     }
     let mut temp_file = NamedTempFile::new_in(dst_parent)?;
 
-    let key_enc = split_key_enc(&derived_key);
-    let cipher = XChaCha20Poly1305::new(*key_enc);
     decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
 
     drop(src_file);
     persist_temp_file(temp_file, dst, Some(src))?;
 
     Ok(Some(header))
+}
+
+/// Decrypt `src` into `dst`.
+pub fn decrypt_file_to(src: &Path, dst: &Path, master_key: &[u8]) -> Result<Option<FileHeader>> {
+    decrypt_file_impl(src, dst, master_key, KeyDerivation::Direct, None)
 }
 
 /// Encrypt a single file **in place**.
@@ -141,53 +168,20 @@ pub fn decrypt_file(path: &Path, master_key: &[u8]) -> Result<()> {
     decrypt_file_to(path, path, master_key).map(|_| ())
 }
 
-/// Decrypt a single file with a thread-safe Argon2 key cache and optional
-/// salt/`file_id` cache.
+/// Decrypt a single file **in place** with a thread-safe Argon2 key cache and
+/// optional salt/`file_id` cache.
 pub fn decrypt_file_with_cache(
     path: &Path,
     key_cache: &KeyCache,
     cache: Option<CacheRef<'_>>,
     master_key: &[u8],
 ) -> Result<()> {
-    let mut file = fs::File::open(path)?;
-
-    let mut header_bytes = [0u8; HEADER_LEN];
-    if file.read_exact(&mut header_bytes).is_err() {
-        debug!(
-            "File too small to be encrypted, skipping: {}",
-            path.display()
-        );
-        return Ok(());
-    }
-    if &header_bytes[0..5] != MAGIC || !is_encrypted_version(header_bytes[5]) {
-        debug!(
-            "File not encrypted (no magic), skipping: {}",
-            path.display()
-        );
-        return Ok(());
-    }
-
-    debug!("Decrypting: {}", path.display());
-    let header = *FileHeader::from_bytes(&header_bytes)?;
-
-    if let Some(cache) = cache {
-        cache.sender.insert(cache.key, CachedEntry {
-            salt: header.salt,
-            file_id: header.file_id,
-        });
-    }
-
-    let derived_key = get_or_derive_key(key_cache, master_key, &header.salt)?;
-
-    let key_enc = split_key_enc(&derived_key);
-    let cipher = XChaCha20Poly1305::new(*key_enc);
-    let parent_dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut temp_file = NamedTempFile::new_in(parent_dir)?;
-
-    decrypt_body(&mut file, &mut temp_file, &cipher, &header)?;
-    drop(file);
-
-    persist_temp_file(temp_file, path, Some(path))?;
-
-    Ok(())
+    decrypt_file_impl(
+        path,
+        path,
+        master_key,
+        KeyDerivation::Shared(key_cache),
+        cache,
+    )
+    .map(|_| ())
 }

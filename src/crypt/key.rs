@@ -51,6 +51,27 @@ pub(super) fn derive_nonce(
 pub(super) type KeyCache =
     DashMap<[u8; SALT_LEN], Arc<OnceLock<Result<Zeroizing<[u8; 32]>, String>>>>;
 
+/// How a decrypt call obtains the Argon2-derived key for a file's salt.
+pub(super) enum KeyDerivation<'a> {
+    /// Run Argon2 on every call (single-file public entry points).
+    Direct,
+    /// Deduplicate Argon2 across files that share a salt (batch/repo paths).
+    Shared(&'a KeyCache),
+}
+
+impl KeyDerivation<'_> {
+    pub(super) fn derive(
+        self,
+        master_key: &[u8],
+        salt: &[u8; SALT_LEN],
+    ) -> Result<Zeroizing<[u8; 32]>> {
+        match self {
+            Self::Direct => derive_key(master_key, salt),
+            Self::Shared(cache) => get_or_derive_key(cache, master_key, salt),
+        }
+    }
+}
+
 pub(super) fn get_or_derive_key(
     key_cache: &KeyCache,
     master_key: &[u8],

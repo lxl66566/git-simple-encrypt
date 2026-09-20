@@ -11,17 +11,14 @@ use rand::prelude::Rng;
 
 use crate::{
     crypt::{
-        file::{decrypt_file_with_cache, encrypt_file},
+        file::{decrypt_file_impl, encrypt_file},
         header::SALT_LEN,
-        key::{KeyCache, get_or_derive_key},
+        key::{KeyCache, KeyDerivation, get_or_derive_key},
     },
     error::{Error, Result},
     repo::Repo,
     salt_cache::{self, CacheRef},
-    utils::{
-        Progress, is_file_encrypted, parallel, print_post_report, print_pre_report,
-        resolve_target_files,
-    },
+    utils::{Progress, parallel, print_post_report, print_pre_report, resolve_target_files},
 };
 
 /// Compute a repo-relative cache key from a file path.
@@ -166,37 +163,31 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let result = {
         let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
         parallel::for_each(&target_files, |f| {
-            match is_file_encrypted(f) {
-                Ok(true) => {},
-                Ok(false) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                    pb.inc(1);
-                    return;
-                },
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                    pb.inc(1);
-                    return;
-                },
-            }
-
+            // decrypt_file_impl sniffs the header itself and reports
+            // non-encrypted files as Ok(None) — no separate pre-read pass.
             let relative_key = cache_key(f, repo.path());
 
-            let r = decrypt_file_with_cache(
+            let r = decrypt_file_impl(
                 f,
-                &key_cache,
+                f,
+                key.as_bytes(),
+                KeyDerivation::Shared(&key_cache),
                 Some(CacheRef {
                     sender: &sender,
                     key: &relative_key,
                 }),
-                key.as_bytes(),
             )
             .map_err(|e| with_file_context("decrypt", f, e));
 
-            if let Err(e) = r {
-                failed.fetch_add(1, Ordering::Relaxed);
-                errors.lock().push(e);
+            match r {
+                Ok(Some(_)) => {},
+                Ok(None) => {
+                    skipped.fetch_add(1, Ordering::Relaxed);
+                },
+                Err(e) => {
+                    failed.fetch_add(1, Ordering::Relaxed);
+                    errors.lock().push(e);
+                },
             }
 
             pb.inc(1);

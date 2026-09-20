@@ -57,6 +57,9 @@ pub use header::{
     CHUNK_SIZE, FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION,
     is_encrypted_version,
 };
+// Sniff helpers shared with `utils::is_file_encrypted`; crate-internal to
+// avoid growing the public API.
+pub(crate) use header::{is_encrypted_header, read_header_bytes};
 pub use key::derive_key;
 pub use repo::{cache_key, decrypt_repo, encrypt_repo};
 pub use stream::{decrypt_into, encrypt_into};

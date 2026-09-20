@@ -32,6 +32,30 @@ pub const fn is_encrypted_version(v: u8) -> bool {
     v == VERSION
 }
 
+/// Read exactly [`HEADER_LEN`] raw bytes from `reader` for sniffing.
+///
+/// `Ok(None)` means the stream ended before the header finished — too short
+/// to be an encrypted file. Other IO errors propagate. Shared by the
+/// encrypt/decrypt pre-reads and `utils::is_file_encrypted`.
+pub fn read_header_bytes<R: std::io::Read>(
+    reader: &mut R,
+) -> crate::error::Result<Option<[u8; HEADER_LEN]>> {
+    let mut buf = [0u8; HEADER_LEN];
+    match reader.read_exact(&mut buf) {
+        Ok(()) => Ok(Some(buf)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Sniff-level check on raw header bytes: do they carry our magic and a
+/// version we can decrypt? (Full validation, including `enc_algo`, happens in
+/// [`FileHeader::from_bytes`].)
+#[must_use]
+pub fn is_encrypted_header(bytes: &[u8; HEADER_LEN]) -> bool {
+    &bytes[0..5] == MAGIC && is_encrypted_version(bytes[5])
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileHeader {
