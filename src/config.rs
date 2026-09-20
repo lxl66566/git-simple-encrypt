@@ -89,12 +89,16 @@ impl Config {
         if path_relative_to_repo.is_absolute() {
             return Err(Error::PathNotRelative(path_relative_to_repo));
         }
-        info!(
-            "Add to encrypt list: {}",
-            path_relative_to_repo.display().to_string().green()
-        );
-        self.crypt_list
-            .push(path_relative_to_repo.to_string_lossy().into_owned());
+        let path_str = path_relative_to_repo.to_string_lossy().into_owned();
+        // Entries are stored as repo-relative `/`-separated lossy strings;
+        // compare in exactly that form so a path never enters the list twice
+        // (duplicates would inflate the skip count and dirty the config).
+        if self.crypt_list.iter().any(|x| *x == path_str) {
+            debug!("already in crypt list, skipping: {path_str}");
+            return Ok(());
+        }
+        info!("Add to encrypt list: {}", path_str.green());
+        self.crypt_list.push(path_str);
         Ok(())
     }
 
@@ -138,6 +142,28 @@ mod tests {
             "needs to be dir: {}",
             config.crypt_list.first().unwrap()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_add_duplicate_path_to_crypt_list() -> Result<()> {
+        let temp_dir = TempDir::new()?.keep();
+        let file_path = temp_dir.join("test.toml");
+        let mut config = Config::load_or_default(file_path)
+            .map_err(|e| Error::Config(e.to_string()))?
+            .with_repo_path(&*temp_dir);
+
+        fs::create_dir(temp_dir.join("testdir"))?;
+        for _ in 0..2 {
+            config.add_one_path_to_crypt_list(
+                temp_dir
+                    .join("testdir")
+                    .as_os_str()
+                    .to_string_lossy()
+                    .as_ref(),
+            )?;
+        }
+        assert_eq!(config.crypt_list, vec!["testdir".to_string()]);
         Ok(())
     }
 }
