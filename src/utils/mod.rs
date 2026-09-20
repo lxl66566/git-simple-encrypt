@@ -113,7 +113,14 @@ pub fn list_files(
     });
 
     drop(tx);
-    rx.into_iter().collect()
+    let mut files: Vec<PathBuf> = rx.into_iter().collect();
+    // Parallel walking yields a non-deterministic order and may emit the same
+    // file twice when roots overlap (e.g. both `dir` and `dir/file.txt`).
+    // Sorting + dedup keeps the output stable; cost is negligible (ms-level
+    // even for tens of thousands of entries).
+    files.sort();
+    files.dedup();
+    files
 }
 
 // --- Reporting & Progress Helpers ---
@@ -202,6 +209,7 @@ pub fn resolve_target_files(
 mod tests {
     use assert2::assert;
     use path_absolutize::Absolutize as _;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -245,5 +253,20 @@ mod tests {
             list_files(["lib.rs"], Path::new("src").absolutize().unwrap()),
             vec![Path::new("src/lib.rs").absolutize().unwrap()]
         );
+    }
+
+    #[test]
+    fn test_list_files_overlapping_roots_dedup_and_sorted() {
+        let temp_dir = TempDir::new().unwrap().keep();
+        let dir = temp_dir.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(dir.join("b.txt"), "b").unwrap();
+
+        // Overlapping roots: `dir` (walked recursively, covers dir/a.txt)
+        // plus `dir/a.txt` itself. Constructed directly because the `add`
+        // command now deduplicates identical paths at the config level.
+        let res = list_files(["dir", "dir/a.txt"], &temp_dir);
+        assert_eq!(res, vec![dir.join("a.txt"), dir.join("b.txt")]);
     }
 }
