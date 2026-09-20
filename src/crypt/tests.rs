@@ -588,8 +588,7 @@ fn test_decrypt_files_to_batch() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let summary = decrypt_files_to(&sources, master_key, |src: &Path| {
         Some(out_dir.path().join(src.file_name().unwrap()))
-    })
-    .unwrap();
+    });
 
     assert_eq!(summary.total, 3);
     assert_eq!(summary.succeeded, 3);
@@ -616,8 +615,7 @@ fn test_decrypt_files_to_skips_non_encrypted() {
     let out_dir = tempfile::TempDir::new().unwrap();
     let summary = decrypt_files_to(&sources, b"any", |src: &Path| {
         Some(out_dir.path().join(src.file_name().unwrap()))
-    })
-    .unwrap();
+    });
 
     assert_eq!(summary.total, 3);
     assert_eq!(summary.succeeded, 0);
@@ -651,8 +649,7 @@ fn test_decrypt_files_to_mapper_skip() {
         } else {
             Some(out_dir.path().join(src.file_name().unwrap()))
         }
-    })
-    .unwrap();
+    });
 
     assert_eq!(summary.succeeded, 2);
     assert!(summary.is_ok());

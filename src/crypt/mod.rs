@@ -8,7 +8,7 @@
 //! | [`key`] | Key derivation (Argon2, key splitting, nonce derivation) + key cache |
 //! | [`stream`] | Streaming `Read → Write` encrypt/decrypt primitives |
 //! | [`file`] | File-to-file encrypt/decrypt with atomic writes & metadata preservation |
-//! | [`batch`] | Parallel batch operations with shared key cache |
+//! | [`batch`] | Parallel batch operations with shared key cache; also hosts the tallying engine reused by `encrypt_repo`/`decrypt_repo` |
 //! | [`repo`] | Repository-level encrypt/decrypt with salt cache integration |
 //!
 //! See the module-level docs of each submodule for details.
@@ -42,7 +42,7 @@
 //!
 //! Each encrypted chunk layout: `[NONCE (24B)] [CIPHERTEXT] [TAG (16B)]`
 
-mod batch;
+pub mod batch;
 mod file;
 mod header;
 mod key;

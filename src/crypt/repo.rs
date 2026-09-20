@@ -1,7 +1,4 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
 use fuck_backslash::FuckBackslash;
@@ -11,6 +8,7 @@ use rand::prelude::Rng;
 
 use crate::{
     crypt::{
+        batch::{BatchSummary, run_batch},
         file::{decrypt_file_impl, encrypt_file},
         header::SALT_LEN,
         key::{KeyCache, KeyDerivation, get_or_derive_key},
@@ -18,7 +16,7 @@ use crate::{
     error::{Error, Result},
     repo::Repo,
     salt_cache::{self, CacheRef},
-    utils::{Progress, parallel, print_post_report, print_pre_report, resolve_target_files},
+    utils::{Progress, print_post_report, print_pre_report, resolve_target_files},
 };
 
 /// Compute a repo-relative cache key from a file path.
@@ -49,6 +47,22 @@ fn with_file_context(action: &str, file: &Path, e: Error) -> Error {
     }
 }
 
+/// Report a completed run: post-report line, every per-file failure logged
+/// (messages already embed the file path), and the first failure surfaced as
+/// the return value.
+fn report_summary(action: &str, summary: BatchSummary) -> Result<()> {
+    print_post_report(action, summary.total, summary.skipped, summary.failed);
+
+    for (_, e) in &summary.errors {
+        warn!("{e}");
+    }
+    if let Some((_, first)) = summary.errors.into_iter().next() {
+        return Err(first);
+    }
+
+    Ok(())
+}
+
 /// Encrypt given files in the repo.
 pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let key = repo.get_key()?;
@@ -70,73 +84,31 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     rand::rng().fill_bytes(&mut batch_salt);
 
     let pb = Progress::new(target_files.len(), "Encrypt");
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
 
-    let result = {
-        let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        parallel::for_each(&target_files, |f| {
-            let relative_key = cache_key(f, repo.path());
-            let (salt, cached_file_id) = reader
-                .get(&relative_key)
-                .map_or((batch_salt, None), |entry| {
-                    (entry.salt, Some(entry.file_id))
-                });
+    let summary = run_batch(&target_files, Some(&pb), |f| {
+        let relative_key = cache_key(f, repo.path());
+        let (salt, cached_file_id) = reader
+            .get(&relative_key)
+            .map_or((batch_salt, None), |entry| {
+                (entry.salt, Some(entry.file_id))
+            });
 
-            let derived_key = match get_or_derive_key(&key_cache, key.as_bytes(), &salt) {
-                Ok(k) => k,
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                    pb.inc(1);
-                    return;
-                },
-            };
-
-            let r = encrypt_file(
-                f,
-                &derived_key,
-                &salt,
-                cached_file_id,
-                repo.conf.use_zstd.then_some(repo.conf.zstd_level),
-            )
-            .map_err(|e| with_file_context("encrypt", f, e));
-
-            match r {
-                Ok(Some(_)) => {},
-                Ok(None) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                },
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                },
-            }
-
-            pb.inc(1);
-        });
-        errors.into_inner()
-    };
+        get_or_derive_key(&key_cache, key.as_bytes(), &salt)
+            .and_then(|derived_key| {
+                encrypt_file(
+                    f,
+                    &derived_key,
+                    &salt,
+                    cached_file_id,
+                    repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+                )
+            })
+            .map_err(|e| with_file_context("encrypt", f, e))
+    });
 
     pb.finish_and_clear();
 
-    print_post_report(
-        "Encrypt",
-        target_files.len(),
-        skipped.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed),
-    );
-
-    // Log every per-file failure (messages already embed the file path), then
-    // surface the first one as the return value.
-    for e in &result {
-        warn!("{e}");
-    }
-    if let Some(first) = result.into_iter().next() {
-        return Err(first);
-    }
-
-    Ok(())
+    report_summary("Encrypt", summary)
 }
 
 /// Decrypt given files in the repo.
@@ -157,64 +129,27 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     let (sender, saver) = salt_cache::create_writer(repo.path());
 
     let pb = Progress::new(target_files.len(), "Decrypt");
-    let skipped = AtomicUsize::new(0);
-    let failed = AtomicUsize::new(0);
 
-    let result = {
-        let errors: parking_lot::Mutex<Vec<Error>> = parking_lot::Mutex::new(Vec::new());
-        parallel::for_each(&target_files, |f| {
-            // decrypt_file_impl sniffs the header itself and reports
-            // non-encrypted files as Ok(None) — no separate pre-read pass.
-            let relative_key = cache_key(f, repo.path());
+    let summary = run_batch(&target_files, Some(&pb), |f| {
+        let relative_key = cache_key(f, repo.path());
 
-            let r = decrypt_file_impl(
-                f,
-                f,
-                key.as_bytes(),
-                KeyDerivation::Shared(&key_cache),
-                Some(CacheRef {
-                    sender: &sender,
-                    key: &relative_key,
-                }),
-            )
-            .map_err(|e| with_file_context("decrypt", f, e));
-
-            match r {
-                Ok(Some(_)) => {},
-                Ok(None) => {
-                    skipped.fetch_add(1, Ordering::Relaxed);
-                },
-                Err(e) => {
-                    failed.fetch_add(1, Ordering::Relaxed);
-                    errors.lock().push(e);
-                },
-            }
-
-            pb.inc(1);
-        });
-        errors.into_inner()
-    };
+        decrypt_file_impl(
+            f,
+            f,
+            key.as_bytes(),
+            KeyDerivation::Shared(&key_cache),
+            Some(CacheRef {
+                sender: &sender,
+                key: &relative_key,
+            }),
+        )
+        .map_err(|e| with_file_context("decrypt", f, e))
+    });
 
     drop(sender);
     saver.save();
 
     pb.finish_and_clear();
 
-    print_post_report(
-        "Decrypt",
-        target_files.len(),
-        skipped.load(Ordering::Relaxed),
-        failed.load(Ordering::Relaxed),
-    );
-
-    // Log every per-file failure (messages already embed the file path), then
-    // surface the first one as the return value.
-    for e in &result {
-        warn!("{e}");
-    }
-    if let Some(first) = result.into_iter().next() {
-        return Err(first);
-    }
-
-    Ok(())
+    report_summary("Decrypt", summary)
 }
