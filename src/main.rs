@@ -2,9 +2,15 @@ use clap::Parser;
 use git_simple_encrypt::{Cli, run};
 use log::LevelFilter;
 
-fn main() -> Result<(), git_simple_encrypt::Error> {
+fn main() {
     log_init();
-    run(Cli::parse())
+    // Report failures through Display (user-facing message) instead of the
+    // derived Debug output std prints for an `Err` returned from main. The
+    // exit code stays 1, matching the `Result`-returning form.
+    if let Err(e) = run(Cli::parse()) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
 }
 
 #[inline]
