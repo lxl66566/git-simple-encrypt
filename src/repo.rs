@@ -55,6 +55,21 @@ impl Repo {
         {
             repo_path.pop();
         }
+        // A usable work tree must contain a `.git` entry: either a directory
+        // (normal clone) or a `gitdir: <path>` pointer file (linked worktree /
+        // submodule). Rejecting other directories up front avoids obscure git
+        // errors from `get_key()`, and more importantly the salt cache
+        // silently failing to write under `.git/` (best-effort, warn only),
+        // which would break deterministic re-encryption unnoticed.
+        // No dedicated Error variant for v3 compatibility (the enum is not
+        // `#[non_exhaustive]`); the message rides in `Error::Other`.
+        let dot_git = repo_path.join(".git");
+        if !dot_git.is_dir() && !dot_git.is_file() {
+            return Err(Error::Other(format!(
+                "not a git repository: {}",
+                repo_path.display()
+            )));
+        }
         info!("Open repo: {}", repo_path.display());
         let config_file_path = repo_path.join(CONFIG_FILE_NAME);
         if !config_file_path.exists() {
@@ -321,6 +336,35 @@ mod tests {
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
         let repo = Repo::open(Path::new("./.git").absolutize()?)?;
         assert_eq!(repo.path().file_name().unwrap(), "git-simple-encrypt");
+        Ok(())
+    }
+
+    #[test]
+    fn test_repo_open_rejects_non_git_directory() {
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+
+        let err = Repo::open(&repo_path).unwrap_err().to_string();
+        assert!(err.contains("not a git repository"), "got: {err}");
+    }
+
+    #[test]
+    fn test_repo_open_accepts_worktree_gitdir_pointer() -> Result<()> {
+        // A linked worktree's `.git` is a file pointing at the main gitdir;
+        // only its form (file vs directory) is checked here, validating the
+        // target is git's own job.
+        let dir = TempDir::new().unwrap();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        std::fs::write(
+            repo_path.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                repo_path.join("main").join(".git").display()
+            ),
+        )?;
+
+        let repo = Repo::open(&repo_path)?;
+        assert_eq!(repo.path(), repo_path.as_path());
         Ok(())
     }
 
