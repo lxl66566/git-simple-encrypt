@@ -55,6 +55,13 @@ git-se i                    # 安装 pre commit hook，在每次提交前检查�
 - 迁移须知：
   - 所有的 major version 之间加解密算法都不兼容。请先解密仓库的所有文件，对于 v1.x -> v2.x 还需要去除 `git_simple_encrypt.toml` 列表里的所有 wildcard 格式（v2.x+ 不支持 wildcard），然后再升级版本。
 
+## 安全说明
+
+- 密码存储：通过 `git-se p` 或 `git-se set key` 设置的密码（派生密钥前的原始密码）以明文存储在仓库本地 git 配置中（`.git/config` 的 `git-simple-encrypt.key` 项），任何能读取仓库目录的本地进程、同步盘与备份均可获取。这是「单密码」设计的固有代价，请勿将仓库目录置于不受信任的同步或备份位置。
+- 密钥派生：Argon2 使用固定默认参数（Argon2id，m=19MiB，t=2，p=1），当前不可调整，计划在下个 major 版本暴露为配置项。
+- AEAD 实现：XChaCha20-Poly1305 由 `chacha20poly1305-simd` crate 提供（出于其显式 SIMD 的性能动机），该 crate 不在 RustCrypto 审计系列内，版本已在 `Cargo.toml` 与 `Cargo.lock` 中锁定。
+- 解压：解密后的数据解压写盘无磁盘填充上限（仅受 zstd window 限制），与通用解压工具一致；仅在已知密码场景下才会到达解压路径，属低风险披露。
+
 ---
 
 ## 原理

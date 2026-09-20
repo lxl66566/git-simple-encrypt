@@ -55,6 +55,13 @@ git-se i                    # Install pre-commit hook, which checks that all fil
 - Migration notice:
   - Encryption/decryption algorithms are incompatible across major versions. First decrypt all files in the repository. For v1.x -> v2.x, also remove all wildcard entries from the `git_simple_encrypt.toml` list (v2.x+ does not support wildcards), then upgrade the version.
 
+## Security Notes
+
+- Password storage: the password set by `git-se p` or `git-se set key` (the raw password, before key derivation) is stored in plaintext in the repo-local git config (`.git/config`, entry `git-simple-encrypt.key`). Any local process, sync service, or backup that can read the repository directory can obtain it. This is an inherent trade-off of the single-password design; do not place the repository in untrusted sync or backup locations.
+- Key derivation: Argon2 runs with fixed default parameters (Argon2id, m=19MiB, t=2, p=1). They are currently not configurable; exposing them as options is planned for the next major version.
+- AEAD implementation: XChaCha20-Poly1305 is provided by the `chacha20poly1305-simd` crate (chosen for its explicit-SIMD performance). It is not part of the RustCrypto audited series; its version is pinned in `Cargo.toml`/`Cargo.lock`.
+- Decompression: decrypted data is decompressed to disk with no fill limit (bounded only by the zstd window), the same as general-purpose decompression tools; a known-password, low-risk disclosure.
+
 ---
 
 ## How it works
