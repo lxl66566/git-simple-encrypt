@@ -4,6 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use fuck_backslash::FuckBackslash;
 use log::warn;
 use pathdiff::diff_paths;
 use rand::prelude::Rng;
@@ -24,6 +25,9 @@ use crate::{
 };
 
 /// Compute a repo-relative cache key from a file path.
+///
+/// Separators are normalized to `/` (via the same `fuck_backslash` helper the
+/// crypt list uses) so the raw-byte key stays consistent across platforms.
 #[must_use]
 pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     let relative = if file_path.is_absolute() {
@@ -31,13 +35,10 @@ pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     } else {
         file_path.to_path_buf()
     };
-    let mut bytes = relative.into_os_string().into_encoded_bytes();
-    for b in &mut bytes {
-        if *b == b'\\' {
-            *b = b'/';
-        }
-    }
-    bytes
+    relative
+        .fuck_backslash()
+        .into_os_string()
+        .into_encoded_bytes()
 }
 
 /// Wrap a per-file failure with the operation and file path for context.

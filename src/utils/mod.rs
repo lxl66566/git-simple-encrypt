@@ -4,7 +4,7 @@ pub(crate) mod style;
 
 use std::{
     fs,
-    io::{Read, Write},
+    io::{ErrorKind, Read, Write},
     path::{Path, PathBuf},
     sync::mpsc,
 };
@@ -182,12 +182,13 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
     let mut file = fs::File::open(path)?;
     let mut header_bytes = [0u8; HEADER_LEN];
-    let bytes_read = file.read(&mut header_bytes)?;
-    if bytes_read < HEADER_LEN {
-        // File is smaller than the header, definitely not encrypted
-        return Ok(false);
+    // Same read_exact pre-check as the encrypt/decrypt paths; a file shorter
+    // than the header cannot be encrypted.
+    match file.read_exact(&mut header_bytes) {
+        Ok(()) => Ok(&header_bytes[0..5] == MAGIC && is_encrypted_version(header_bytes[5])),
+        Err(e) if e.kind() == ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e.into()),
     }
-    Ok(&header_bytes[0..5] == MAGIC && is_encrypted_version(header_bytes[5]))
 }
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the

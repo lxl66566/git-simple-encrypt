@@ -62,6 +62,8 @@ pub fn encrypt_file_to(
     // Skip the stat+mkdir round-trip when the destination already lives in a
     // directory the source is in (the in-place path, or same-dir writes) —
     // that directory necessarily exists.
+    // Literal comparison only: semantically-equal spellings (trailing slash,
+    // `..`, case on Windows) just cost one extra mkdir; harmless.
     let src_parent = src.parent().unwrap_or_else(|| Path::new("."));
     if src_parent != dst_parent {
         fs::create_dir_all(dst_parent)?;

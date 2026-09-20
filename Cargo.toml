@@ -55,7 +55,7 @@ assert2   = "0.4"
 colored   = "3"
 criterion = "0.8"
 tap       = "1"
-tempfile  = "3"
+tempfile  = "3.26.0"
 
 [features]
 default  = ["bin", "colored", "progress"]
