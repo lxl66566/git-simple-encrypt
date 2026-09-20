@@ -54,7 +54,8 @@ pub use file::{
     decrypt_file, decrypt_file_to, decrypt_file_with_cache, encrypt_file, encrypt_file_to,
 };
 pub use header::{
-    FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION, is_encrypted_version,
+    CHUNK_SIZE, FILE_ID_LEN, FileHeader, HEADER_LEN, MAGIC, NONCE_LEN, SALT_LEN, VERSION,
+    is_encrypted_version,
 };
 pub use key::derive_key;
 pub use repo::{cache_key, decrypt_repo, encrypt_repo};
