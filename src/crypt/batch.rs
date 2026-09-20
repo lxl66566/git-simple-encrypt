@@ -15,7 +15,7 @@ use crate::{
     crypt::{
         file::{encrypt_file_to, persist_temp_file},
         header::{FileHeader, HEADER_LEN, MAGIC, SALT_LEN, is_encrypted_version},
-        key::{KeyCache, get_or_derive_key, split_keys},
+        key::{KeyCache, get_or_derive_key, split_key_enc},
         stream::decrypt_body,
     },
     error::{Error, Result},
@@ -71,7 +71,7 @@ fn decrypt_file_to_with_key_cache(
     fs::create_dir_all(dst_parent)?;
     let mut temp_file = NamedTempFile::new_in(dst_parent)?;
 
-    let (key_enc, _) = split_keys(&derived_key);
+    let key_enc = split_key_enc(&derived_key);
     let cipher = XChaCha20Poly1305::new(*key_enc);
     decrypt_body(&mut src_file, &mut temp_file, &cipher, &header)?;
 

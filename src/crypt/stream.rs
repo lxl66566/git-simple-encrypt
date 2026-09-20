@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 use crate::{
     crypt::{
         header::{CHUNK_SIZE, FILE_ID_LEN, FileHeader, HEADER_LEN, NONCE_LEN},
-        key::{derive_key, derive_nonce, split_keys},
+        key::{derive_key, derive_nonce, split_key_enc, split_keys},
     },
     error::{Error, Result},
 };
@@ -241,7 +241,7 @@ pub fn decrypt_into<R: Read, W: Write>(
     let header = FileHeader::read_from(reader)?;
 
     let derived_key = derive_key(master_key, &header.salt)?;
-    let (key_enc, _) = split_keys(&derived_key);
+    let key_enc = split_key_enc(&derived_key);
     let cipher = XChaCha20Poly1305::new(*key_enc);
 
     decrypt_body(reader, writer, &cipher, &header)?;

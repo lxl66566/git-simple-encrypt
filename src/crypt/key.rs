@@ -17,10 +17,19 @@ pub fn derive_key(password: &[u8], salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {
     Ok(key)
 }
 
+/// Derive only the AEAD key. Decrypt paths read per-chunk nonces from the
+/// ciphertext and never need `key_mac`, so they skip one blake3 KDF by
+/// calling this instead of [`split_keys`].
+pub(super) fn split_key_enc(master_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(blake3::derive_key("git-simple-encrypt-enc", master_key))
+}
+
+fn split_key_mac(master_key: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(blake3::derive_key("git-simple-encrypt-mac", master_key))
+}
+
 pub(super) fn split_keys(master_key: &[u8; 32]) -> (Zeroizing<[u8; 32]>, Zeroizing<[u8; 32]>) {
-    let key_enc = blake3::derive_key("git-simple-encrypt-enc", master_key);
-    let key_mac = blake3::derive_key("git-simple-encrypt-mac", master_key);
-    (Zeroizing::new(key_enc), Zeroizing::new(key_mac))
+    (split_key_enc(master_key), split_key_mac(master_key))
 }
 
 pub(super) fn derive_nonce(
