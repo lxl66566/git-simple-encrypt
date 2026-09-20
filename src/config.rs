@@ -26,7 +26,9 @@ pub struct Config {
     pub(crate) config_path: PathBuf,
     /// whether to use zstd
     pub use_zstd: bool,
-    /// zstd compression level (1-22).
+    /// zstd compression level (1-22). Default 3: on typical text data the
+    /// ratio is within a few percent of higher levels at a vastly higher
+    /// throughput (level does not affect the ciphertext format).
     pub zstd_level: u8,
     /// list of files (patterns) to encrypt
     pub crypt_list: Vec<String>,
@@ -38,7 +40,7 @@ impl Default for Config {
             repo_path: PathBuf::from("."),
             config_path: PathBuf::from(CONFIG_FILE_NAME),
             use_zstd: true,
-            zstd_level: 15,
+            zstd_level: 3,
             crypt_list: vec![],
         }
     }
