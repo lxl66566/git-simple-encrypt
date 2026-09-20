@@ -159,15 +159,22 @@ impl Repo {
                     list.push(relative);
                 },
                 Ok(true) => {},
-                Err(e) => errors.lock().push(e),
+                Err(e) => {
+                    // is_file_encrypted errors carry no file context, so log it here.
+                    warn!("Failed to check {}: {e}", f.display());
+                    errors.lock().push(e);
+                },
             }
             pb.inc(1);
         });
+
+        // Clear the progress bar on every exit path, error or not.
+        pb.finish_and_clear();
+
+        // Every error was logged above; surface the first one as the return value.
         if let Some(first) = errors.into_inner().into_iter().next() {
             return Err(first);
         }
-
-        pb.finish_and_clear();
 
         let not_encrypted = not_encrypted.into_inner();
         let total = target_files.len();

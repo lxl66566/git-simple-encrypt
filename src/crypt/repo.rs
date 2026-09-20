@@ -4,6 +4,7 @@ use std::{
 };
 
 use dashmap::DashMap;
+use log::warn;
 use pathdiff::diff_paths;
 use rand::prelude::Rng;
 
@@ -117,6 +118,11 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         failed.load(Ordering::Relaxed),
     );
 
+    // Log every per-file failure (messages already embed the file path), then
+    // surface the first one as the return value.
+    for e in &result {
+        warn!("{e}");
+    }
     if let Some(first) = result.into_iter().next() {
         return Err(first);
     }
@@ -198,6 +204,11 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         failed.load(Ordering::Relaxed),
     );
 
+    // Log every per-file failure (messages already embed the file path), then
+    // surface the first one as the return value.
+    for e in &result {
+        warn!("{e}");
+    }
     if let Some(first) = result.into_iter().next() {
         return Err(first);
     }
