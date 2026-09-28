@@ -12,6 +12,7 @@
 - 并行加速：多线程并行加解密，充分利用 CPU 多核性能。
 - 原子写入：加解密过程实现原子写入，防止中断时损坏文件；保留原文件的权限与时间戳。
 - 可配置的 Zstd 压缩：默认开启，减少空间占用。
+- 透明的 git 集成（v3.1+）：`git-se i` 安装 clean/smudge 过滤器，在 add/checkout 时自动加解密，工作区始终是明文，`git diff` 仍可读。
 
 ## 安装
 
@@ -39,14 +40,27 @@
 
 ## 使用
 
+### 自动加解密（v3.1+）
+
 ```sh
 git-se p                    # 设置/更新主密码
 git-se add file.txt mydir   # 将文件/文件夹添加到加密列表。如果是文件夹，则会递归加密文件夹下的所有文件
+git-se i                    # 安装 git 过滤器集成
+git add . && git commit -m "..."   # 正常工作即可
+```
+
+安装后加解密完全透明：`git add` / `git commit` 自动加密；`git checkout` / `git switch` / `git stash` 时自动解密。工作区始终是明文。支持 diff。迁移现有仓库请运行一次 `git-se i`。
+
+- `.gitattributes` 会增加一个由 `# BEGIN git-simple-encrypt (managed)` / `# END git-simple-encrypt` 标记包围的托管块；自定义规则请放在块外。加密列表变更时 git-se 会自动刷新该块。
+
+### 手动加解密（老版本）
+
+```sh
 git-se e                    # 加密列表中的所有文件
 git-se d                    # 解密列表中的所有文件
 git-se e xxx.txt dir1 ...   # 部分加密文件
 git-se d xxx.txt dir1 ...   # 部分解密文件
-git-se i                    # 安装 pre commit hook，在每次提交前检查是否所有文件都已加密
+git-se i --mode hook        # 安装 pre commit hook，在每次提交前检查是否所有文件都已加密
 ```
 
 ## 注意事项

@@ -21,6 +21,12 @@
 //! entries, merges with any existing on-disk cache, and serializes the
 //! result via rkyv.
 //!
+//!
+//! ## Single-Writer Merge (git filter drivers)
+//!
+//! The clean/smudge filter processes run one file per invocation and cannot
+//! share a channel; they merge entries directly via [`merge_entries`],
+//! serialized by an OS lock so concurrent processes cannot lose entries.
 //! # Key Format
 //!
 //! Cache keys are repo-relative path bytes with forward slashes (`b'/'`),
@@ -266,43 +272,14 @@ impl SaltCacheSaver {
         //     `self` under non-2024 drop ordering.
         // All workers have returned by the time we get here, so every
         // sent entry is already in the channel buffer.
-        let mut entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
+        let entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
 
         if entries.is_empty() {
             debug!("No cache entries to save");
             return;
         }
 
-        // Merge with existing cache on disk (keep existing entries only when
-        // no new entry covers the same path).
-        let path = cache_path(&self.repo_path);
-        if path.exists()
-            && let Ok(existing_bytes) = std::fs::read(&path)
-            && let Ok(existing) =
-                rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&existing_bytes)
-        {
-            for (k, v) in existing {
-                entries.entry(k).or_insert(v);
-            }
-        }
-
-        // Serialize and write atomically.
-        match rkyv::to_bytes::<RkyvError>(&entries) {
-            Ok(bytes) => {
-                if let Err(e) = atomic_write(&path, bytes.as_slice()) {
-                    warn!("Failed to save salt cache to {}: {e}", path.display());
-                } else {
-                    debug!(
-                        "Saved salt cache with {} entries to {}",
-                        entries.len(),
-                        path.display()
-                    );
-                }
-            },
-            Err(e) => {
-                warn!("Failed to serialize salt cache: {e}");
-            },
-        }
+        write_merged(&cache_path(&self.repo_path), entries);
     }
 }
 
@@ -319,6 +296,72 @@ pub fn create_writer(repo_path: &Path) -> (SaltCacheSender, SaltCacheSaver) {
         rx: Some(rx),
         repo_path: repo_path.to_path_buf(),
     })
+}
+
+/// Merge `entries` over the cache at `path` (new entries win) and write it
+/// atomically. Best-effort: failures are logged, never propagated (a lost
+/// entry only costs ciphertext determinism, never data).
+fn write_merged(path: &Path, mut entries: HashMap<Vec<u8>, CachedEntry>) {
+    // Merge with existing cache on disk (keep existing entries only when
+    // no new entry covers the same path).
+    if path.exists()
+        && let Ok(existing_bytes) = std::fs::read(path)
+        && let Ok(existing) =
+            rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&existing_bytes)
+    {
+        for (k, v) in existing {
+            entries.entry(k).or_insert(v);
+        }
+    }
+
+    match rkyv::to_bytes::<RkyvError>(&entries) {
+        Ok(bytes) => {
+            if let Err(e) = atomic_write(path, bytes.as_slice()) {
+                warn!("Failed to save salt cache to {}: {e}", path.display());
+            } else {
+                debug!(
+                    "Saved salt cache with {} entries to {}",
+                    entries.len(),
+                    path.display()
+                );
+            }
+        },
+        Err(e) => warn!("Failed to serialize salt cache: {e}"),
+    }
+}
+
+/// Merge entries into the on-disk cache from a single-file process (the git clean/smudge drivers).
+///
+/// Git runs filter processes concurrently (e.g. parallel smudge during checkout), so the
+/// read-modify-write cycle is serialized with an exclusive OS lock on `<cache>.lock`. The lock is
+/// advisory and released automatically when the process exits, so a crashed filter cannot leave a
+/// stale lock behind. Reads need no lock: [`atomic_write`] renames into place, so a concurrent
+/// reader always maps either the old or the new complete file.
+pub fn merge_entries<I>(repo_path: &Path, entries: I)
+where
+    I: IntoIterator<Item = (Vec<u8>, CachedEntry)>,
+{
+    let map: HashMap<Vec<u8>, CachedEntry> = entries.into_iter().collect();
+    if map.is_empty() {
+        return;
+    }
+
+    let lock_path = repo_path
+        .join(".git")
+        .join(format!("{CACHE_FILENAME}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .and_then(|file| {
+            file.lock()?;
+            Ok(file)
+        });
+    match lock {
+        Ok(_guard) => write_merged(&cache_path(repo_path), map),
+        Err(e) => warn!("Failed to lock salt cache {}: {e}", lock_path.display()),
+    }
 }
 
 impl Drop for SaltCacheSaver {
@@ -454,5 +497,27 @@ mod tests {
         let reader = SaltCacheReader::load(repo);
         assert_eq!(reader.get(b"existing.txt"), Some(entry_a));
         assert_eq!(reader.get(b"new.txt"), Some(entry_b));
+    }
+
+    #[test]
+    fn test_merge_entries_single_writer_api() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let entry = make_entry(0x77, 0x88);
+        merge_entries(repo, [(b"f.txt".to_vec(), entry)]);
+
+        // merges with, not replaces, the existing cache
+        let (sender, saver) = create_writer(repo);
+        sender.insert(b"other.txt", make_entry(0x99, 0xaa));
+        drop(sender);
+        saver.save();
+
+        merge_entries(repo, [(b"f.txt".to_vec(), make_entry(0xbb, 0xcc))]);
+
+        let reader = SaltCacheReader::load(repo);
+        assert_eq!(reader.get(b"f.txt"), Some(make_entry(0xbb, 0xcc)));
+        assert_eq!(reader.get(b"other.txt"), Some(make_entry(0x99, 0xaa)));
     }
 }

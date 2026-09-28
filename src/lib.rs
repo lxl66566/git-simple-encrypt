@@ -3,18 +3,19 @@
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::multiple_crate_versions)]
 
+#[cfg(feature = "bin")]
+mod cli;
 pub mod config;
 pub mod crypt;
 mod error;
+pub mod filter;
+pub mod gitattributes;
 pub mod repo;
 pub mod salt_cache;
 pub mod utils;
 
 #[cfg(feature = "bin")]
-mod cli;
-
-#[cfg(feature = "bin")]
-pub use crate::cli::{Cli, SetField, SubCommand};
+pub use crate::cli::{Cli, InstallMode, SetField, SubCommand};
 #[cfg(feature = "bin")]
 use crate::crypt::{decrypt_repo, encrypt_repo};
 #[cfg(feature = "bin")]
@@ -32,15 +33,31 @@ pub fn run(cli: Cli) -> Result<()> {
     if !cli.repo.is_absolute() {
         return Err(Error::RepoPathNotAbsolute(cli.repo.clone()));
     }
-    let mut repo = Repo::open(&cli.repo)?;
+    // Filter callbacks run from the worktree root by git, but keep them
+    // working when invoked from anywhere inside the repo.
+    let mut repo = if cli.command.is_filter_driver() {
+        Repo::discover(&cli.repo)?
+    } else {
+        Repo::open(&cli.repo)?
+    };
     match cli.command {
         SubCommand::Encrypt { paths } => encrypt_repo(&repo, &paths)?,
         SubCommand::Decrypt { paths } => decrypt_repo(&repo, &paths)?,
-        SubCommand::Add { paths } => repo.conf.add_paths_to_crypt_list(&paths)?,
+        SubCommand::Add { paths } => {
+            repo.conf.add_paths_to_crypt_list(&paths)?;
+            // Keep the managed .gitattributes block in sync in filter mode.
+            repo.refresh_gitattributes()?;
+        },
         SubCommand::Set { field } => field.set(&mut repo)?,
         SubCommand::Pwd => repo.set_key_interactive()?,
         SubCommand::Check { paths, staged } => repo.check(&paths, staged)?,
-        SubCommand::Install => repo.install_hook()?,
+        SubCommand::Install { mode } => match mode {
+            InstallMode::Filter => repo.install_filter()?,
+            InstallMode::Hook => repo.install_hook()?,
+        },
+        SubCommand::Clean { path } => filter::clean(&repo, &path)?,
+        SubCommand::Smudge { path } => filter::smudge(&repo, &path)?,
+        SubCommand::Diff { file } => filter::diff(&repo, file.as_deref())?,
     }
     Ok(())
 }

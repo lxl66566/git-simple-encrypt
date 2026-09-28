@@ -17,7 +17,7 @@ git-se e                    # Encrypt all files in the list
 git-se d                    # Decrypt all files in the list
 git-se e xxx.txt dir1 ...   # Encrypt specific files
 git-se d xxx.txt dir1 ...   # Decrypt specific files
-git-se i                    # Install a pre-commit hook to check encryption before committing
+git-se i                    # Install git filter integration: automatic encryption / decryption
 "#)]
 #[clap(args_conflicts_with_subcommands = true)]
 pub struct Cli {
@@ -71,9 +71,62 @@ pub enum SubCommand {
         #[arg(long, default_value_t = false)]
         staged: bool,
     },
-    /// Install a pre-commit hook to check encryption before committing.
+    /// Install git integration.
+    ///
+    /// Filter mode (default, transcrypt-style) exports `.gitattributes` and
+    /// configures git clean/smudge filters plus a diff textconv: files in the
+    /// crypt list stay plaintext in the working tree, git encrypts them on
+    /// `git add` and decrypts on checkout, and `git diff` shows plaintext.
+    /// Hook mode keeps the legacy behavior: only a pre-commit check hook,
+    /// with manual `e`/`d`.
     #[clap(alias("i"))]
-    Install,
+    Install {
+        /// What to install.
+        #[arg(long, value_enum, default_value_t = InstallMode::Filter)]
+        mode: InstallMode,
+    },
+    /// Git clean filter: encrypt stdin to stdout. Invoked by git through
+    /// `filter.git-se.clean` with the filtered path (git's %f placeholder).
+    Clean {
+        /// Path of the filtered file, relative to the repo root.
+        path: PathBuf,
+    },
+    /// Git smudge filter: decrypt stdin to stdout. Invoked by git through
+    /// `filter.git-se.smudge` with the filtered path (git's %f placeholder).
+    Smudge {
+        /// Path of the filtered file, relative to the repo root.
+        path: PathBuf,
+    },
+    /// Decrypt ciphertext to stdout for `git diff` (configured as
+    /// `diff.git-se.textconv`). Reads the given file, or stdin when omitted.
+    Diff {
+        /// File holding the ciphertext (git passes a blob temp file here).
+        file: Option<PathBuf>,
+    },
+}
+
+/// What `git-se install` sets up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum InstallMode {
+    /// Export `.gitattributes` and configure clean/smudge filters and the
+    /// plaintext diff; encryption becomes fully automatic.
+    Filter,
+    /// Only install the legacy pre-commit check hook; encrypt/decrypt stays
+    /// manual (`git-se e` / `git-se d`).
+    Hook,
+}
+
+impl SubCommand {
+    /// Whether this command is a git filter/textconv callback. Git invokes
+    /// these once per file with data on stdin/stdout, so they must stay quiet
+    /// and fast.
+    #[must_use]
+    pub const fn is_filter_driver(&self) -> bool {
+        matches!(
+            self,
+            Self::Clean { .. } | Self::Smudge { .. } | Self::Diff { .. }
+        )
+    }
 }
 
 #[derive(Debug, Subcommand)]

@@ -10,8 +10,10 @@ use parking_lot::Mutex;
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
     error::{Error, Result},
+    filter::is_ciphertext,
+    gitattributes,
     utils::{
-        Progress, is_file_encrypted, parallel, prompt_password, resolve_target_files,
+        Progress, atomic_write, is_file_encrypted, parallel, prompt_password, resolve_target_files,
         style::Colorize,
     },
 };
@@ -43,6 +45,19 @@ fn hook_marker() -> &'static [u8] {
         "hook template must keep the marker line"
     );
     marker
+}
+
+/// Whether the pre-commit hook at `hook_path` is managed by git-se
+/// (recognized by the marker line below the shebang).
+fn is_managed_hook(hook_path: &Path) -> Result<bool> {
+    if !hook_path.exists() {
+        return Ok(false);
+    }
+    let existing = std::fs::read(hook_path)?;
+    Ok(existing
+        .split(|&b| b == b'\n')
+        .take(2) // shebang + marker line
+        .any(|line| line.trim_ascii() == hook_marker()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -140,6 +155,19 @@ impl Repo {
     /// which files are not encrypted. The process exits with a non-zero code
     /// when files are not encrypted, suitable for CI usage.
     pub fn check(&self, paths: &[PathBuf], staged: bool) -> Result<()> {
+        // In filter mode the working tree stays plaintext by design, so
+        // checking worktree files would always fail and report nothing
+        // useful. The staged check stays meaningful: it inspects the staged
+        // blobs that will actually be committed.
+        let filter_mode = self.filter_installed();
+        if filter_mode && !staged {
+            println!(
+                "Filter integration is active: working-tree files stay plaintext and are \
+                 encrypted automatically by git; only `check --staged` is meaningful (it inspects \
+                 the staged blobs)."
+            );
+            return Ok(());
+        }
         let target_files = if staged {
             // `git -c` options must precede the subcommand. Disable path
             // quoting: with git's default `core.quotepath = true`, non-ASCII
@@ -192,7 +220,16 @@ impl Repo {
         let errors: Mutex<Vec<Error>> = Mutex::new(Vec::new());
 
         parallel::for_each(&target_files, |f| {
-            match is_file_encrypted(f) {
+            let encrypted = if filter_mode {
+                // The worktree file is plaintext by design; check the staged
+                // blob (`:path`) that will actually be committed.
+                let rel = pathdiff::diff_paths(f, &self.path).unwrap_or_else(|| f.clone());
+                self.staged_blob(&rel.to_string_lossy().replace('\\', "/"))
+                    .map(|blob| is_ciphertext(&blob))
+            } else {
+                is_file_encrypted(f)
+            };
+            match encrypted {
                 Ok(false) => {
                     let mut list = not_encrypted.lock();
                     let relative = pathdiff::diff_paths(f, &self.path).unwrap_or_else(|| f.clone());
@@ -200,7 +237,6 @@ impl Repo {
                 },
                 Ok(true) => {},
                 Err(e) => {
-                    // is_file_encrypted errors carry no file context, so log it here.
                     warn!("Failed to check {}: {e}", f.display());
                     errors.lock().push(e);
                 },
@@ -261,17 +297,10 @@ impl Repo {
         let hook_path = hooks_dir.join("pre-commit");
 
         // An existing hook may only be overwritten when it is managed by
-        // git-se, i.e. its second line (below the shebang) carries the
-        // marker. Anything else is user content and must be removed manually.
-        if hook_path.exists() {
-            let existing = std::fs::read(&hook_path)?;
-            let managed = existing
-                .split(|&b| b == b'\n')
-                .take(2) // shebang + marker line
-                .any(|line| line.trim_ascii() == hook_marker());
-            if !managed {
-                return Err(Error::HookExists(hook_path));
-            }
+        // git-se (marker line below the shebang). Anything else is user
+        // content and must be removed manually.
+        if hook_path.exists() && !is_managed_hook(&hook_path)? {
+            return Err(Error::HookExists(hook_path));
         }
 
         std::fs::write(&hook_path, PRE_COMMIT_HOOK)?;
@@ -293,6 +322,303 @@ impl Repo {
             hook_path.display()
         );
         Ok(())
+    }
+
+    /// Like [`Repo::open`], but walk up from `start` until a directory with a
+    /// `.git` entry is found.
+    ///
+    /// Git runs the clean/smudge filter processes from the worktree root,
+    /// but manual invocations from subdirectories should work too.
+    pub fn discover(start: impl AsRef<Path>) -> Result<Self> {
+        debug_assert!(start.as_ref().is_absolute(), "given path must be absolute");
+        let mut dir = start.as_ref().to_path_buf();
+        loop {
+            let dot_git = dir.join(".git");
+            if dot_git.is_dir() || dot_git.is_file() {
+                return Self::open(&dir);
+            }
+            if !dir.pop() {
+                return Err(Error::Other(format!(
+                    "not a git repository: {}",
+                    start.as_ref().display()
+                )));
+            }
+        }
+    }
+
+    /// Whether the clean/smudge filter integration is installed in this repo.
+    #[must_use]
+    pub fn filter_installed(&self) -> bool {
+        self.get_raw_config(&format!("filter.{}.required", gitattributes::FILTER_NAME))
+            .is_ok()
+    }
+
+    /// Install the git filter integration: export `.gitattributes` and
+    /// configure the clean/smudge filter driver plus the plaintext-diff
+    /// textconv (transcrypt-style). After this, encryption and decryption
+    /// are driven by git itself and the working tree stays plaintext.
+    ///
+    /// A git-se managed pre-commit hook is removed: it checks worktree
+    /// files, which are plaintext on purpose in filter mode, so it would
+    /// block every commit. Foreign hooks are kept (a warning is printed).
+    pub fn install_filter(&self) -> Result<()> {
+        // Absolute exe path survives PATH changes; forward slashes work in
+        // both POSIX sh and MSYS sh; single quotes make it shell-safe.
+        let exe = std::env::current_exe()
+            .map_err(|e| Error::Other(format!("failed to locate the running executable: {e}")))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let quoted = format!("'{}'", exe.replace('\'', "'\\''"));
+
+        // 1. Export the managed .gitattributes block.
+        let attr_path = self.path.join(".gitattributes");
+        let content = match std::fs::read_to_string(&attr_path) {
+            Ok(content) => content,
+            // A missing .gitattributes is the common case: start from empty.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+            // Any other read failure (encoding, permissions) must surface:
+            // continuing with an empty base would clobber the user's file
+            // with a block-only rewrite below.
+            Err(e) => {
+                return Err(Error::Other(format!(
+                    "failed to read {}: {e}",
+                    attr_path.display()
+                )));
+            },
+        };
+        let patterns = self.filter_patterns();
+        let updated = gitattributes::with_managed_block(&content, &patterns);
+        atomic_write(&attr_path, updated.as_bytes())?;
+
+        // 2. Configure the filter driver and the diff textconv.
+        let f = format!("filter.{}", gitattributes::FILTER_NAME);
+        self.set_raw_config(&format!("{f}.clean"), &format!("{quoted} clean %f"))?;
+        self.set_raw_config(&format!("{f}.smudge"), &format!("{quoted} smudge %f"))?;
+        // Fail loudly (instead of committing plaintext) when the filter
+        // cannot run, e.g. the binary was moved.
+        self.set_raw_config(&format!("{f}.required"), "true")?;
+        self.set_raw_config(
+            &format!("diff.{}.textconv", gitattributes::FILTER_NAME),
+            &format!("{quoted} diff"),
+        )?;
+
+        // 3. The legacy check hook is incompatible with filter mode.
+        let hook = self.path.join(".git").join("hooks").join("pre-commit");
+        if is_managed_hook(&hook)? {
+            std::fs::remove_file(&hook)?;
+            println!(
+                "{} legacy pre-commit hook (incompatible with filter mode)",
+                "Removed".yellow().bold()
+            );
+        } else if hook.exists() {
+            warn!(
+                "A foreign pre-commit hook exists at {}; it may block commits in filter mode.",
+                hook.display()
+            );
+        }
+
+        // 4. Decrypt the working tree where it is safe to do so.
+        let has_key = self.get_key().is_ok();
+        let (decrypted, needs_renormalize) = if has_key {
+            self.force_checkout_tracked()
+        } else {
+            (0, false)
+        };
+
+        println!(
+            "{} git filter integration at {}",
+            "Installed".green().bold(),
+            self.path.display()
+        );
+        println!(
+            "{}",
+            "Working-tree files stay plaintext; git encrypts them on `git add` and decrypts on \
+             checkout."
+                .dimmed()
+        );
+        if !has_key {
+            println!(
+                "{}",
+                "Run `git-se p` to set the password before staging files.".yellow()
+            );
+            return Ok(());
+        }
+        if decrypted > 0 {
+            println!(
+                "{} decrypted {decrypted} tracked file(s) in the working tree",
+                "Auto".green().bold()
+            );
+        }
+        if needs_renormalize {
+            println!(
+                "{}",
+                "Some blobs need re-staging; run `git add --renormalize .` to encrypt them."
+                    .yellow()
+            );
+        }
+        Ok(())
+    }
+
+    /// Refresh the managed `.gitattributes` block after crypt-list changes.
+    ///
+    /// No-op unless the block already exists (i.e. filter mode is active);
+    /// the hook-only workflow never touches `.gitattributes`.
+    pub fn refresh_gitattributes(&self) -> Result<()> {
+        let attr_path = self.path.join(".gitattributes");
+        let Ok(content) = std::fs::read_to_string(&attr_path) else {
+            return Ok(());
+        };
+        if !gitattributes::has_managed_block(&content) {
+            return Ok(());
+        }
+        let updated = gitattributes::with_managed_block(&content, &self.filter_patterns());
+        if updated != content {
+            atomic_write(&attr_path, updated.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    /// Final gitignore-style patterns for the crypt list: directory entries
+    /// get a `/**` suffix (a bare directory pattern does not cascade to its
+    /// contents in `.gitattributes`).
+    fn filter_patterns(&self) -> Vec<String> {
+        self.conf
+            .crypt_list
+            .iter()
+            .map(|entry| {
+                // The `/**` suffix is a real glob and must stay inside the
+                // quotes when the path itself needs quoting, so it is passed
+                // as a suffix rather than appended to the escaped pattern.
+                if self.path.join(entry).is_dir() {
+                    gitattributes::escape_pattern(entry, "/**")
+                } else {
+                    gitattributes::escape_pattern(entry, "")
+                }
+            })
+            .collect()
+    }
+
+    /// Tracked (index) files covered by the crypt list, as repo-relative
+    /// paths with forward separators.
+    fn tracked_crypt_files(&self) -> Vec<String> {
+        if self.conf.crypt_list.is_empty() {
+            return Vec::new();
+        }
+        // `-z` disables path quoting: paths come NUL-separated and raw.
+        let Ok(out) = std::process::Command::new("git")
+            .current_dir(&self.path)
+            .args(["ls-files", "-z", "--"])
+            .args(&self.conf.crypt_list)
+            .output()
+        else {
+            return Vec::new();
+        };
+        if !out.status.success() {
+            return Vec::new();
+        }
+        out.stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned())
+            .collect()
+    }
+
+    /// Content of a blob by spec (e.g. `HEAD:rel`, `:rel` for the staged
+    /// blob). `rel` uses forward separators.
+    fn blob(&self, spec: &str) -> Result<Vec<u8>> {
+        let out = std::process::Command::new("git")
+            .current_dir(&self.path)
+            .args(["cat-file", "blob", spec])
+            .output()?;
+        if !out.status.success() {
+            return Err(Error::Git(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
+        }
+        Ok(out.stdout)
+    }
+
+    /// The committed blob content for a repo-relative `path`, or `None` when
+    /// the path is absent from `HEAD` (e.g. never committed).
+    fn head_blob(&self, rel: &str) -> Option<Vec<u8>> {
+        self.blob(&format!("HEAD:{rel}")).ok()
+    }
+
+    /// The staged blob content for a repo-relative `path`.
+    fn staged_blob(&self, rel: &str) -> Result<Vec<u8>> {
+        self.blob(&format!(":{rel}"))
+    }
+
+    /// Transcrypt-style migration at install time: tracked crypt-list files
+    /// whose worktree copy still equals the committed blob byte-for-byte
+    /// (typical right after a clone, before any filter was installed) are
+    /// deleted and force-checked-out so the smudge filter decrypts them.
+    /// Locally modified files are never touched.
+    ///
+    /// Returns (number of decrypted files, whether `git add --renormalize .`
+    /// is still recommended: some blob was committed as plaintext before the
+    /// filter existed, or some file was decrypted outside of git and its
+    /// cached stat is therefore stale).
+    fn force_checkout_tracked(&self) -> (usize, bool) {
+        let mut to_decrypt: Vec<String> = Vec::new();
+        let mut needs_renormalize = false;
+        for rel in self.tracked_crypt_files() {
+            let Some(blob) = self.head_blob(&rel) else {
+                continue;
+            };
+            let blob_encrypted = is_ciphertext(&blob);
+            let Ok(worktree) = std::fs::read(self.path.join(&rel)) else {
+                if !blob_encrypted {
+                    needs_renormalize = true;
+                }
+                continue;
+            };
+            if worktree == blob {
+                // untouched since the last checkout: safe to re-smudge
+                if blob_encrypted {
+                    to_decrypt.push(rel);
+                } else {
+                    // committed as plaintext before the filter existed
+                    needs_renormalize = true;
+                }
+            } else if blob_encrypted && !is_ciphertext(&worktree) {
+                // decrypted outside git (e.g. `git-se d`): the cached stat
+                // no longer matches; renormalize refreshes it losslessly
+                needs_renormalize = true;
+            } else if !blob_encrypted {
+                // committed as plaintext before the filter existed
+                needs_renormalize = true;
+            }
+        }
+
+        // Chunk to stay clear of argv length limits on huge crypt lists.
+        let mut decrypted = 0;
+        'chunks: for chunk in to_decrypt.chunks(64) {
+            for rel in chunk {
+                let _ = std::fs::remove_file(self.path.join(rel));
+            }
+            let mut args: Vec<&str> = vec!["checkout", "--force", "HEAD", "--"];
+            args.extend(chunk.iter().map(String::as_str));
+            match std::process::Command::new("git")
+                .current_dir(&self.path)
+                .args(&args)
+                .output()
+            {
+                Ok(out) if out.status.success() => decrypted += chunk.len(),
+                Ok(out) => {
+                    warn!(
+                        "git checkout failed during install: {}",
+                        String::from_utf8_lossy(&out.stderr)
+                    );
+                    break 'chunks;
+                },
+                Err(e) => {
+                    warn!("failed to run git checkout during install: {e}");
+                    break 'chunks;
+                },
+            }
+        }
+        (decrypted, needs_renormalize)
     }
 
     /// Run a `git` command in the repo, discarding its stdout/stderr.
@@ -336,6 +662,20 @@ impl Repo {
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
         self.run(&["config", "--local", &temp, value])
+    }
+
+    /// Write to an unprefixed git config key (e.g. `filter.git-se.clean`) in
+    /// the repo-local config. Unlike [`Repo::set_config`], no namespace is
+    /// prepended — used for the git integration settings git itself reads.
+    pub fn set_raw_config(&self, key: &str, value: &str) -> Result<()> {
+        self.run(&["config", "--local", key, value])
+    }
+
+    /// Read an unprefixed key from the repo-local git config only (no
+    /// global/system lookup, unlike [`Repo::get_config`]).
+    pub fn get_raw_config(&self, key: &str) -> Result<String> {
+        self.run_with_output(&["config", "--local", "--get", key])
+            .map(|x| x.trim().to_string())
     }
 
     /// Read `<prefix>.<key>` from the repo-local git config.

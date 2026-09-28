@@ -12,6 +12,7 @@ A secure, high-performance, easy-to-use Git encryption tool. With just one passw
 - Parallel acceleration: Multi-threaded parallel encryption/decryption, fully utilizing multi-core CPU performance.
 - Atomic writes: Encryption/decryption process implements atomic writes to prevent file corruption if interrupted; preserves original file permissions and timestamps.
 - Configurable Zstd compression: Enabled by default to reduce storage space.
+- Transparent git integration (v3.1+): `git-se i` installs clean/smudge filters so encryption and decryption happen automatically on `git add`/`git checkout`, while the working tree stays plaintext and `git diff` remains readable.
 
 ## Installation
 
@@ -39,14 +40,27 @@ You can choose **any** of the following methods:
 
 ## Usage
 
+### Automatic Encryption/Decryption (v3.1+)
+
 ```sh
-git-se p                    # Set/update master password
-git-se add file.txt mydir   # Add files/directories to the encryption list. If a directory is specified, all files inside will be encrypted recursively
-git-se e                    # Encrypt all files in the list
+git-se p                    # Set/update the master password
+git-se add file.txt mydir   # Add a file/folder to the encryption list. If it is a folder, all files under it are encrypted recursively
+git-se i                    # Install the Git filter integration
+git add . && git commit -m "..."   # Just work normally
+```
+
+After installation, encryption/decryption is fully transparent: `git add` / `git commit` automatically encrypt; `git checkout` / `git switch` / `git stash` automatically decrypt. The working tree is always plaintext. diff is supported. To migrate an existing repository, run `git-se i` once.
+
+- `.gitattributes` will get a managed block surrounded by `# BEGIN git-simple-encrypt (managed)` / `# END git-simple-encrypt` markers; put custom rules outside the block. git-se automatically refreshes this block when the encryption list changes.
+
+### Manual Encryption/Decryption (Older Versions)
+
+```sh
+git-se e                    # Encrypt all files in the encryption list
 git-se d                    # Decrypt all files in the list
-git-se e xxx.txt dir1 ...   # Encrypt specific files
-git-se d xxx.txt dir1 ...   # Decrypt specific files
-git-se i                    # Install pre-commit hook, which checks that all files are encrypted before each commit
+git-se e xxx.txt dir1 ...   # Encrypt selected files
+git-se d xxx.txt dir1 ...   # Decrypt selected files
+git-se i --mode hook        # Install a pre-commit hook to check that all files are encrypted before each commit
 ```
 
 ## Important Notes
