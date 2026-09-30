@@ -39,10 +39,24 @@ pub fn format_hex(value: &[u8]) -> String {
 
 /// Atomically write `data` to `path` by writing to a temp file first, then
 /// renaming. This prevents partial writes from corrupting the target file.
+///
+/// The temp file is fsynced before the rename, so a power loss leaves either
+/// the old or the new content — never a truncated file. On Unix, an existing
+/// target's mode is carried over and fresh files get the conventional 0644;
+/// without this every rewritten file would inherit the temp file's 0600.
 pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let mut temp_file = NamedTempFile::new_in(parent)?;
     temp_file.write_all(data)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path).map_or(0o644, |m| m.permissions().mode());
+        std::fs::set_permissions(temp_file.path(), std::fs::Permissions::from_mode(mode))?;
+    }
+
+    temp_file.as_file().sync_all()?;
     temp_file
         .persist(path)
         .map_err(|e| Error::AtomicPersist(path.to_path_buf(), e.to_string()))?;
