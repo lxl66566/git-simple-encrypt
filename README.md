@@ -12,7 +12,7 @@ A secure, high-performance, easy-to-use Git encryption tool. With just one passw
 - Parallel acceleration: Multi-threaded parallel encryption/decryption, fully utilizing multi-core CPU performance.
 - Atomic writes: Encryption/decryption process implements atomic writes to prevent file corruption if interrupted; preserves original file permissions and timestamps.
 - Configurable Zstd compression: Enabled by default to reduce storage space.
-- Transparent git integration (v3.1+): `git-se i` installs clean/smudge filters so encryption and decryption happen automatically on `git add`/`git checkout`, while the working tree stays plaintext and `git diff` remains readable.
+- Transparent git integration (v3.1+): `git-se i` installs a long-running process filter (used by git >= 2.16) with clean/smudge filters kept as the fallback, so encryption and decryption happen automatically on `git add`/`git checkout`, while the working tree stays plaintext and `git diff` remains readable.
 
 ## Installation
 
@@ -51,6 +51,8 @@ git add . && git commit -m "..."   # Just work normally
 
 After installation, encryption/decryption is fully transparent: `git add` / `git commit` automatically encrypt; `git checkout` / `git switch` / `git stash` automatically decrypt. The working tree is always plaintext. diff is supported. To migrate an existing repository, run `git-se i` once.
 
+- A single long-lived process filter serves every file of one git operation, instead of spawning one process per file. All first-time encryptions of that operation share one salt, so the Argon2 derivation is paid once per git operation rather than once per file. This requires git >= 2.16; older git automatically falls back to the per-file clean/smudge filters with identical ciphertext. Repositories installed by older git-se versions get the process filter by running `git-se i` again.
+
 - `.gitattributes` will get a managed block surrounded by `# BEGIN git-simple-encrypt (managed)` / `# END git-simple-encrypt` markers; put custom rules outside the block. git-se automatically refreshes this block when the encryption list changes.
 
 ### Manual Encryption/Decryption (Older Versions)
@@ -74,15 +76,6 @@ git-se i --mode hook        # Install a pre-commit hook to check that all files 
 - Configuration file: The encryption list and configuration are stored in `git_simple_encrypt.toml`. To remove a file from the list, edit this file manually.
 - Migration notice:
   - Encryption/decryption algorithms are incompatible across major versions. First decrypt all files in the repository. For v1.x -> v2.x, also remove all wildcard entries from the `git_simple_encrypt.toml` list (v2.x+ does not support wildcards), then upgrade the version.
-
-## Security Notes
-
-- Password storage: the password set by `git-se p` or `git-se set key` (the raw password, before key derivation) is stored in plaintext in the repo-local git config (`.git/config`, entry `git-simple-encrypt.key`). Any local process, sync service, or backup that can read the repository directory can obtain it. This is an inherent trade-off of the single-password design; do not place the repository in untrusted sync or backup locations.
-- Password input and transport: the interactive prompt echoes the password as you type (a deliberate choice: the single password has no recovery path, and visible feedback beats silent typos; the trade-off is that the plaintext lands in the terminal scrollback). The key is written into `.git/config` by direct file editing with git-compatible value escaping — the password never appears in a child process's command line (process listings). In memory the derived keys and buffers are zeroized on drop.
-- Key derivation: Argon2 runs with fixed default parameters (Argon2id, m=19MiB, t=2, p=1). They are not written into the file header and are therefore a frozen part of the on-disk format: existing files cannot be decrypted with different parameters (a mismatch is indistinguishable from a wrong password), so the parameters cannot change within a major version. Exposing them as options is planned for the next major version, which would record a parameter identifier in the reserved header bytes.
-- AEAD implementation: XChaCha20-Poly1305 is provided by the `chacha20poly1305-simd` crate (chosen for its explicit-SIMD performance). It is not part of the RustCrypto audited series. `Cargo.toml` tracks it with a caret semver requirement (`"0.3"`), so compatible minor updates are allowed; the exact version compiled into a build is what `Cargo.lock` pins.
-- Determinism vs. Zstd versions: when compression is enabled, the nonce is derived from the compressed chunk data, so the ciphertext also depends on the exact byte output of the Zstd encoder. Upgrading the zstd crate may change compressed output for unchanged input, which would make re-encryption of an unchanged file produce different ciphertext (a phantom modification in `git status`); the data itself stays decryptable. Such upgrades are held back within a major version when possible.
-- Decompression: decrypted data is decompressed to disk with no fill limit (bounded only by the zstd window), the same as general-purpose decompression tools; a known-password, low-risk disclosure.
 
 ---
 

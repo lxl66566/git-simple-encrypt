@@ -7,12 +7,12 @@
 - 相比 [git-crypt](https://github.com/AGWA/git-crypt)，它不需要管理 GPG 密钥或备份密钥文件。**单密码对称加密**是核心原则。
 - 安全性：v2.0.0+ 版本进行了彻底重构，采用 **Argon2 + XChaCha20-Poly1305** 保证安全性，适用于生产环境。
   - 算法可抗位篡改、重排攻击、重放攻击、截断攻击，详见[原理](#原理)。
-- 对偶性保证：解密时缓存 salt + FILE_ID，并在加密时复用，若**文件无变更则加密产物也相同**，避免反复加解密导致仓库体积膨胀。v3.0.0+ Nonce 基于当前分块数据（启用压缩时为压缩后数据）+ File_ID + chunk_idx 计算，在保持确定性同时消除了 Nonce 重用风险和跨文件数据块碰撞问题。
+- 对偶性保证：解密时缓存 salt + FILE_ID，并在加密时复用，若**文件无变更则加密产物也相同**，避免反复加解密导致仓库体积膨胀。v3.0.0+ Nonce 基于当前分块数据 + File_ID + chunk_idx 计算，在保持确定性同时消除了 Nonce 重用风险和跨文件数据块碰撞问题。
 - 流式处理：采用 64KB 分块加密，降低大文件加密的内存占用。
 - 并行加速：多线程并行加解密，充分利用 CPU 多核性能。
 - 原子写入：加解密过程实现原子写入，防止中断时损坏文件；保留原文件的权限与时间戳。
 - 可配置的 Zstd 压缩：默认开启，减少空间占用。
-- 透明的 git 集成（v3.1+）：`git-se i` 安装 clean/smudge 过滤器，在 add/checkout 时自动加解密，工作区始终是明文，`git diff` 仍可读。
+- 透明的 git 集成（v3.1+）：`git-se i` 安装长驻进程过滤（git >= 2.16 优先使用）并保留 clean/smudge 作为回退，在 add/checkout 时自动加解密，工作区始终是明文，`git diff` 仍可读。
 
 ## 安装
 
@@ -49,8 +49,7 @@ git-se i                    # 安装 git 过滤器集成
 git add . && git commit -m "..."   # 正常工作即可
 ```
 
-安装后加解密完全透明：`git add` / `git commit` 自动加密；`git checkout` / `git switch` / `git stash` 时自动解密。工作区始终是明文。支持 diff。迁移现有仓库请运行一次 `git-se i`。
-
+- 安装后加解密完全透明：`git add` / `git commit` 自动加密；`git checkout` / `git switch` / `git stash` 时自动解密。工作区始终是明文。支持 diff。迁移现有仓库请运行一次 `git-se i`。
 - `.gitattributes` 会增加一个由 `# BEGIN git-simple-encrypt (managed)` / `# END git-simple-encrypt` 标记包围的托管块；自定义规则请放在块外。加密列表变更时 git-se 会自动刷新该块。
 
 ### 手动加解密（老版本）
@@ -74,15 +73,6 @@ git-se i --mode hook        # 安装 pre commit hook，在每次提交前检查�
 - 配置文件：加密列表与配置存储在 `git_simple_encrypt.toml` 中，如需从列表中删除文件，请手动编辑该文件。
 - 迁移须知：
   - 所有的 major version 之间加解密算法都不兼容。请先解密仓库的所有文件，对于 v1.x -> v2.x 还需要去除 `git_simple_encrypt.toml` 列表里的所有 wildcard 格式（v2.x+ 不支持 wildcard），然后再升级版本。
-
-## 安全说明
-
-- 密码存储：通过 `git-se p` 或 `git-se set key` 设置的密码（派生密钥前的原始密码）以明文存储在仓库本地 git 配置中（`.git/config` 的 `git-simple-encrypt.key` 项），任何能读取仓库目录的本地进程、同步盘与备份均可获取。这是「单密码」设计的固有代价，请勿将仓库目录置于不受信任的同步或备份位置。
-- 密码输入与传输：交互式输入按终端默认回显明文（有意为之：单密码无找回途径，可见的输入反馈优于无声的键入错误；代价是明文会留在终端回滚缓冲中）。密码写入 `.git/config` 采用直接编辑文件、按 git 兼容的值转义规则写入的方式，全程不经过任何子进程的命令行参数（进程列表）；派生密钥与加密缓冲在内存中随 drop 清零。
-- 密钥派生：Argon2 使用固定默认参数（Argon2id，m=19MiB，t=2，p=1）。参数不写入文件头，因此属于磁盘格式的冻结部分：换参数将无法解密既有文件（且参数不匹配与密码错误无法区分），所以 major 版本内参数不可调整。计划在下个 major 版本将参数暴露为配置项，并在头部保留字节中记录参数标识。
-- AEAD 实现：XChaCha20-Poly1305 由 `chacha20poly1305-simd` crate 提供（出于其显式 SIMD 的性能动机），该 crate 不在 RustCrypto 审计系列内。`Cargo.toml` 以 caret semver（`"0.3"`）跟踪其版本，允许兼容的次版本更新；实际参与构建的确切版本由 `Cargo.lock` 锁定。
-- 确定性与 Zstd 版本：启用压缩时 Nonce 基于压缩后的分块数据派生，因此密文还依赖于 Zstd 编码器的确切字节输出。升级 zstd crate 可能改变相同输入的压缩输出，使未变更文件重加密后产生不同密文（在 `git status` 中表现为幻影修改）；数据本身始终可解密。此类升级在 major 版本内会尽量推迟。
-- 解压：解密后的数据解压写盘无磁盘填充上限（仅受 zstd window 限制），与通用解压工具一致；仅在已知密码场景下才会到达解压路径，属低风险披露。
 
 ---
 
@@ -142,7 +132,7 @@ sequenceDiagram
 
 解密：从文件读取 24 字节作为 `Nonce_i`，读取后续的密文 + Tag，直接调用 XChaCha20-Poly1305 解密。
 
-### 4. 确定性重加密（Salt + File_ID 缓存）
+### 4\. 确定性重加密（Salt + File_ID 缓存）
 
 为保证 decrypt -> encrypt 循环对相同文件产生完全相同的密文，程序在 `.git/git-simple-encrypt-salt-cache` 中持久化每个文件的 Salt 和 File_ID。
 
