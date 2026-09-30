@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     crypt::{
-        header::{FILE_ID_LEN, FileHeader, SALT_LEN, is_encrypted_header, read_header_bytes},
+        header::{FILE_ID_LEN, FileHeader, SALT_LEN, has_gitse_magic, read_header_bytes},
         key::{KeyCache, KeyDerivation, split_key_enc},
         stream::{decrypt_body, encrypt_into},
     },
@@ -46,8 +46,11 @@ pub fn encrypt_file_to(
 ) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
+    // Magic-only skip: a GITSE file of ANY version is one of ours —
+    // re-encrypting it would double-wrap data (needing two decrypts), so it
+    // is left untouched regardless of whether this build understands it.
     if let Some(bytes) = read_header_bytes(&mut src_file)?
-        && is_encrypted_header(&bytes)
+        && has_gitse_magic(&bytes)
     {
         warn!("Source file already encrypted, skipping: {}", src.display());
         return Ok(None);
@@ -90,9 +93,10 @@ pub fn encrypt_file_to(
 /// - `derivation`: fresh Argon2 per call vs deduplicated via a shared [`KeyCache`];
 /// - `salt_cache`: optionally record `(salt, file_id)` for deterministic re-encryption.
 ///
-/// Returns `Ok(None)` when `src` is not encrypted by this tool (too short,
-/// foreign magic, or unsupported version), so callers can tell skip from
-/// failure without a separate header pre-read.
+/// Returns `Ok(None)` when `src` is not encrypted by this tool (too short or
+/// no GITSE magic), so callers can tell skip from failure without a separate
+/// header pre-read. A file carrying the magic but an unsupported
+/// version/algorithm fails with an explicit error instead.
 pub(super) fn decrypt_file_impl(
     src: &Path,
     dst: &Path,
@@ -109,12 +113,16 @@ pub(super) fn decrypt_file_impl(
         );
         return Ok(None);
     };
-    if !is_encrypted_header(&header_bytes) {
+    if !has_gitse_magic(&header_bytes) {
         debug!("File not encrypted (no magic), skipping: {}", src.display());
         return Ok(None);
     }
 
     debug!("Decrypting {} → {}", src.display(), dst.display());
+    // Magic without a supported version/algorithm is OUR file this build
+    // cannot handle — `from_bytes` turns that into an explicit error
+    // (`UnsupportedVersion` / `UnsupportedAlgo`) instead of letting the
+    // caller silently treat the ciphertext as plaintext.
     let header = *FileHeader::from_bytes(&header_bytes)?;
 
     // Record (salt, file_id) before decryption: even if the body fails to

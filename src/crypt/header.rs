@@ -56,6 +56,49 @@ pub fn is_encrypted_header(bytes: &[u8; HEADER_LEN]) -> bool {
     &bytes[0..5] == MAGIC && is_encrypted_version(bytes[5])
 }
 
+/// Sniff-level check on raw header bytes: do they carry our magic?
+///
+/// Magic alone means "this file claims to be a GITSE product" — the right
+/// gate for *skip/leave-untouched* decisions (re-encrypting over it would
+/// double-wrap data from another format version), as opposed to
+/// *can-we-decrypt* decisions, which need [`sniff`] or [`FileHeader::from_bytes`].
+#[must_use]
+pub fn has_gitse_magic(bytes: &[u8; HEADER_LEN]) -> bool {
+    &bytes[0..5] == MAGIC
+}
+
+/// Sniff classification of a raw 64-byte header prefix.
+///
+/// Splits "carries our magic" from "we fully understand it", so callers never
+/// silently double-encrypt a foreign-version file nor silently treat one of
+/// our own files as plaintext.
+pub enum Sniffed {
+    /// No GITSE magic — ordinary plaintext.
+    Plaintext,
+    /// Fully recognized: supported version and known algorithm.
+    Ciphertext,
+    /// GITSE magic but a version this build cannot handle (future format).
+    /// Never encrypt over it; decrypting it is impossible.
+    FutureVersion(u8),
+    /// GITSE magic, supported version, but an unknown algorithm byte — almost
+    /// certainly a plaintext imitating our header. Safe to encrypt as-is.
+    UnknownAlgo(u8),
+}
+
+/// Classify raw header bytes (see [`Sniffed`]).
+pub fn sniff(bytes: &[u8; HEADER_LEN]) -> Sniffed {
+    if !has_gitse_magic(bytes) {
+        return Sniffed::Plaintext;
+    }
+    if !is_encrypted_version(bytes[5]) {
+        return Sniffed::FutureVersion(bytes[5]);
+    }
+    if bytes[7] != ENC_ALGO {
+        return Sniffed::UnknownAlgo(bytes[7]);
+    }
+    Sniffed::Ciphertext
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileHeader {
