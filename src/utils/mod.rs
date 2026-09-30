@@ -66,27 +66,20 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
 
 /// Prompt the user for a password.
 ///
-/// On a real terminal the input is read with echo disabled (rpassword) so
-/// the plaintext never lands in the terminal scrollback. Non-TTY stdin
-/// (pipes, CI, `echo pw | git-se p`) falls back to the plain line read:
-/// there is no echo to suppress there, and scripted workflows depend on it.
+/// The input is echoed deliberately (plain line read): users of a
+/// single-password tool retype the password often, and visible feedback
+/// beats silent typos against a value with no recovery path. The
+/// plaintext-in-scrollback trade-off is disclosed in the README security
+/// notes.
 ///
 /// Returns an empty-password error if the user enters only whitespace. The
 /// returned string is wrapped in [`Zeroizing`] so the plaintext is scrubbed
 /// from memory on drop.
 pub fn prompt_password(prompt: &str) -> Result<Zeroizing<String>> {
-    use std::io::IsTerminal;
-
     print!("{prompt}");
     std::io::stdout().flush()?;
     let mut password = String::new();
-    if std::io::stdin().is_terminal() {
-        password = rpassword::read_password()?;
-        // rpassword consumes the Enter key silently; keep the visual line.
-        println!();
-    } else {
-        std::io::stdin().read_line(&mut password)?;
-    }
+    std::io::stdin().read_line(&mut password)?;
     let trimmed = password.trim();
     if trimmed.is_empty() {
         return Err(Error::EmptyPassword);
