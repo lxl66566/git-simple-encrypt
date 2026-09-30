@@ -140,6 +140,10 @@ impl FileHeader {
         id
     }
 
+    // Sound: FileHeader is repr(C) with compile-time size and alignment
+    // asserts (see the const asserts above), so the cast neither pads nor
+    // truncates.
+    #[allow(unsafe_code)]
     pub fn from_bytes(bytes: &[u8; HEADER_LEN]) -> crate::error::Result<&Self> {
         use crate::error::Error;
 
@@ -169,6 +173,8 @@ impl FileHeader {
         Ok(())
     }
 
+    // Sound: same repr(C) + size/alignment guarantees as from_bytes.
+    #[allow(unsafe_code)]
     #[must_use]
     pub const fn as_bytes(&self) -> &[u8; HEADER_LEN] {
         unsafe { &*std::ptr::from_ref::<Self>(self).cast() }

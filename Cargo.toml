@@ -33,7 +33,6 @@ fuck-backslash        = "0.1"
 ignore                = { version = "0.4", features = ["simd-accel"] }
 indicatif             = { version = "0.18", optional = true }
 log                   = "0.4"
-memmap2               = "0.9"
 parking_lot           = "0.12.5"
 path-absolutize       = "4"
 pathdiff              = "0.2"
@@ -45,6 +44,9 @@ rkyv                  = "0.8"
 serde                 = { version = "1", features = ["derive"] }
 tempfile              = "3.26.0"
 thiserror             = "2"
+# Under --all-features cargo reports this as unused: rayon-backend cfg-swaps
+# the parallel backend away. The lint cannot model mutually exclusive
+# features; keep the dependency (it is the default backend).
 youpipe               = { version = "0.5.0", default-features = false }
 zeroize               = "1.9"
 zstd                  = "0.13"
@@ -81,7 +83,9 @@ pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
 [lints.rust]
-unsafe_code           = "allow"
+# Unsafe is allowed only at the audited spots (repr(C) header casts); new
+# unsafe code must justify itself locally with #[allow(unsafe_code)].
+unsafe_code           = "deny"
 unused_qualifications = "warn"
 
 [profile.release]

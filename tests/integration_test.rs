@@ -101,6 +101,8 @@ impl IsolatedGitConfig {
         // SAFETY: the temporary values only affect git subprocesses spawned
         // by tests and are benign for them (git works fine without a global
         // config; identities are set per-repo, so no global one is needed).
+        // Note: tests here never spawn threads that read these variables.
+        #[allow(unsafe_code)]
         unsafe {
             env::set_var("HOME", empty_home);
             env::set_var("GIT_CONFIG_NOSYSTEM", "1");
@@ -117,6 +119,7 @@ impl IsolatedGitConfig {
 impl Drop for IsolatedGitConfig {
     fn drop(&mut self) {
         // SAFETY: see `IsolatedGitConfig::new`
+        #[allow(unsafe_code)]
         unsafe {
             for (key, value) in self.0.drain(..) {
                 match value {
@@ -1598,6 +1601,7 @@ fn keyscope_global_config_key_is_not_adopted() -> anyhow::Result<()> {
     // SAFETY: restored by the IsolatedGitConfig guard's Drop (the variable
     // was unset when the guard captured it); only git subprocesses of this
     // test observe the temporary value.
+    #[allow(unsafe_code)]
     unsafe {
         env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
     }
