@@ -57,6 +57,7 @@ pub fn run(cli: Cli) -> Result<()> {
         SubCommand::Clean { path } => filter::clean(&repo, &path)?,
         SubCommand::Smudge { path } => filter::smudge(&repo, &path)?,
         SubCommand::Diff { file } => filter::diff(&repo, file.as_deref())?,
+        SubCommand::FilterProcess => filter::process::serve(&repo)?,
     }
     Ok(())
 }

@@ -537,11 +537,18 @@ impl Repo {
         }
     }
 
-    /// Whether the clean/smudge filter integration is installed in this repo.
+    /// Whether the filter integration is installed in this repo: the
+    /// clean/smudge drivers and/or the process filter.
     #[must_use]
     pub fn filter_installed(&self) -> bool {
+        // `required` is written by every install of the filter mode; the
+        // `process` check keeps this true for setups wired to the process
+        // filter alone.
         self.get_raw_config(&format!("filter.{}.required", gitattributes::FILTER_NAME))
             .is_ok()
+            || self
+                .get_raw_config(&format!("filter.{}.process", gitattributes::FILTER_NAME))
+                .is_ok()
     }
 
     /// Install the git filter integration: export `.gitattributes` and
@@ -605,6 +612,12 @@ impl Repo {
         let f = format!("filter.{}", gitattributes::FILTER_NAME);
         self.set_raw_config(&format!("{f}.clean"), &format!("{quoted} clean %f"))?;
         self.set_raw_config(&format!("{f}.smudge"), &format!("{quoted} smudge %f"))?;
+        // Long-running process filter: one daemon serves every blob of a git
+        // operation, amortizing the per-file process cold start, repo open
+        // and Argon2 (a shared batch salt). Clean/smudge above stay
+        // configured: git >= 2.16 prefers `process`, older git ignores the
+        // unknown key and falls back to them.
+        self.set_raw_config(&format!("{f}.process"), &format!("{quoted} filter-process"))?;
         // Fail loudly (instead of committing plaintext) when the filter
         // cannot run, e.g. the binary was moved.
         self.set_raw_config(&format!("{f}.required"), "true")?;

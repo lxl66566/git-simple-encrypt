@@ -1646,3 +1646,413 @@ fn keyscope_global_config_key_is_not_adopted() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+// ============ region: process filter (git >= 2.16) ============
+
+/// Minimal pkt-line helpers for driving the real `git-se filter-process`
+/// binary the way git would.
+mod pkt {
+    use std::io::Read;
+
+    pub const FLUSH: &[u8] = b"0000";
+
+    pub fn line(line: &str) -> Vec<u8> {
+        data(format!("{line}\n").as_bytes())
+    }
+
+    pub fn data(bytes: &[u8]) -> Vec<u8> {
+        let mut v = format!("{:04x}", bytes.len() + 4).into_bytes();
+        v.extend_from_slice(bytes);
+        v
+    }
+
+    pub fn concat(parts: &[&[u8]]) -> Vec<u8> {
+        parts.concat()
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Pkt {
+        Flush,
+        Data(Vec<u8>),
+    }
+
+    pub fn read(reader: &mut dyn Read) -> std::io::Result<Pkt> {
+        let mut prefix = [0u8; 4];
+        reader.read_exact(&mut prefix)?;
+        if prefix == *FLUSH {
+            return Ok(Pkt::Flush);
+        }
+        let len = usize::from_str_radix(&String::from_utf8_lossy(&prefix), 16)
+            .map_err(std::io::Error::other)?;
+        let mut payload = vec![0u8; len - 4];
+        reader.read_exact(&mut payload)?;
+        Ok(Pkt::Data(payload))
+    }
+
+    /// A key=value list terminated by flush.
+    pub fn read_list(reader: &mut dyn Read) -> Vec<String> {
+        let mut out = Vec::new();
+        loop {
+            match read(reader).unwrap() {
+                Pkt::Flush => return out,
+                Pkt::Data(bytes) => {
+                    out.push(String::from_utf8_lossy(&bytes).trim_end().to_owned());
+                },
+            }
+        }
+    }
+
+    pub fn read_content(reader: &mut dyn Read) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            match read(reader).unwrap() {
+                Pkt::Flush => return out,
+                Pkt::Data(bytes) => out.extend_from_slice(&bytes),
+            }
+        }
+    }
+}
+
+/// Drive the real binary over its stdin/stdout pipes: handshake, one clean,
+/// then close stdin (EOF) and read everything it wrote back. Strict parsing
+/// doubles as the no-stray-stdout-bytes check: anything non-protocol fails
+/// to decode, and nothing may remain after the parsed session.
+#[test]
+fn filter_process_binary_speaks_pure_protocol() -> anyhow::Result<()> {
+    use std::{
+        io::{Read as _, Write as _},
+        process::{Command, Stdio},
+    };
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-se"))
+        .args(["filter-process"])
+        .current_dir(dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        // stdout is the protocol channel; stderr may only see the
+        // error-level logger, which stays silent on success
+        .stderr(Stdio::null())
+        .spawn()
+        .context("spawn git-se filter-process")?;
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        stdin.write_all(&pkt::concat(&[
+            &pkt::line("git-filter-client"),
+            &pkt::line("version=2"),
+            pkt::FLUSH,
+            &pkt::line("capability=clean"),
+            &pkt::line("capability=smudge"),
+            pkt::FLUSH,
+        ]))?;
+        stdin.write_all(&pkt::concat(&[
+            &pkt::line("command=clean"),
+            &pkt::line("pathname=a.txt"),
+            pkt::FLUSH,
+            &pkt::data(b"binary protocol session"),
+            pkt::FLUSH,
+        ]))?;
+    }
+    drop(child.stdin.take()); // EOF: the process must exit on its own
+
+    let mut out = Vec::new();
+    child.stdout.take().unwrap().read_to_end(&mut out)?;
+    let status = child.wait()?;
+    assert!(status.success(), "clean EOF exit expected, got {status}");
+
+    let mut cur = std::io::Cursor::new(&out);
+    assert_eq!(pkt::read_list(&mut cur), [
+        "git-filter-server".to_string(),
+        "version=2".to_string()
+    ]);
+    assert_eq!(pkt::read_list(&mut cur), [
+        "capability=clean".to_string(),
+        "capability=smudge".to_string()
+    ]);
+    assert_eq!(pkt::read_list(&mut cur), ["status=success".to_string()]);
+    let ciphertext = pkt::read_content(&mut cur);
+    assert!(ciphertext.starts_with(b"GITSE"));
+    assert_eq!(pkt::read_list(&mut cur), Vec::<String>::new()); // keep success
+    assert_eq!(
+        usize::try_from(cur.position()).unwrap(),
+        out.len(),
+        "stray stdout bytes"
+    );
+
+    // interop: the one-shot textconv decrypts the process-mode ciphertext
+    fs::write(dir.join("probe.enc"), &ciphertext)?;
+    let plain = Command::new(env!("CARGO_BIN_EXE_git-se"))
+        .args(["diff", "probe.enc"])
+        .current_dir(dir)
+        .output()
+        .context("spawn git-se diff")?;
+    assert!(plain.status.success());
+    assert_eq!(plain.stdout, b"binary protocol session");
+    fs::remove_file(dir.join("probe.enc"))?;
+    Ok(())
+}
+
+/// Install wires the process filter; one `git add` of several files encrypts
+/// them all through the single daemon, the blobs decrypt on checkout, and a
+/// forced re-clean reproduces the identical blobs (determinism).
+#[test]
+fn filter_process_install_add_checkout_deterministic() -> anyhow::Result<()> {
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+
+    fs::write(dir.join("a.txt"), "secret a\n")?;
+    fs::create_dir(dir.join("sub"))?;
+    fs::write(dir.join("sub/b.txt"), "secret b\n")?;
+    fs::write(dir.join("sub/c.txt"), "secret c\n")?;
+    run(
+        SubCommand::Add {
+            paths: ["a.txt", "sub"].map(PathBuf::from).to_vec(),
+        },
+        dir,
+    )?;
+
+    run_bin(dir, &["install"])?;
+
+    // the process filter is configured next to the clean/smudge fallback
+    let process = git_str(dir, &[
+        "config",
+        "--local",
+        "--get",
+        "filter.git-se.process",
+    ])?;
+    assert!(process.contains("filter-process"), "{process}");
+
+    git(dir, &["add", "."])?;
+    for f in ["a.txt", "sub/b.txt", "sub/c.txt"] {
+        assert!(
+            git(dir, &["cat-file", "blob", &format!(":{f}")])?.starts_with(b"GITSE"),
+            "{f} must be staged as ciphertext"
+        );
+    }
+    // worktree stays plaintext
+    assert_eq!(fs::read_to_string(dir.join("a.txt"))?, "secret a\n");
+
+    // forced re-clean is byte-stable (touch-equivalent: renormalize defeats
+    // the stat cache and re-runs clean on every file)
+    let oids_before: Vec<String> = ["a.txt", "sub/b.txt", "sub/c.txt"]
+        .iter()
+        .map(|f| git_str(dir, &["rev-parse", &format!(":{f}")]))
+        .collect::<anyhow::Result<_>>()?;
+    git(dir, &["add", "--renormalize", "."])?;
+    for (f, before) in ["a.txt", "sub/b.txt", "sub/c.txt"].iter().zip(&oids_before) {
+        assert_eq!(
+            git_str(dir, &["rev-parse", &format!(":{f}")])?,
+            *before,
+            "re-clean of {f} must be deterministic"
+        );
+    }
+
+    git(dir, &["commit", "-m", "enc"])?;
+    fs::remove_file(dir.join("a.txt"))?;
+    git(dir, &["checkout", "--", "a.txt"])?;
+    assert_eq!(fs::read_to_string(dir.join("a.txt"))?, "secret a\n");
+
+    Ok(())
+}
+
+/// One `git add` through the process filter mints ONE shared salt for every
+/// cache miss of that git operation (single Argon2 derivation via the key
+/// cache); the one-shot clean/smudge fallback keeps per-file salts.
+#[test]
+fn filter_process_shares_batch_salt_per_git_operation() -> anyhow::Result<()> {
+    use std::collections::HashSet;
+
+    use git_simple_encrypt::salt_cache::SaltCacheReader;
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+
+    for i in 0..4 {
+        fs::write(dir.join(format!("m{i}.txt")), format!("secret {i}\n"))?;
+    }
+    run(
+        SubCommand::Add {
+            paths: ["m0.txt", "m1.txt", "m2.txt", "m3.txt"]
+                .map(PathBuf::from)
+                .to_vec(),
+        },
+        dir,
+    )?;
+    run_bin(dir, &["install"])?;
+
+    git(dir, &["add", "."])?;
+
+    let reader = SaltCacheReader::load(dir);
+    let salts: HashSet<[u8; 16]> = (0..4)
+        .map(|i| reader.get(format!("m{i}.txt").as_bytes()).unwrap().salt)
+        .collect();
+    assert_eq!(salts.len(), 1, "one git add shares one batch salt");
+
+    // fallback mode (process unset): a fresh file gets its own salt
+    git(dir, &[
+        "config",
+        "--local",
+        "--unset",
+        "filter.git-se.process",
+    ])?;
+    fs::write(dir.join("m4.txt"), "secret 4\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["m4.txt".into()],
+        },
+        dir,
+    )?;
+    git(dir, &["add", "m4.txt"])?;
+    let reader = SaltCacheReader::load(dir);
+    assert!(!salts.contains(&reader.get(b"m4.txt").unwrap().salt));
+
+    Ok(())
+}
+
+/// Ciphertext interop between the process filter and the one-shot
+/// clean/smudge fallback in both directions: same cache, same format.
+#[test]
+fn filter_process_interop_with_one_shot_filters() -> anyhow::Result<()> {
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+
+    fs::write(dir.join("a.txt"), "via process\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["a.txt".into()],
+        },
+        dir,
+    )?;
+    run_bin(dir, &["install"])?;
+    git(dir, &["add", "a.txt"])?;
+    let process_oid = git_str(dir, &["rev-parse", ":a.txt"])?;
+
+    // one-shot mode: re-clean must reproduce the process-mode blob
+    git(dir, &[
+        "config",
+        "--local",
+        "--unset",
+        "filter.git-se.process",
+    ])?;
+    fs::write(dir.join("b.txt"), "via one-shot\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["b.txt".into()],
+        },
+        dir,
+    )?;
+    git(dir, &["add", "b.txt"])?;
+    git(dir, &["add", "--renormalize", "."])?;
+    assert_eq!(
+        git_str(dir, &["rev-parse", ":a.txt"])?,
+        process_oid,
+        "one-shot clean must reproduce the process-filter blob"
+    );
+
+    // one-shot smudge decrypts both blobs
+    git(dir, &["commit", "-m", "enc"])?;
+    fs::remove_file(dir.join("a.txt"))?;
+    fs::remove_file(dir.join("b.txt"))?;
+    git(dir, &["checkout", "--", "."])?;
+    assert_eq!(fs::read_to_string(dir.join("a.txt"))?, "via process\n");
+    assert_eq!(fs::read_to_string(dir.join("b.txt"))?, "via one-shot\n");
+
+    // and the process filter smudges one-shot-cleaned blobs back
+    let clean_cfg = git_str(dir, &["config", "--local", "--get", "filter.git-se.clean"])?;
+    let process_cfg = clean_cfg.replace("clean %f", "filter-process");
+    git(dir, &[
+        "config",
+        "--local",
+        "filter.git-se.process",
+        &process_cfg,
+    ])?;
+    fs::remove_file(dir.join("a.txt"))?;
+    git(dir, &["checkout", "--", "a.txt"])?;
+    assert_eq!(fs::read_to_string(dir.join("a.txt"))?, "via process\n");
+
+    Ok(())
+}
+
+/// A pre-process-filter install (clean/smudge only) is upgraded by running
+/// install again: the process config is added on top.
+#[test]
+fn filter_process_upgrade_from_old_install() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+
+    run_bin(dir, &["install"])?;
+    assert!(
+        git(dir, &[
+            "config",
+            "--local",
+            "--get",
+            "filter.git-se.process"
+        ])
+        .is_ok()
+    );
+    git(dir, &[
+        "config",
+        "--local",
+        "--unset",
+        "filter.git-se.process",
+    ])?;
+
+    run_bin(dir, &["install"])?;
+    let process = git_str(dir, &[
+        "config",
+        "--local",
+        "--get",
+        "filter.git-se.process",
+    ])?;
+    assert!(process.contains("filter-process"), "{process}");
+    // the fallback entries survived the upgrade
+    assert!(
+        git_str(dir, &["config", "--local", "--get", "filter.git-se.clean"])?.contains("clean %f")
+    );
+    Ok(())
+}
+
+/// Without a usable key the process filter aborts the session, and git
+/// (filter.required=true) fails the whole `git add` instead of staging
+/// plaintext.
+#[test]
+fn filter_process_abort_fails_add_without_key() -> anyhow::Result<()> {
+    let pwd = TempDir::new()?;
+    let dir = pwd.path();
+    exec("git init", dir)?;
+    fs::write(dir.join("s.txt"), "secret\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        dir,
+    )?;
+    // no `git-se p`: the key is deliberately missing
+    run_bin(dir, &["install"])?;
+
+    let out = Command::new("git")
+        .args(["add", "s.txt"])
+        .current_dir(dir)
+        .output()
+        .context("git add")?;
+    assert!(
+        !out.status.success(),
+        "git add must fail when the filter aborts; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        git(dir, &["rev-parse", ":s.txt"]).is_err(),
+        "nothing may be staged"
+    );
+    Ok(())
+}

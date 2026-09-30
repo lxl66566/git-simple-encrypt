@@ -104,6 +104,11 @@ pub enum SubCommand {
         /// File holding the ciphertext (git passes a blob temp file here).
         file: Option<PathBuf>,
     },
+    /// Git long-running process filter (configured as
+    /// `filter.git-se.process`): speak the packet-line protocol on
+    /// stdin/stdout and serve every clean/smudge request of one git
+    /// invocation from a single process.
+    FilterProcess,
 }
 
 /// What `git-se install` sets up.
@@ -119,13 +124,12 @@ pub enum InstallMode {
 
 impl SubCommand {
     /// Whether this command is a git filter/textconv callback. Git invokes
-    /// these once per file with data on stdin/stdout, so they must stay quiet
-    /// and fast.
+    /// these with data on stdin/stdout, so they must stay quiet and fast.
     #[must_use]
     pub const fn is_filter_driver(&self) -> bool {
         matches!(
             self,
-            Self::Clean { .. } | Self::Smudge { .. } | Self::Diff { .. }
+            Self::Clean { .. } | Self::Smudge { .. } | Self::Diff { .. } | Self::FilterProcess
         )
     }
 }

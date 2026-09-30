@@ -4,9 +4,10 @@ use log::LevelFilter;
 
 fn main() {
     let cli = Cli::parse();
-    // Filter/textconv callbacks run once per file per git operation and
-    // stdout carries the data stream; default to error-only logging so they
-    // stay quiet. RUST_LOG still overrides (see parse_default_env).
+    // Filter/textconv callbacks (per file, or one long-lived process filter
+    // per git operation) have stdout carrying protocol/data streams; default
+    // to error-only logging so they stay quiet. RUST_LOG still overrides
+    // (see parse_default_env).
     let level = if cli.command.is_filter_driver() {
         LevelFilter::Error
     } else if cfg!(debug_assertions) {
