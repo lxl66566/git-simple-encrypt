@@ -28,8 +28,9 @@ pub enum Error {
     #[error("file or directory does not exist: {0}")]
     PathNotExist(PathBuf),
 
-    /// Expected a repo-relative path but got an absolute one.
-    #[error("expected repo-relative path, got absolute: {0}")]
+    /// Expected a path inside the repository but got an absolute path
+    /// elsewhere, or a relative path escaping the repo root (leading `..`).
+    #[error("path must be inside the repository: {0}")]
     PathNotRelative(PathBuf),
 
     /// Master key/password is empty.
