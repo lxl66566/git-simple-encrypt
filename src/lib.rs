@@ -33,13 +33,12 @@ pub fn run(cli: Cli) -> Result<()> {
     if !cli.repo.is_absolute() {
         return Err(Error::RepoPathNotAbsolute(cli.repo.clone()));
     }
-    // Filter callbacks run from the worktree root by git, but keep them
-    // working when invoked from anywhere inside the repo.
-    let mut repo = if cli.command.is_filter_driver() {
-        Repo::discover(&cli.repo)?
-    } else {
-        Repo::open(&cli.repo)?
-    };
+    // Every command resolves the repo the same way: `discover` walks up from
+    // the given directory, so invocations from anywhere inside the worktree
+    // (subdirectories included — what the discover docs promise) work for
+    // filter drivers and manual commands alike; at the repo root it behaves
+    // exactly like `Repo::open`.
+    let mut repo = Repo::discover(&cli.repo)?;
     match cli.command {
         SubCommand::Encrypt { paths } => encrypt_repo(&repo, &paths)?,
         SubCommand::Decrypt { paths } => decrypt_repo(&repo, &paths)?,
