@@ -1070,3 +1070,575 @@ fn test_check_staged_in_filter_mode() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+// ============ region config / walker / escape ============
+
+/// `e .` must encrypt the working tree but never descend into `.git` —
+/// encrypting git metadata would brick the repository and break the
+/// recovery path (`d .` needs `.git/config` for the password).
+#[test]
+fn walker_encrypt_root_dot_skips_git_dir() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+    fs::write(temp_dir.join("plain.txt"), "data")?;
+    assert!(temp_dir.join(".git").join("HEAD").is_file());
+
+    run(
+        SubCommand::Encrypt {
+            paths: vec![".".into()],
+        },
+        temp_dir,
+    )?;
+    assert!(temp_dir.join("plain.txt").is_encrypted());
+    assert!(temp_dir.join(".git").join("HEAD").is_not_encrypted());
+    assert!(temp_dir.join(".git").join("config").is_not_encrypted());
+
+    // Recovery still works: `d .` decrypts the worktree only.
+    run(
+        SubCommand::Decrypt {
+            paths: vec![".".into()],
+        },
+        temp_dir,
+    )?;
+    assert_eq!(fs::read_to_string(temp_dir.join("plain.txt"))?, "data");
+    Ok(())
+}
+
+/// `add` rejects entries that would corrupt or escape the repository: the
+/// repo root (`.`/`./`/absolute), `.git` internals and `..`-escapes. The
+/// config file must stay untouched.
+#[test]
+fn config_add_rejects_repo_root_git_and_escapes() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+    fs::write(temp_dir.join("f.txt"), "x")?;
+
+    for bad in [
+        ".".to_string(),
+        "./".to_string(),
+        temp_dir.display().to_string(),
+    ] {
+        let result = run(
+            SubCommand::Add {
+                paths: vec![bad.clone().into()],
+            },
+            temp_dir,
+        );
+        assert!(result.is_err(), "add {bad} must be rejected");
+    }
+    assert!(!temp_dir.join("git_simple_encrypt.toml").exists());
+
+    // A sibling directory reached via `..` is an escape.
+    let outside = TempDir::new()?;
+    let name = outside.path().file_name().unwrap().to_owned();
+    let relative_escape = PathBuf::from("..").join(&name);
+    let err = run(
+        SubCommand::Add {
+            paths: vec![relative_escape],
+        },
+        temp_dir,
+    )
+    .expect_err("relative escape must be rejected");
+    let err = err
+        .downcast_ref::<git_simple_encrypt::Error>()
+        .expect("should be a library error");
+    assert!(matches!(err, git_simple_encrypt::Error::PathNotRelative(_)));
+
+    // An absolute path outside the repo is rejected the same way.
+    let err = run(
+        SubCommand::Add {
+            paths: vec![outside.path().to_path_buf()],
+        },
+        temp_dir,
+    )
+    .expect_err("absolute outside path must be rejected");
+    let err = err
+        .downcast_ref::<git_simple_encrypt::Error>()
+        .expect("should be a library error");
+    assert!(matches!(err, git_simple_encrypt::Error::PathNotRelative(_)));
+
+    assert!(!temp_dir.join("git_simple_encrypt.toml").exists());
+    Ok(())
+}
+
+/// Encrypt/decrypt must never touch files outside the repository, whether
+/// the escaping path is relative (`..`) or absolute.
+#[test]
+fn escape_encrypt_outside_paths_are_skipped() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let outside = TempDir::new()?;
+    let absolute_target = outside.path().join("secret.txt");
+    fs::write(&absolute_target, "outside secret")?;
+    let name = outside.path().file_name().unwrap().to_owned();
+    let relative_target = PathBuf::from("..").join(&name).join("secret.txt");
+
+    for escaping in [absolute_target.clone(), relative_target] {
+        let result = run(
+            SubCommand::Encrypt {
+                paths: vec![escaping],
+            },
+            temp_dir,
+        );
+        assert!(result.is_err(), "encrypting outside the repo must fail");
+    }
+    assert!(
+        fs::read_to_string(&absolute_target)? == "outside secret",
+        "the outside file must stay untouched"
+    );
+    Ok(())
+}
+
+/// Absolute paths inside the repository are first-class targets: they used
+/// to panic on debug builds (`debug_assert`) while release builds handled
+/// them via `Path::join` replacement semantics.
+#[test]
+fn walker_absolute_path_roundtrip() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+    let file = temp_dir.join("abs.txt");
+    assert!(file.is_absolute());
+    fs::write(&file, "absolute path content")?;
+
+    run(
+        SubCommand::Encrypt {
+            paths: vec![file.clone()],
+        },
+        temp_dir,
+    )?;
+    assert!(file.is_encrypted());
+
+    run(
+        SubCommand::Decrypt {
+            paths: vec![file.clone()],
+        },
+        temp_dir,
+    )?;
+    assert_eq!(fs::read_to_string(&file)?, "absolute path content");
+    Ok(())
+}
+
+/// Files inside crypt-list entries that the ignore rules exclude must not be
+/// silently skipped: `e` does not encrypt them, but it (and `check`) warns
+/// loudly — otherwise they form a silent hole in the pre-commit defense.
+#[test]
+fn walker_ignored_file_in_crypt_entry_warns() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+    fs::write(temp_dir.join(".gitignore"), "*.env\n")?;
+    fs::create_dir(temp_dir.join("dir"))?;
+    fs::write(temp_dir.join("dir").join("keep.txt"), "keep")?;
+    fs::write(temp_dir.join("dir").join("x.env"), "secret")?;
+    // An ignored file OUTSIDE crypt coverage: plain ignore semantics, no
+    // warning expected.
+    fs::create_dir(temp_dir.join("otherdir"))?;
+    fs::write(temp_dir.join("otherdir").join("y.env"), "unrelated")?;
+
+    run(
+        SubCommand::Add {
+            paths: vec!["dir".into()],
+        },
+        temp_dir,
+    )?;
+
+    // List-mode `e`: keep.txt encrypted, x.env excluded but warned about.
+    let out = run_bin(temp_dir, &["e"])?;
+    assert!(
+        out.contains("x.env"),
+        "warning must surface on stdout: {out}"
+    );
+    assert!(
+        !out.contains("otherdir"),
+        "no warning for files outside crypt coverage: {out}"
+    );
+    assert!(temp_dir.join("dir").join("keep.txt").is_encrypted());
+    assert!(temp_dir.join("dir").join("x.env").is_not_encrypted());
+
+    // `check` surfaces the same warning (the file is invisible to it).
+    let out = run_bin(temp_dir, &["c"])?;
+    assert!(out.contains("x.env"), "{out}");
+
+    // Explicit-path `e dir` (inside crypt coverage) warns as well.
+    let out = run_bin(temp_dir, &["e", "dir"])?;
+    assert!(out.contains("x.env"), "{out}");
+    Ok(())
+}
+
+// ============ region: git integration & password hardening (repo.rs batch) ============
+
+/// Linked worktree (`git worktree add`): the `.git` entry is a `gitdir:`
+/// pointer file. The salt cache must resolve through it to the worktree's
+/// private gitdir, or every clean mints a fresh salt and re-adds drift
+/// (the blob oid changes on each re-clean).
+#[test]
+fn worktree_filter_add_is_deterministic() -> anyhow::Result<()> {
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+    fs::write(dir.join("s.txt"), "secret\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        dir,
+    )?;
+    run_bin(dir, &["install"])?;
+    git(dir, &["add", "."])?;
+    git(dir, &["commit", "-m", "init"])?;
+
+    let wt_parent = TempDir::new()?;
+    let wtdir = wt_parent.path().join("wt");
+    git(dir, &["worktree", "add", &wtdir.display().to_string()])?;
+    assert!(
+        wtdir.join(".git").is_file(),
+        "linked worktree .git must be a pointer file"
+    );
+
+    fs::write(wtdir.join("new.txt"), "fresh secret\n")?;
+    git(&wtdir, &["add", "new.txt"])?;
+    let oid1 = git_str(&wtdir, &["rev-parse", ":new.txt"])?;
+
+    // Force a re-clean (a plain re-add would be skipped by the stat cache).
+    git(&wtdir, &["add", "--renormalize", "."])?;
+    let oid2 = git_str(&wtdir, &["rev-parse", ":new.txt"])?;
+    assert_eq!(
+        oid1, oid2,
+        "clean in a linked worktree must be deterministic"
+    );
+
+    // The cache lives under the worktree's real gitdir, not beside the pointer.
+    let cache = dir
+        .join(".git")
+        .join("worktrees")
+        .join("wt")
+        .join("git-simple-encrypt-salt-cache");
+    assert!(
+        cache.is_file(),
+        "salt cache expected at {}",
+        cache.display()
+    );
+    Ok(())
+}
+
+/// A repo-local `core.hooksPath` (relative, resolved against the worktree
+/// root) decides where the hook is installed; `.git/hooks` is not written.
+#[test]
+fn hook_respects_local_core_hookspath() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git(dir, &["config", "--local", "core.hooksPath", "my-hooks"])?;
+    run_bin(dir, &["install", "--mode", "hook"])?;
+
+    let hook = dir.join("my-hooks").join("pre-commit");
+    assert!(hook.is_file(), "hook expected at {}", hook.display());
+    assert!(!dir.join(".git").join("hooks").join("pre-commit").exists());
+    Ok(())
+}
+
+/// The hook template must invoke the installing binary by absolute path —
+/// a bare `git-se` depends on PATH and blocks commits in GUI clients/CI.
+#[test]
+fn hook_invokes_absolute_exe_path() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+    run_bin(dir, &["install", "--mode", "hook"])?;
+
+    let hook = dir.join(".git").join("hooks").join("pre-commit");
+    let content = fs::read_to_string(&hook)?;
+    let exe = env!("CARGO_BIN_EXE_git-se").replace('\\', "/");
+    assert!(
+        content.contains(&format!("'{exe}' check --staged")),
+        "hook should call the absolute exe path, got: {content}"
+    );
+    Ok(())
+}
+
+/// `e`/`c`/`d` invoked with the repo argument pointing at a subdirectory
+/// must discover the repo root and act on repo-relative targets.
+#[test]
+fn subdir_encrypt_check_decrypt() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+    fs::create_dir(dir.join("sub"))?;
+    fs::write(dir.join("sub/s.txt"), "secret\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["sub".into()],
+        },
+        dir,
+    )?;
+
+    let sub = dir.join("sub");
+    run(SubCommand::Encrypt { paths: vec![] }, &sub)?;
+    assert!(dir.join("sub/s.txt").is_encrypted());
+    run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: false,
+        },
+        &sub,
+    )?;
+    run(SubCommand::Decrypt { paths: vec![] }, &sub)?;
+    assert_eq!(fs::read_to_string(dir.join("sub/s.txt"))?, "secret\n");
+    Ok(())
+}
+
+/// Staged files whose names contain spaces, non-ASCII (and quotes /
+/// backslashes on unix) must be enumerated and checked byte-exactly: the
+/// staged enumeration uses `-z`, so git's C-quoting cannot hide them.
+#[test]
+fn stagedblob_special_char_paths_are_checked() -> anyhow::Result<()> {
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = test_init();
+    let dir = pwd.path();
+
+    // `mut` is only consumed by the unix-only quote/backslash additions.
+    #[allow(unused_mut)]
+    let mut names: Vec<String> = vec![
+        "sp ace.txt".to_string(),
+        "dir with space/inner file.txt".to_string(),
+        "密码文件.txt".to_string(),
+    ];
+    // `"` and `\` are legal filename bytes on unix only (Windows forbids them).
+    #[cfg(unix)]
+    names.extend(["quo\"te.txt".to_string(), "back\\slash.txt".to_string()]);
+
+    for name in &names {
+        if let Some(parent) = Path::new(name)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            fs::create_dir_all(dir.join(parent))?;
+        }
+        fs::write(dir.join(name), "plaintext\n")?;
+    }
+    run(
+        SubCommand::Add {
+            paths: names.iter().map(PathBuf::from).collect(),
+        },
+        dir,
+    )?;
+
+    let mut add_args: Vec<&str> = vec!["add", "--"];
+    add_args.extend(names.iter().map(String::as_str));
+    git(dir, &add_args)?;
+
+    let result = run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: true,
+        },
+        dir,
+    );
+    let err = result.expect_err("staged plaintext with special-char names must fail");
+    let err = err
+        .downcast_ref::<git_simple_encrypt::Error>()
+        .expect("should be a library error");
+    let expected = names.len();
+    assert!(
+        matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(n, t) if *n == expected && *t == expected),
+        "expected all {expected} files flagged, got: {err:?}"
+    );
+
+    // After encrypting and re-staging, the blobs are ciphertext and pass.
+    run(SubCommand::Encrypt { paths: vec![] }, dir)?;
+    git(dir, &add_args)?;
+    run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: true,
+        },
+        dir,
+    )?;
+    Ok(())
+}
+
+/// A staged file whose worktree copy was deleted afterwards must still be
+/// checked — the staged blob is what the commit would write. An `exists()`
+/// filter used to drop such files, letting plaintext through the hook.
+#[test]
+fn stagedblob_worktree_deleted_file_is_still_checked() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let dir = pwd.path();
+
+    fs::write(dir.join("gone.txt"), "plaintext\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["gone.txt".into()],
+        },
+        dir,
+    )?;
+    git(dir, &["add", "gone.txt"])?;
+    fs::remove_file(dir.join("gone.txt"))?;
+
+    let result = run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: true,
+        },
+        dir,
+    );
+    let err = result.expect_err("staged plaintext without a worktree copy must fail");
+    let err = err
+        .downcast_ref::<git_simple_encrypt::Error>()
+        .expect("should be a library error");
+    assert!(
+        matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(1, 1)),
+        "got: {err:?}"
+    );
+    Ok(())
+}
+
+/// Staged plaintext cannot be masked by an encrypted worktree: the check
+/// inspects the staged blob, not the file on disk.
+#[test]
+fn stagedblob_encrypted_worktree_cannot_mask_staged_plaintext() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let dir = pwd.path();
+
+    fs::write(dir.join("s.txt"), "plaintext\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        dir,
+    )?;
+    git(dir, &["add", "s.txt"])?; // stages the plaintext bytes
+    run(SubCommand::Encrypt { paths: vec![] }, dir)?; // worktree now ciphertext
+    assert!(dir.join("s.txt").is_encrypted());
+
+    let result = run(
+        SubCommand::Check {
+            paths: vec![],
+            staged: true,
+        },
+        dir,
+    );
+    let err = result.expect_err("staged plaintext blob must fail despite the encrypted worktree");
+    let err = err
+        .downcast_ref::<git_simple_encrypt::Error>()
+        .expect("should be a library error");
+    assert!(
+        matches!(err, git_simple_encrypt::Error::FilesNotEncrypted(1, 1)),
+        "got: {err:?}"
+    );
+    Ok(())
+}
+
+/// `git-se i` must refuse to run its migration checkout over user-staged
+/// changes (`git checkout --force HEAD --` resets the index as well) and
+/// leave the repository untouched when refusing.
+#[test]
+fn installguard_refuses_to_reset_staged_changes() -> anyhow::Result<()> {
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+
+    // Commit an encrypted blob in manual mode: afterwards worktree == HEAD
+    // blob, exactly the state the install migration force-checkouts.
+    fs::write(dir.join("s.txt"), "secret\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        dir,
+    )?;
+    run(SubCommand::Encrypt { paths: vec![] }, dir)?;
+    git(dir, &["add", "s.txt"])?;
+    git(dir, &["commit", "-m", "enc"])?;
+
+    // Stage a modification, then restore the worktree to the committed
+    // bytes: index != HEAD, worktree == HEAD.
+    let committed = fs::read(dir.join("s.txt"))?;
+    let mut modified = committed.clone();
+    modified.extend_from_slice(b"more");
+    fs::write(dir.join("s.txt"), &modified)?;
+    git(dir, &["add", "s.txt"])?;
+    fs::write(dir.join("s.txt"), &committed)?;
+
+    let out = Command::new(env!("CARGO_BIN_EXE_git-se"))
+        .args(["install"])
+        .current_dir(dir)
+        .output()
+        .context("spawn git-se install")?;
+    assert!(
+        !out.status.success(),
+        "install must fail instead of silently discarding staged changes"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("staged"), "unexpected error: {stderr}");
+
+    // The refusal left everything intact.
+    assert_eq!(git_str(dir, &["diff", "--cached", "--name-only"])?, "s.txt");
+    assert!(git(dir, &["config", "--local", "--get", "filter.git-se.clean"]).is_err());
+    assert!(!dir.join(".gitattributes").exists());
+    Ok(())
+}
+
+/// A stray `git-simple-encrypt.key` in the user's global config must not be
+/// adopted: only the repo-local scope is read (matching where `set` writes).
+#[test]
+fn keyscope_global_config_key_is_not_adopted() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+    let global_cfg = empty_home.path().join("gitconfig");
+    fs::write(&global_cfg, "[git-simple-encrypt]\n\tkey = global-leak\n")?;
+    // SAFETY: restored by the IsolatedGitConfig guard's Drop (the variable
+    // was unset when the guard captured it); only git subprocesses of this
+    // test observe the temporary value.
+    unsafe {
+        env::set_var("GIT_CONFIG_GLOBAL", &global_cfg);
+    }
+
+    git(dir, &[
+        "config",
+        "--local",
+        "--unset",
+        "git-simple-encrypt.key",
+    ])?;
+    fs::write(dir.join("s.txt"), "secret\n")?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        dir,
+    )?;
+    let err = run(SubCommand::Encrypt { paths: vec![] }, dir)
+        .expect_err("encrypt must fail without a repo-local key");
+    assert!(
+        err.to_string().contains("Key not found"),
+        "expected a key-not-found error, got: {err}"
+    );
+
+    // A local key wins over the global one.
+    run(
+        SubCommand::Set {
+            field: SetField::Key {
+                value: "local-key".to_owned(),
+            },
+        },
+        dir,
+    )?;
+    assert_eq!(
+        git_str(dir, &[
+            "config",
+            "--local",
+            "--get",
+            "git-simple-encrypt.key"
+        ])?,
+        "local-key"
+    );
+    Ok(())
+}
