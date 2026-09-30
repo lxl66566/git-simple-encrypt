@@ -79,22 +79,35 @@ where
 /// Temporarily isolate git's config lookup for the current process (and thus
 /// for every git subprocess spawned by the library under test).
 ///
-/// Simulates a default-config user: empty `HOME`, no XDG config and no system
-/// config, so `core.quotepath` falls back to its default `true` even when the
-/// machine's global git config sets it to `false` (which would mask BUG-1).
+/// Simulates a default-config user: empty `HOME`, no XDG config, no system
+/// config and no redirected config files, so machine-global settings cannot
+/// leak into assertions. Examples that would otherwise break tests: a global
+/// `core.quotepath = false` masks the quoted-path regression, and a global
+/// `core.autocrlf = true` rewrites checked-out files with CRLF, breaking
+/// exact-content assertions after `git checkout`/`git clone`.
 /// Previous values are restored on drop, even on panic.
 struct IsolatedGitConfig(Vec<(&'static str, Option<OsString>)>);
 
 impl IsolatedGitConfig {
     fn new(empty_home: &Path) -> Self {
-        const KEYS: [&str; 3] = ["HOME", "GIT_CONFIG_NOSYSTEM", "XDG_CONFIG_HOME"];
+        const KEYS: [&str; 5] = [
+            "HOME",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+            "XDG_CONFIG_HOME",
+        ];
         let guard = Self(KEYS.iter().map(|&k| (k, env::var_os(k))).collect());
         // SAFETY: the temporary values only affect git subprocesses spawned
         // by tests and are benign for them (git works fine without a global
-        // config; no commit is made in tests, so no identity is needed).
+        // config; identities are set per-repo, so no global one is needed).
         unsafe {
             env::set_var("HOME", empty_home);
             env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+            // An explicitly redirected global/system config file would defeat
+            // the empty-HOME isolation above.
+            env::remove_var("GIT_CONFIG_GLOBAL");
+            env::remove_var("GIT_CONFIG_SYSTEM");
             env::remove_var("XDG_CONFIG_HOME");
         }
         guard
@@ -289,6 +302,53 @@ fn test_large_file_encrypt_decrypt() -> anyhow::Result<()> {
     let decrypted_data = fs::read(&file_path)?;
     assert_eq!(decrypted_data, original_data);
     assert!(file_path.is_not_encrypted());
+
+    Ok(())
+}
+
+/// Compressed multi-chunk roundtrip: the file's *compressed* stream spans
+/// several 64KB chunks. The payload is half random (incompressible, passes
+/// through as zstd raw blocks) and half zeros (highly compressible), so the
+/// compressed stream stays around 256KB — multiple chunks — while the real
+/// decompression path still runs for the zeros. Also locks determinism of the
+/// compressed ciphertext: decrypt → encrypt must reproduce the exact bytes.
+#[test]
+fn test_compressible_multichunk_roundtrip() -> anyhow::Result<()> {
+    let pwd = test_init();
+    let temp_dir = pwd.path();
+
+    let mut rng = SmallRng::from_seed([0xab; 32]);
+    let mut original = Vec::with_capacity(512 * 1024);
+    original.extend((0..256 * 1024).map(|_| rng.random::<u8>()));
+    original.extend(std::iter::repeat_n(0u8, 256 * 1024));
+
+    let file_path = temp_dir.join("mixed.bin");
+    fs::write(&file_path, &original)?;
+
+    run(
+        SubCommand::Add {
+            paths: vec![file_path.clone()],
+        },
+        temp_dir,
+    )?;
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+
+    assert!(file_path.is_compressed());
+    // The compressed stream exceeds one chunk: 64B header + at least two
+    // [NONCE (24) | CIPHERTEXT (<= 64KB) | TAG (16)] frames.
+    assert!(
+        fs::metadata(&file_path)?.len() > u64::try_from(64 + 2 * (24 + 64 * 1024 + 16)).unwrap(),
+        "compressed stream should span multiple chunks"
+    );
+    let ciphertext = fs::read(&file_path)?;
+
+    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    assert_eq!(fs::read(&file_path)?, original);
+
+    // Re-encrypting the unchanged file must reproduce the same compressed
+    // ciphertext byte for byte.
+    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    assert_eq!(fs::read(&file_path)?, ciphertext);
 
     Ok(())
 }
@@ -693,6 +753,11 @@ fn git_identity(pwd: &Path) -> anyhow::Result<()> {
 /// via `git add --renormalize`.
 #[test]
 fn test_filter_install_roundtrip() -> anyhow::Result<()> {
+    // Content assertions after `git checkout` require a default-config user:
+    // a global `core.autocrlf` would rewrite every checked-out file.
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
     let pwd = bench_init();
     let dir = pwd.path();
     git_identity(dir)?;
@@ -803,6 +868,11 @@ fn test_filter_install_roundtrip() -> anyhow::Result<()> {
 /// committed blobs.
 #[test]
 fn test_filter_install_on_clone() -> anyhow::Result<()> {
+    // The clone and the install-time re-checkout are both subject to a global
+    // `core.autocrlf`; the exact-content assertions need a default-config user.
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
     // origin repo with committed ciphertext
     let origin = bench_init();
     let odir = origin.path();

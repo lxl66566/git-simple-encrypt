@@ -425,6 +425,74 @@ fn test_exact_chunk_size_multiple_roundtrip_compressed() {
 }
 
 #[test]
+fn test_zstd_multichunk_roundtrip_and_determinism() {
+    // Incompressible data: the zstd stream stays above CHUNK_SIZE, so the
+    // encrypted body spans multiple chunks. All other compressed tests use
+    // highly redundant data that compresses to a few dozen bytes and never
+    // leaves chunk 0. Also locks compression determinism: same
+    // salt+file_id+password must yield byte-identical ciphertext.
+    let mut plaintext = vec![0u8; CHUNK_SIZE * 2 + 1000];
+    rand::rng().fill_bytes(&mut plaintext);
+
+    let password = b"zstd_multichunk_password";
+    let salt = [0x42; SALT_LEN];
+    let file_id = [0x13; FILE_ID_LEN];
+    let derived = derive_key(password, &salt).unwrap();
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&*derived);
+
+    let path1 = create_temp_file(&plaintext);
+    let path2 = create_temp_file(&plaintext);
+    encrypt_file(&path1, &key, &salt, Some(file_id), Some(3)).unwrap();
+    encrypt_file(&path2, &key, &salt, Some(file_id), Some(3)).unwrap();
+
+    let ct1 = std::fs::read(&path1).unwrap();
+    let ct2 = std::fs::read(&path2).unwrap();
+    assert_eq!(
+        ct1, ct2,
+        "Same plaintext + salt + file_id + zstd must produce identical ciphertext"
+    );
+    // At least one full chunk plus a second chunk frame must be present.
+    assert!(
+        ct1.len() > HEADER_LEN + (NONCE_LEN + CHUNK_SIZE + 16) + (NONCE_LEN + 16),
+        "incompressible zstd stream must split into multiple chunks"
+    );
+
+    decrypt_file(&path1, password).unwrap();
+    assert_eq!(std::fs::read(&path1).unwrap(), plaintext);
+}
+
+#[test]
+fn test_future_version_file_not_wrapped_and_rejected_by_decrypt() {
+    // A GITSE header with a version this build does not support: encrypt
+    // must leave it untouched (never double-wrap), decrypt must fail loudly
+    // instead of silently treating the ciphertext as plaintext.
+    let mut file_bytes = [0u8; HEADER_LEN + 64];
+    file_bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+    file_bytes[5] = VERSION + 1;
+    file_bytes[7] = 1; // enc_algo
+    file_bytes[HEADER_LEN..].fill(0xab);
+
+    let path = create_temp_file(&file_bytes);
+    let (key, salt) = get_test_key_and_salt();
+
+    // encrypt: magic-only detection → skipped, bytes unchanged
+    assert_eq!(
+        encrypt_file(&path, &key, &salt, None, None).unwrap(),
+        None,
+        "future-version GITSE file must not be re-encrypted"
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), file_bytes);
+
+    // decrypt: explicit unsupported-version error
+    let err = decrypt_file(&path, b"any_password").unwrap_err();
+    assert!(matches!(
+        err,
+        crate::error::Error::UnsupportedVersion(v) if v == VERSION + 1
+    ));
+}
+
+#[test]
 fn test_wrong_password_decrypt_fails() {
     let plaintext = b"data encrypted under one password";
     let path = create_temp_file(plaintext);
