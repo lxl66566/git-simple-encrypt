@@ -49,12 +49,11 @@ zeroize               = "1.9"
 zstd                  = "0.13"
 
 [dev-dependencies]
-anyhow    = "1.0"
-assert2   = "0.4"
-colored   = "3"
-criterion = "0.8"
-tap       = "1"
-tempfile  = "3.26.0"
+anyhow  = "1.0"
+assert2 = "0.4"
+colored = "3"
+# tempfile is already a regular dependency; dev-dependencies inherit it.
+tap     = "1"
 
 [features]
 default       = ["bin", "colored", "progress"]
@@ -85,7 +84,12 @@ unsafe_code           = "allow"
 unused_qualifications = "warn"
 
 [profile.release]
-opt-level = "s"
-strip     = true
-lto       = true
-panic     = "abort"
+# opt-level 3 instead of "s": the C toolchain compiles the zstd C sources with
+# -Os under "s", which measured ~2x slower compression and ~12% slower pure
+# encryption on this codebase; level 3 costs ~0.7MB of binary size, a fair
+# trade for a throughput-oriented tool.
+opt-level     = 3
+codegen-units = 1
+strip         = true
+lto           = true
+panic         = "abort"
