@@ -40,10 +40,11 @@
 //!
 //! # Persistence
 //!
-//! Serialized via [`rkyv`] to `<repo>/.git/git-simple-encrypt-salt-cache`.
-//! The binary format is opaque and not meant for human consumption. Writes
-//! are performed atomically to prevent corruption, and skipped when nothing
-//! changed (see [`write_merged`]).
+//! Serialized via [`rkyv`] to the repo's real git directory (resolving the
+//! `gitdir:` pointer of linked worktrees/submodules, see [`resolve_git_dir`]):
+//! `<gitdir>/git-simple-encrypt-salt-cache`. The binary format is opaque and
+//! not meant for human consumption. Writes are performed atomically to
+//! prevent corruption, and skipped when nothing changed (see [`write_merged`]).
 //!
 //! # Lifecycle
 //!
@@ -108,9 +109,49 @@ impl fmt::Debug for CacheRef<'_> {
     }
 }
 
+/// Resolve the real git directory of the worktree at `repo_path`.
+///
+/// `repo_path/.git` is a directory for a normal clone, but a
+/// `gitdir: <path>` pointer file for linked worktrees (`git worktree add`)
+/// and submodules. Naively joining the cache onto the pointer *file* yields a
+/// path whose parent does not exist, so every lock/write fails with "os
+/// error 3" and the cache silently stops working (breaking clean
+/// determinism exactly there).
+///
+/// Resolution strategy: parse the pointer file ourselves instead of spawning
+/// `git rev-parse --git-path`. The filter drivers open the repo and touch the
+/// cache once per file, and a git subprocess costs 20-50ms on Windows, while
+/// reading a ~60-byte file is free. Pointer parsing is exactly what git's own
+/// `read_gitfile` does and covers every real-world case where `.git` is not
+/// the gitdir; `--git-path`'s extra authority only matters for config
+/// overrides of *well-known* names (e.g. `core.hooksPath`), which cannot
+/// apply to our private cache name. A relative `gitdir:` target is resolved
+/// against the worktree root (a moved/cloned repo may contain one).
+fn resolve_git_dir(repo_path: &Path) -> PathBuf {
+    let dot_git = repo_path.join(".git");
+    if dot_git.is_dir() {
+        return dot_git;
+    }
+    if let Ok(content) = std::fs::read_to_string(&dot_git)
+        && let Some(target) = content.trim().strip_prefix("gitdir:")
+    {
+        let target = Path::new(target.trim());
+        // The target is the per-worktree gitdir, e.g.
+        // `<main>/.git/worktrees/<name>` or `<parent>/.git/modules/<name>`.
+        return if target.is_absolute() {
+            target.to_path_buf()
+        } else {
+            repo_path.join(target)
+        };
+    }
+    // Not a directory and not a parseable pointer: keep the legacy location
+    // so behavior degrades exactly as before (writes fail loudly in logs).
+    dot_git
+}
+
 /// Returns the cache file path for the given repo.
 fn cache_path(repo_path: &Path) -> PathBuf {
-    repo_path.join(".git").join(CACHE_FILENAME)
+    resolve_git_dir(repo_path).join(CACHE_FILENAME)
 }
 
 // ---------------------------------------------------------------------------
@@ -270,9 +311,8 @@ impl Writer {
 /// (they indicate a broken environment such as a read-only `.git`), unlike
 /// merge write failures, which follow the caller's [`Writer`] visibility.
 fn with_cache_lock<T>(repo_path: &Path, body: impl FnOnce(&Path) -> T) -> Option<T> {
-    let lock_path = repo_path
-        .join(".git")
-        .join(format!("{CACHE_FILENAME}.lock"));
+    let git_dir = resolve_git_dir(repo_path);
+    let lock_path = git_dir.join(format!("{CACHE_FILENAME}.lock"));
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -283,7 +323,7 @@ fn with_cache_lock<T>(repo_path: &Path, body: impl FnOnce(&Path) -> T) -> Option
             Ok(file)
         });
     match lock {
-        Ok(_guard) => Some(body(&cache_path(repo_path))),
+        Ok(_guard) => Some(body(&git_dir.join(CACHE_FILENAME))),
         Err(e) => {
             error!("Failed to lock salt cache {}: {e}", lock_path.display());
             None
@@ -404,7 +444,8 @@ impl SaltCacheSaver {
     ///    finished, so every sent entry is already buffered).
     /// 2. Merges with any existing on-disk cache (existing entries are kept only if no new entry
     ///    overrides them) under the exclusive cache lock.
-    /// 3. Serializes via rkyv and writes atomically to `<repo>/.git/<CACHE_FILENAME>`.
+    /// 3. Serializes via rkyv and writes atomically to the cache file in the repo's real git
+    ///    directory (worktree pointers included).
     ///
     /// Safe to call exactly once; a paired [`Drop`] impl guards the
     /// panic-on-drop path. Errors are logged but not propagated because cache
@@ -742,6 +783,53 @@ mod tests {
         let reader = SaltCacheReader::load(repo);
         assert_eq!(reader.get(b"a.txt"), Some(make_entry(0x11, 0x22)));
         assert_eq!(reader.get(b"b.txt"), Some(make_entry(0x33, 0x44)));
+    }
+
+    #[test]
+    fn test_cache_lands_in_worktree_gitdir_behind_pointer() {
+        // A linked worktree: `.git` is a `gitdir:` pointer file; joining the
+        // cache onto the pointer itself would produce a path under a
+        // nonexistent directory (os error 3 on every lock/write).
+        let dir = TempDir::new().unwrap();
+        let main_git = dir.path().join("main").join(".git");
+        let wt_git = main_git.join("worktrees").join("wt");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), format!("gitdir: {}\n", wt_git.display())).unwrap();
+
+        assert_eq!(cache_path(&wt), wt_git.join(CACHE_FILENAME));
+
+        // The full lock-guarded write path resolves the same way.
+        let entry = make_entry(0x11, 0x22);
+        merge_entries(&wt, [(b"f.txt".to_vec(), entry.clone())]);
+        assert!(wt_git.join(CACHE_FILENAME).exists());
+        assert!(wt_git.join(format!("{CACHE_FILENAME}.lock")).exists());
+        assert_eq!(SaltCacheReader::load(&wt).get(b"f.txt"), Some(entry));
+    }
+
+    #[test]
+    fn test_cache_resolves_relative_gitdir_pointer() {
+        // Repos can be moved so that the pointer target becomes relative;
+        // it must resolve against the worktree root. (Joining keeps the `..`
+        // component; comparison goes through Absolutize, which normalizes.)
+        use path_absolutize::Absolutize;
+
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("main").join(".git")).unwrap();
+        let wt = dir.path().join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(wt.join(".git"), b"gitdir: ../main/.git\n").unwrap();
+
+        assert_eq!(
+            cache_path(&wt).absolutize().unwrap(),
+            dir.path()
+                .join("main")
+                .join(".git")
+                .join(CACHE_FILENAME)
+                .absolutize()
+                .unwrap()
+        );
     }
 
     #[test]
