@@ -14,6 +14,12 @@
 //! workflows composable and makes migration safe (a worktree holding
 //! ciphertext from the manual workflow stays consistent with the index).
 //!
+//! Header sniffing is asymmetric on purpose (see `crypt::Sniffed`): clean
+//! never encrypts over any GITSE-magic file (a future format version passes
+//! through untouched instead of being double-wrapped), while smudge refuses
+//! GITSE files it cannot decrypt with an explicit error rather than handing
+//! the ciphertext to the worktree as fake plaintext.
+//!
 //! Determinism: git re-runs clean after a mere `touch`, and a different
 //! ciphertext would surface as a phantom modification. `clean` therefore
 //! reuses the cached `(salt, file_id)` for the path — recording a fresh one
@@ -28,12 +34,12 @@ use std::{
     path::Path,
 };
 
+use log::warn;
 use rand::prelude::Rng;
 
 use crate::{
     crypt::{
-        self, FileHeader, HEADER_LEN, SALT_LEN, cache_key, derive_key, encrypt_into,
-        is_encrypted_header,
+        self, FileHeader, HEADER_LEN, SALT_LEN, Sniffed, cache_key, derive_key, encrypt_into, sniff,
     },
     error::Result,
     repo::Repo,
@@ -55,10 +61,15 @@ fn peek(reader: &mut dyn Read, n: usize) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Whether `buf` starts with a full, recognized GITSE header.
+/// Whether `buf` starts with a full, recognized GITSE header: magic,
+/// supported version, and a known encryption algorithm.
+///
+/// The `enc_algo` check matters: without it a plaintext crafted to start with
+/// `GITSE\x03` would pass clean's passthrough gate and enter the repository
+/// unencrypted.
 pub(crate) fn is_ciphertext(buf: &[u8]) -> bool {
     buf.first_chunk::<HEADER_LEN>()
-        .is_some_and(is_encrypted_header)
+        .is_some_and(|bytes| matches!(sniff(bytes), Sniffed::Ciphertext))
 }
 
 /// Write `prefix` followed by the rest of `reader` unchanged.
@@ -78,8 +89,21 @@ fn clean_stream<W: Write>(
     out: &mut W,
 ) -> Result<()> {
     let prefix = peek(input, HEADER_LEN)?;
-    if is_ciphertext(&prefix) {
-        return passthrough(&prefix, input, out);
+    match prefix
+        .first_chunk::<HEADER_LEN>()
+        .map_or(Sniffed::Plaintext, sniff)
+    {
+        // Recognized ciphertext passes through unchanged (idempotency). A
+        // future-version GITSE file passes through too: encrypting over it
+        // would double-wrap data that no current build can unwrap in one
+        // step, so it is left byte-identical instead.
+        Sniffed::Ciphertext | Sniffed::FutureVersion(_) => {
+            return passthrough(&prefix, input, out);
+        },
+        Sniffed::UnknownAlgo(algo) => {
+            warn!("GITSE magic with unknown algorithm byte {algo}; encrypting as plaintext");
+        },
+        Sniffed::Plaintext => {},
     }
 
     let password = repo.get_key()?;
@@ -87,13 +111,17 @@ fn clean_stream<W: Write>(
     let reader = SaltCacheReader::load(repo.path());
     let (salt, file_id) = reader.get(&key).map_or_else(
         || {
-            // Record the fresh entry before encrypting so every later clean
-            // of this path reuses the same salt/file_id.
-            let entry = CachedEntry {
+            // First clean of this path: mint an entry and record it
+            // atomically under the cache lock, so concurrent first-cleans of
+            // the same path converge on ONE entry instead of
+            // last-writer-wins (the loser's ciphertext would otherwise
+            // diverge from the cache and resurface as a phantom
+            // modification on the next clean).
+            let candidate = CachedEntry {
                 salt: random_salt(),
                 file_id: FileHeader::generate_file_id(),
             };
-            salt_cache::merge_entries(repo.path(), [(key, entry.clone())]);
+            let entry = salt_cache::resolve_or_insert(repo.path(), &key, candidate);
             (entry.salt, Some(entry.file_id))
         },
         |entry| (entry.salt, Some(entry.file_id)),
@@ -125,8 +153,18 @@ fn decrypt_stream<W: Write>(
     record_key: Option<&[u8]>,
 ) -> Result<()> {
     let prefix = peek(input, HEADER_LEN)?;
-    if !is_ciphertext(&prefix) {
-        return passthrough(&prefix, input, out);
+    match prefix
+        .first_chunk::<HEADER_LEN>()
+        .map_or(Sniffed::Plaintext, sniff)
+    {
+        Sniffed::Plaintext => return passthrough(&prefix, input, out),
+        // A GITSE file this build cannot handle fails loudly: silently
+        // passing the ciphertext through would hand it to the worktree as
+        // fake "plaintext" (and via `filter.required=true`, git aborts the
+        // whole operation so the mismatch cannot go unnoticed).
+        Sniffed::FutureVersion(v) => return Err(crate::error::Error::UnsupportedVersion(v)),
+        Sniffed::UnknownAlgo(a) => return Err(crate::error::Error::UnsupportedAlgo(a)),
+        Sniffed::Ciphertext => {},
     }
 
     let password = repo.get_key()?;
@@ -258,5 +296,49 @@ mod tests {
         let mut input = Cursor::new(ciphertext);
         // failure propagates as a non-zero exit, making git abort the operation
         assert!(decrypt_stream(&repo, &mut input, &mut out, None).is_err());
+    }
+
+    /// A file with valid magic+version but a bogus algorithm byte: plaintext
+    /// imitating our header must be encrypted, not passed through into the
+    /// index.
+    #[test]
+    fn test_clean_encrypts_fake_gitse_header_with_unknown_algo() {
+        let (_dir, repo) = init_repo();
+
+        let mut fake = vec![0u8; HEADER_LEN + 10];
+        fake[..5].copy_from_slice(b"GITSE");
+        fake[5] = 3; // current version
+        fake[7] = 0x7f; // unknown algorithm
+        fake[HEADER_LEN..].copy_from_slice(b"plaintext!");
+
+        assert!(!is_ciphertext(&fake));
+
+        let out = clean_into(&repo, &fake);
+        assert_ne!(out, fake);
+        assert!(is_ciphertext(&out));
+        assert_eq!(decrypt_into_buf(&repo, &out, None), fake);
+    }
+
+    /// A GITSE file of a future version is never double-wrapped by clean and
+    /// is rejected loudly by smudge instead of being handed to the worktree
+    /// as fake plaintext.
+    #[test]
+    fn test_future_version_passthrough_on_clean_and_smudge_error() {
+        let (_dir, repo) = init_repo();
+
+        let mut future = vec![0u8; HEADER_LEN + 10];
+        future[..5].copy_from_slice(b"GITSE");
+        future[5] = 4; // future version
+        future[7] = 1;
+        future[HEADER_LEN..].copy_from_slice(b"ciphertext");
+
+        // clean passes it through byte-identically
+        assert_eq!(clean_into(&repo, &future), future);
+
+        // smudge refuses with an explicit unsupported-version error
+        let mut out = Vec::new();
+        let mut input = Cursor::new(future);
+        let err = decrypt_stream(&repo, &mut input, &mut out, None).unwrap_err();
+        assert!(matches!(err, crate::error::Error::UnsupportedVersion(4)));
     }
 }

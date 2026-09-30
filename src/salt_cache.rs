@@ -6,58 +6,66 @@
 //!
 //! # Architecture
 //!
-//! ## Read Path (encrypt) — Zero-copy via mmap + rkyv
+//! ## Read Path (encrypt) — one-shot read + rkyv
 //!
-//! [`SaltCacheReader`] memory-maps the cache file and uses rkyv's zero-copy
-//! deserialization to access the archived `HashMap<String, CachedEntry>`
-//! directly. No heap allocation or full deserialization is required for
-//! lookups.
+//! [`SaltCacheReader`] reads the whole cache file into memory once and
+//! deserializes it via rkyv. It used to mmap the file for zero-copy lookups,
+//! but on Windows an active mapping blocks the rename that atomically
+//! replaces the cache, so a reader could make every concurrent cache write
+//! (including its own process's) fail with access-denied. The cache is tiny —
+//! tens of bytes per tracked file — so a plain read costs nothing and removes
+//! the hazard entirely.
 //!
 //! ## Write Path (decrypt) — mpsc + rkyv
 //!
 //! [`SaltCacheSender`] is a `Sync` handle that wraps an `mpsc::Sender`.
-//! Rayon worker threads send `(path, entry)` pairs through the channel.
-//! After all parallel work completes, [`SaltCacheSaver`] collects the
-//! entries, merges with any existing on-disk cache, and serializes the
-//! result via rkyv.
+//! Worker threads send `(path, entry)` pairs through the channel. After all
+//! parallel work completes, [`SaltCacheSaver`] collects the entries, merges
+//! with any existing on-disk cache, and serializes the result via rkyv.
 //!
+//! ## Single-Writer Lock Protocol
 //!
-//! ## Single-Writer Merge (git filter drivers)
+//! All mutations — the filter drivers' per-file merges ([`merge_entries`],
+//! [`resolve_or_insert`]) and the batch saver's checkpoints/final save — run
+//! under an exclusive OS lock on `<cache>.lock`, so concurrent processes
+//! cannot lose each other's entries.
 //!
-//! The clean/smudge filter processes run one file per invocation and cannot
-//! share a channel; they merge entries directly via [`merge_entries`],
-//! serialized by an OS lock so concurrent processes cannot lose entries.
 //! # Key Format
 //!
 //! Cache keys are repo-relative path bytes with forward slashes (`b'/'`),
 //! computed by the caller via [`crate::crypt::cache_key`]. Using raw bytes
-//! (`Vec<u8>`) avoids UTF-8 validation overhead and string allocation.
+//! (`Vec<u8>`) avoids UTF-8 validation overhead and string allocation. On
+//! case-insensitive filesystems (Windows, macOS) keys are stored
+//! ASCII-lowercased; see [`storage_key`] for the compatibility story.
 //!
 //! # Persistence
 //!
 //! Serialized via [`rkyv`] to `<repo>/.git/git-simple-encrypt-salt-cache`.
 //! The binary format is opaque and not meant for human consumption. Writes
-//! are performed atomically to prevent corruption.
+//! are performed atomically to prevent corruption, and skipped when nothing
+//! changed (see [`write_merged`]).
 //!
 //! # Lifecycle
 //!
-//! - **Decrypt**: Create sender → workers send entries → saver persists (atomically)
-//! - **Encrypt**: Create reader (mmap, read-only) → workers look up cached values. **No write** is
-//!   performed during encryption.
-//! - **On error**: Cache is saved with whatever entries were captured before the failure,
+//! - **Decrypt**: Create sender → workers send entries → saver persists (atomically), with periodic
+//!   [`SaltCacheSaver::checkpoint`]s during long batches.
+//! - **Encrypt**: Create a reader (read-only) → workers look up cached values. The cache is written
+//!   during encryption only when a fresh entry is minted ([`resolve_or_insert`]; manual
+//!   `encrypt_repo` writes back through the sender/saver pair).
+//! - **On error**: The cache is saved with whatever entries were captured before the failure,
 //!   preserving partial progress.
 //! - **Stale entries**: Entries for files that no longer exist are harmless (looked up by key,
 //!   simply not found) and do not affect correctness.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     fmt,
     path::{Path, PathBuf},
     sync::mpsc,
 };
 
-use log::{debug, warn};
-use memmap2::Mmap;
+use log::{debug, error, warn};
 use rkyv::rancor::Error as RkyvError;
 
 use crate::{
@@ -106,16 +114,69 @@ fn cache_path(repo_path: &Path) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
-// Read Path — zero-copy via mmap + rkyv
+// Key normalization (case-insensitive filesystems)
 // ---------------------------------------------------------------------------
 
-/// Read-only salt cache backed by memory-mapped file + rkyv zero-copy access.
+/// Whether cache keys are case-normalized on this platform.
+const CASE_INSENSITIVE_FS: bool = cfg!(windows) || cfg!(target_os = "macos");
+
+/// Canonical storage form of a cache key: raw bytes on case-sensitive
+/// platforms, ASCII-lowercased on case-insensitive ones.
 ///
-/// Used during **encryption** to look up previously cached `salt/file_id`
-/// values without allocating or fully deserializing the cache.
+/// On Windows/macOS the same file can be spelled differently by git's index
+/// (the filter's `%f`) and by on-disk enumeration (manual commands); storing
+/// one canonical form lets both workflows share entries. ASCII-only folding:
+/// bytes >= 0x80 pass through untouched, so multi-byte UTF-8 path sequences
+/// are never corrupted.
+fn storage_key(key: &[u8]) -> Cow<'_, [u8]> {
+    if !CASE_INSENSITIVE_FS || !key.iter().any(u8::is_ascii_uppercase) {
+        Cow::Borrowed(key)
+    } else {
+        Cow::Owned(key.to_ascii_lowercase())
+    }
+}
+
+/// Look `key` up in `map`, honoring the raw-case entries written by <= 3.1.
+///
+/// Reads try the raw spelling first, then the normalized form, so legacy
+/// entries stay reachable without a cache migration. A legacy entry whose
+/// spelling differs from both lookups (e.g. a case-only rename happened since
+/// it was written) is unreachable — it costs one fresh entry once, after which
+/// the cache converges to normalized keys.
+fn lookup_entry<'a>(map: &'a HashMap<Vec<u8>, CachedEntry>, key: &[u8]) -> Option<&'a CachedEntry> {
+    if !CASE_INSENSITIVE_FS {
+        return map.get(key);
+    }
+    let folded = storage_key(key);
+    map.get(key).or_else(|| map.get(folded.as_ref()))
+}
+
+/// Canonicalize every key of a map destined for the disk (see
+/// [`storage_key`]).
+///
+/// Collision policy when both spellings exist: the last one written wins —
+/// both spellings denote the same file, so neither choice loses information.
+fn normalize_keys(map: HashMap<Vec<u8>, CachedEntry>) -> HashMap<Vec<u8>, CachedEntry> {
+    if !CASE_INSENSITIVE_FS {
+        return map;
+    }
+    map.into_iter()
+        .map(|(k, v)| (storage_key(&k).into_owned(), v))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Read Path — one-shot read + rkyv
+// ---------------------------------------------------------------------------
+
+/// In-memory salt cache snapshot used during **encryption** to look up
+/// previously cached `salt/file_id` values.
+///
+/// Deliberately not mmap-backed: an active mapping blocks the atomic
+/// rename-replace of the cache on Windows (see module docs). The whole file
+/// is read and deserialized once; lookups are plain `HashMap` gets.
 pub struct SaltCacheReader {
-    /// The memory-mapped cache file. `None` if no cache exists.
-    mmap: Option<Mmap>,
+    map: HashMap<Vec<u8>, CachedEntry>,
 }
 
 impl SaltCacheReader {
@@ -129,44 +190,18 @@ impl SaltCacheReader {
     pub fn load(repo_path: &Path) -> Self {
         let path = cache_path(repo_path);
 
-        let mmap = if path.exists() {
-            match std::fs::File::open(&path) {
-                Ok(file) => match unsafe { Mmap::map(&file) } {
-                    Ok(mmap) => {
-                        // Validate the archived data on load so that
-                        // `access_unchecked` in `get()` is sound.
-                        match rkyv::access::<rkyv::Archived<HashMap<Vec<u8>, CachedEntry>>, RkyvError>(
-                            &mmap,
-                        ) {
-                            Ok(_) => {
-                                debug!("Loaded salt cache from {}", path.display());
-                                Some(mmap)
-                            },
-                            Err(e) => {
-                                warn!("Corrupted salt cache at {}: {e}", path.display());
-                                None
-                            },
-                        }
-                    },
-                    Err(e) => {
-                        warn!("Failed to mmap salt cache at {}: {e}", path.display());
-                        None
-                    },
-                },
-                Err(e) => {
-                    warn!("Failed to open salt cache at {}: {e}", path.display());
-                    None
-                },
-            }
-        } else {
+        if !path.exists() {
             debug!("Salt cache not found at {}", path.display());
-            None
-        };
-
-        Self { mmap }
+            return Self {
+                map: HashMap::new(),
+            };
+        }
+        Self {
+            map: read_cache_file(&path).unwrap_or_default(),
+        }
     }
 
-    /// Look up a cached entry by repo-relative path key (bytes). Zero-copy.
+    /// Look up a cached entry by repo-relative path key (bytes).
     ///
     /// The `key` should be forward-slash normalized repo-relative path bytes,
     /// computed by the caller.
@@ -174,28 +209,143 @@ impl SaltCacheReader {
     /// Returns `None` if no cache file exists or the key is not cached.
     #[must_use]
     pub fn get(&self, key: &[u8]) -> Option<CachedEntry> {
-        let mmap = self.mmap.as_ref()?;
+        lookup_entry(&self.map, key).cloned()
+    }
+}
 
-        // SAFETY: We validated the mmap data in `load()`. The mapped file is
-        // not modified while this reader is alive.
-        let archived = unsafe {
-            rkyv::access_unchecked::<rkyv::Archived<HashMap<Vec<u8>, CachedEntry>>>(mmap.as_ref())
-        };
-
-        let entry = archived.get(key)?;
-
-        // For [u8; N] fields, Archived<[u8; N]> = [u8; N], so we can copy
-        // directly.
-        Some(CachedEntry {
-            salt: entry.salt,
-            file_id: entry.file_id,
-        })
+/// Read and deserialize the cache at `path`; `None` (with a warn) when it
+/// cannot be read or parsed.
+fn read_cache_file(path: &Path) -> Option<HashMap<Vec<u8>, CachedEntry>> {
+    match std::fs::read(path) {
+        Ok(bytes) => match rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&bytes) {
+            Ok(map) => Some(map),
+            Err(e) => {
+                warn!("Corrupted salt cache at {}: {e}", path.display());
+                None
+            },
+        },
+        Err(e) => {
+            warn!("Failed to read salt cache at {}: {e}", path.display());
+            None
+        },
     }
 }
 
 // ---------------------------------------------------------------------------
 // Write Path — mpsc collection + rkyv serialization
 // ---------------------------------------------------------------------------
+
+/// Which path is writing the cache — decides how loudly failures are logged.
+enum Writer {
+    /// Git filter driver: its process logger defaults to error-only (stdout
+    /// carries the data stream), so a `warn` is invisible — and a silently
+    /// lost entry breaks clean determinism, the exact failure this cache
+    /// exists to prevent.
+    Filter,
+    /// Interactive batch command (`git-se d`): default logging shows `warn`.
+    Batch,
+}
+
+impl Writer {
+    /// Report a merge/write failure at the visibility the calling path gets.
+    fn report_write_failure(self, msg: fmt::Arguments<'_>) {
+        match self {
+            Self::Filter => error!("{msg}"),
+            Self::Batch => warn!("{msg}"),
+        }
+    }
+}
+
+/// Acquire the exclusive `<cache>.lock`, then run `body` with it held.
+///
+/// This is the single-writer protocol shared by every cache mutation (filter
+/// merges and batch saves alike); without it, one writer's read-modify-write
+/// would silently drop entries another writer merged in between. The lock is
+/// advisory and released automatically when the process exits, so a crashed
+/// writer cannot leave a stale lock behind. Reads elsewhere need no lock:
+/// [`atomic_write`] renames into place, so a concurrent reader always sees
+/// the old or the new complete file.
+///
+/// Lock-acquisition failures are logged at `error` regardless of the caller
+/// (they indicate a broken environment such as a read-only `.git`), unlike
+/// merge write failures, which follow the caller's [`Writer`] visibility.
+fn with_cache_lock<T>(repo_path: &Path, body: impl FnOnce(&Path) -> T) -> Option<T> {
+    let lock_path = repo_path
+        .join(".git")
+        .join(format!("{CACHE_FILENAME}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .and_then(|file| {
+            file.lock()?;
+            Ok(file)
+        });
+    match lock {
+        Ok(_guard) => Some(body(&cache_path(repo_path))),
+        Err(e) => {
+            error!("Failed to lock salt cache {}: {e}", lock_path.display());
+            None
+        },
+    }
+}
+
+/// Merge `new` (normalized) into `map` (new entries win), returning whether
+/// anything actually changed.
+fn merge_into(map: &mut HashMap<Vec<u8>, CachedEntry>, new: HashMap<Vec<u8>, CachedEntry>) -> bool {
+    let mut changed = false;
+    for (k, v) in new {
+        changed |= map.get(&k).is_none_or(|old| *old != v);
+        map.insert(k, v);
+    }
+    changed
+}
+
+/// Serialize `map` and write it atomically to `path`, reporting failures at
+/// the given [`Writer`] visibility.
+fn persist_map(path: &Path, map: &HashMap<Vec<u8>, CachedEntry>, writer: Writer) {
+    match rkyv::to_bytes::<RkyvError>(map) {
+        Ok(bytes) => {
+            if let Err(e) = atomic_write(path, bytes.as_slice()) {
+                writer.report_write_failure(format_args!(
+                    "Failed to save salt cache to {}: {e}",
+                    path.display()
+                ));
+            } else {
+                debug!(
+                    "Saved salt cache with {} entries to {}",
+                    map.len(),
+                    path.display()
+                );
+            }
+        },
+        Err(e) => writer.report_write_failure(format_args!("Failed to serialize salt cache: {e}")),
+    }
+}
+
+/// Merge `entries` over the on-disk cache at `path` (new entries win) and
+/// write it atomically.
+///
+/// Best-effort: failures are logged per `writer`, never propagated (a lost
+/// entry only costs ciphertext determinism, never data). The write is skipped
+/// when every entry is already on disk verbatim — the common case for
+/// repeated smudges of cached paths and re-decrypts of an unchanged repo,
+/// which previously rewrote the whole file each time (O(N²) bytes for N files
+/// in a mass operation).
+fn write_merged(path: &Path, entries: HashMap<Vec<u8>, CachedEntry>, writer: Writer) {
+    let new = normalize_keys(entries);
+    let mut map = read_cache_file(path).unwrap_or_default();
+    if !merge_into(&mut map, new) {
+        debug!(
+            "Salt cache unchanged at {} ({} entries), skipping rewrite",
+            path.display(),
+            map.len()
+        );
+        return;
+    }
+    persist_map(path, &map, writer);
+}
 
 /// Thread-safe sender for cache entries, safe to share across worker threads.
 ///
@@ -223,7 +373,9 @@ impl SaltCacheSender {
 ///
 /// Created paired with a [`SaltCacheSender`] via [`create_writer`]. After all
 /// parallel work completes, call [`save`](Self::save) to collect entries,
-/// merge with any existing on-disk cache, and serialize via rkyv.
+/// merge with any existing on-disk cache, and serialize via rkyv. Long
+/// batches can flush intermediate progress with
+/// [`checkpoint`](Self::checkpoint).
 ///
 /// This type is **not** `Sync` — it should only be used on the main thread
 /// after parallel work completes.
@@ -233,7 +385,10 @@ impl SaltCacheSender {
 /// [`Drop`] is implemented as a safety net: if [`save`](Self::save) is not
 /// called (e.g. due to a panic during parallel decryption), any entries
 /// already buffered in the channel are still persisted. This honors the
-/// module-level contract that partial progress is preserved on error.
+/// module-level contract that partial progress is preserved on error. Note
+/// that release builds use `panic = "abort"`, under which `Drop` never runs —
+/// callers driving long batches should use [`checkpoint`](Self::checkpoint)
+/// instead of relying on this fallback.
 pub struct SaltCacheSaver {
     /// `Option` so [`save_inner`] can take it exactly once; subsequent `Drop`
     /// becomes a no-op.
@@ -248,7 +403,7 @@ impl SaltCacheSaver {
     ///    [`mpsc::Receiver::try_iter`] (non-blocking — by the time this is called, all workers have
     ///    finished, so every sent entry is already buffered).
     /// 2. Merges with any existing on-disk cache (existing entries are kept only if no new entry
-    ///    overrides them).
+    ///    overrides them) under the exclusive cache lock.
     /// 3. Serializes via rkyv and writes atomically to `<repo>/.git/<CACHE_FILENAME>`.
     ///
     /// Safe to call exactly once; a paired [`Drop`] impl guards the
@@ -273,14 +428,31 @@ impl SaltCacheSaver {
         // All workers have returned by the time we get here, so every
         // sent entry is already in the channel buffer.
         let entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
-
-        if entries.is_empty() {
-            debug!("No cache entries to save");
-            return;
-        }
-
-        write_merged(&cache_path(&self.repo_path), entries);
+        persist_entries(&self.repo_path, entries);
     }
+
+    /// Persist the entries buffered so far and keep collecting more.
+    ///
+    /// A periodic save point bounds cache loss when the process dies without
+    /// unwinding (release builds abort on panic, so the [`Drop`] fallback
+    /// never runs mid-batch): only the entries of the current chunk are at
+    /// risk, not those of the whole run.
+    pub fn checkpoint(&mut self) {
+        let Some(rx) = &self.rx else {
+            return;
+        };
+        let entries: HashMap<Vec<u8>, CachedEntry> = rx.try_iter().collect();
+        persist_entries(&self.repo_path, entries);
+    }
+}
+
+/// Flush collected entries through the locked merge path (no-op when empty).
+fn persist_entries(repo_path: &Path, entries: HashMap<Vec<u8>, CachedEntry>) {
+    if entries.is_empty() {
+        debug!("No cache entries to save");
+        return;
+    }
+    with_cache_lock(repo_path, |path| write_merged(path, entries, Writer::Batch));
 }
 
 /// Create a paired sender/saver for collecting cache entries.
@@ -298,45 +470,15 @@ pub fn create_writer(repo_path: &Path) -> (SaltCacheSender, SaltCacheSaver) {
     })
 }
 
-/// Merge `entries` over the cache at `path` (new entries win) and write it
-/// atomically. Best-effort: failures are logged, never propagated (a lost
-/// entry only costs ciphertext determinism, never data).
-fn write_merged(path: &Path, mut entries: HashMap<Vec<u8>, CachedEntry>) {
-    // Merge with existing cache on disk (keep existing entries only when
-    // no new entry covers the same path).
-    if path.exists()
-        && let Ok(existing_bytes) = std::fs::read(path)
-        && let Ok(existing) =
-            rkyv::from_bytes::<HashMap<Vec<u8>, CachedEntry>, RkyvError>(&existing_bytes)
-    {
-        for (k, v) in existing {
-            entries.entry(k).or_insert(v);
-        }
-    }
-
-    match rkyv::to_bytes::<RkyvError>(&entries) {
-        Ok(bytes) => {
-            if let Err(e) = atomic_write(path, bytes.as_slice()) {
-                warn!("Failed to save salt cache to {}: {e}", path.display());
-            } else {
-                debug!(
-                    "Saved salt cache with {} entries to {}",
-                    entries.len(),
-                    path.display()
-                );
-            }
-        },
-        Err(e) => warn!("Failed to serialize salt cache: {e}"),
-    }
-}
-
-/// Merge entries into the on-disk cache from a single-file process (the git clean/smudge drivers).
+/// Merge entries into the on-disk cache from a single-file process (the git
+/// clean/smudge drivers).
 ///
-/// Git runs filter processes concurrently (e.g. parallel smudge during checkout), so the
-/// read-modify-write cycle is serialized with an exclusive OS lock on `<cache>.lock`. The lock is
-/// advisory and released automatically when the process exits, so a crashed filter cannot leave a
-/// stale lock behind. Reads need no lock: [`atomic_write`] renames into place, so a concurrent
-/// reader always maps either the old or the new complete file.
+/// Git runs filter processes concurrently (e.g. parallel smudge during
+/// checkout), so the read-modify-write cycle is serialized with the exclusive
+/// OS lock on `<cache>.lock` (see [`with_cache_lock`]).
+///
+/// Failures log at `error`: filter drivers default to error-only logging, and
+/// a lost entry silently breaks clean determinism.
 pub fn merge_entries<I>(repo_path: &Path, entries: I)
 where
     I: IntoIterator<Item = (Vec<u8>, CachedEntry)>,
@@ -345,23 +487,44 @@ where
     if map.is_empty() {
         return;
     }
+    with_cache_lock(repo_path, |path| write_merged(path, map, Writer::Filter));
+}
 
-    let lock_path = repo_path
-        .join(".git")
-        .join(format!("{CACHE_FILENAME}.lock"));
-    let lock = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .and_then(|file| {
-            file.lock()?;
-            Ok(file)
-        });
-    match lock {
-        Ok(_guard) => write_merged(&cache_path(repo_path), map),
-        Err(e) => warn!("Failed to lock salt cache {}: {e}", lock_path.display()),
-    }
+/// Resolve the cache entry for `key` before a first-time encryption,
+/// converging concurrent writers on a single entry.
+///
+/// Two filter processes can miss on the same path simultaneously (parallel
+/// `git add` of new files) and each mint a random entry; with a plain
+/// last-writer-wins merge the loser's ciphertext would no longer match the
+/// cache, resurfacing as a phantom modification on the next clean. Here the
+/// decision and the cache write happen atomically under the exclusive lock:
+/// if another writer got there first, its entry is adopted *before* any
+/// encryption happens; otherwise the candidate is persisted and used. The
+/// returned entry therefore always matches the on-disk cache from the moment
+/// the lock is released — no re-encryption or post-hoc fixup is needed.
+///
+/// Returns the `candidate` unchanged when the cache is unwritable (missing
+/// `.git`, read-only filesystem, ...): encryption proceeds and only this
+/// path's determinism is at risk — the same best-effort contract as
+/// [`merge_entries`].
+#[must_use]
+pub fn resolve_or_insert(repo_path: &Path, key: &[u8], candidate: CachedEntry) -> CachedEntry {
+    let stored = storage_key(key).into_owned();
+    let fallback = candidate.clone();
+    with_cache_lock(repo_path, |path| {
+        let mut map = read_cache_file(path).unwrap_or_default();
+        if let Some(entry) = lookup_entry(&map, key) {
+            debug!(
+                "Salt cache entry appeared concurrently for {}, adopting it",
+                String::from_utf8_lossy(key)
+            );
+            return entry.clone();
+        }
+        map.insert(stored, candidate.clone());
+        persist_map(path, &map, Writer::Filter);
+        candidate
+    })
+    .unwrap_or(fallback)
 }
 
 impl Drop for SaltCacheSaver {
@@ -519,5 +682,97 @@ mod tests {
         let reader = SaltCacheReader::load(repo);
         assert_eq!(reader.get(b"f.txt"), Some(make_entry(0xbb, 0xcc)));
         assert_eq!(reader.get(b"other.txt"), Some(make_entry(0x99, 0xaa)));
+    }
+
+    #[test]
+    fn test_saver_does_not_lose_concurrent_filter_entries() {
+        // Regression for the lost-update window: the batch saver used to
+        // rewrite the whole cache without the lock, dropping entries a
+        // concurrent filter process had merged in between.
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let (sender, saver) = create_writer(repo);
+        sender.insert(b"batch.txt", make_entry(0x11, 0x22));
+        // concurrent filter write while the batch is still running
+        merge_entries(repo, [(b"filter.txt".to_vec(), make_entry(0x33, 0x44))]);
+        drop(sender);
+        saver.save();
+
+        let reader = SaltCacheReader::load(repo);
+        assert_eq!(reader.get(b"batch.txt"), Some(make_entry(0x11, 0x22)));
+        assert_eq!(reader.get(b"filter.txt"), Some(make_entry(0x33, 0x44)));
+    }
+
+    #[test]
+    fn test_resolve_or_insert_adopts_existing_entry() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let existing = make_entry(0x11, 0x22);
+        merge_entries(repo, [(b"f.txt".to_vec(), existing.clone())]);
+
+        // A concurrent writer "won the race": its entry is adopted, the
+        // candidate discarded.
+        let candidate = make_entry(0x33, 0x44);
+        assert_eq!(resolve_or_insert(repo, b"f.txt", candidate), existing);
+
+        // First writer for a new key: candidate is used and persisted.
+        let fresh = make_entry(0x55, 0x66);
+        assert_eq!(resolve_or_insert(repo, b"new.txt", fresh.clone()), fresh);
+        let reader = SaltCacheReader::load(repo);
+        assert_eq!(reader.get(b"new.txt"), Some(fresh));
+    }
+
+    #[test]
+    fn test_checkpoint_persists_early_entries() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let (sender, mut saver) = create_writer(repo);
+        sender.insert(b"a.txt", make_entry(0x11, 0x22));
+        saver.checkpoint();
+        sender.insert(b"b.txt", make_entry(0x33, 0x44));
+        drop(sender);
+        saver.save();
+
+        let reader = SaltCacheReader::load(repo);
+        assert_eq!(reader.get(b"a.txt"), Some(make_entry(0x11, 0x22)));
+        assert_eq!(reader.get(b"b.txt"), Some(make_entry(0x33, 0x44)));
+    }
+
+    #[test]
+    fn test_case_normalized_keys() {
+        let dir = TempDir::new().unwrap();
+        let repo = dir.path();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+
+        let entry = make_entry(0x11, 0x22);
+        {
+            let (sender, saver) = create_writer(repo);
+            sender.insert(b"Foo.txt", entry.clone());
+            drop(sender);
+            saver.save();
+        }
+
+        let reader = SaltCacheReader::load(repo);
+        // exact spelling always hits
+        assert_eq!(reader.get(b"Foo.txt"), Some(entry.clone()));
+        if CASE_INSENSITIVE_FS {
+            // any other spelling of the same file converges on the entry
+            assert_eq!(reader.get(b"foo.txt"), Some(entry.clone()));
+            assert_eq!(reader.get(b"FOO.TXT"), Some(entry.clone()));
+        } else {
+            // case-sensitive platforms keep spellings distinct
+            assert_eq!(reader.get(b"foo.txt"), None);
+        }
+
+        // resolve_or_insert also converges spellings on the same entry
+        let candidate = make_entry(0x33, 0x44);
+        let resolved = resolve_or_insert(repo, b"foo.TXT", candidate);
+        assert_eq!(resolved, entry);
     }
 }

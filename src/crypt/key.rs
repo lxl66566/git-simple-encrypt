@@ -77,12 +77,19 @@ pub(super) fn get_or_derive_key(
     master_key: &[u8],
     salt: &[u8; SALT_LEN],
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let lock = {
-        let guard = key_cache
-            .entry(*salt)
-            .or_insert_with(|| Arc::new(OnceLock::new()));
-        Arc::clone(&*guard)
-    };
+    // Fast path: `get` takes only the shard read-lock (and drops the guard
+    // before Argon2 runs). `entry()` always takes the exclusive lock, which
+    // would serialize worker threads looking up an already-derived salt.
+    let lock = key_cache.get(salt).map_or_else(
+        || {
+            Arc::clone(
+                &*key_cache
+                    .entry(*salt)
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        },
+        |guard| Arc::clone(guard.value()),
+    );
 
     match lock.get_or_init(|| derive_key(master_key, salt).map_err(|e| e.to_string())) {
         Ok(key) => Ok(key.clone()),
