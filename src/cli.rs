@@ -19,7 +19,8 @@ git-se e xxx.txt dir1 ...   # Encrypt specific files
 git-se d xxx.txt dir1 ...   # Decrypt specific files
 git-se i                    # Install git filter integration: automatic encryption / decryption
 "#)]
-#[clap(args_conflicts_with_subcommands = true)]
+// No `args_conflicts_with_subcommands`: `--repo` is a global argument and must
+// stay usable both before and after the subcommand (`git-se --repo . add x`).
 pub struct Cli {
     /// Encrypt, Decrypt and Add
     #[command(subcommand)]
@@ -215,5 +216,27 @@ mod tests {
         // "." should absolutize to the current working directory.
         let parsed = repo_path_parser(".").unwrap();
         assert!(parsed.is_absolute());
+    }
+
+    /// `--repo` is a global argument: it must parse before the subcommand,
+    /// between the subcommand and its positionals, and after them.
+    #[test]
+    fn repo_flag_parses_before_and_after_subcommand() {
+        for argv in [
+            ["git-se", "--repo", ".", "add", "a.txt"], // before the subcommand
+            ["git-se", "add", "--repo", ".", "a.txt"], // before the positionals
+            ["git-se", "add", "a.txt", "--repo", "."], // trailing
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert!(cli.repo.is_absolute(), "{argv:?}");
+            let SubCommand::Add { paths } = cli.command else {
+                panic!("expected Add subcommand for {argv:?}");
+            };
+            assert!(paths == [PathBuf::from("a.txt")]);
+        }
+
+        // A missing subcommand is still an error, with or without --repo.
+        assert!(Cli::try_parse_from(["git-se", "--repo", "."]).is_err());
+        assert!(Cli::try_parse_from(["git-se"]).is_err());
     }
 }
