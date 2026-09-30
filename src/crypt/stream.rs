@@ -1,4 +1,4 @@
-use std::io::{IoSlice, Read, Write};
+use std::io::{Read, Write};
 
 use chacha20poly1305_simd::XChaCha20Poly1305;
 use zeroize::Zeroizing;
@@ -11,28 +11,6 @@ use crate::{
     error::{Error, Result},
 };
 
-/// Write the full byte sequence of `bufs` in order via vectored writes,
-/// retrying across short writes. Stable stand-in for the (still unstable)
-/// `Write::write_all_vectored`.
-fn write_all_vectored(writer: &mut dyn Write, bufs: &mut [IoSlice<'_>]) -> Result<()> {
-    // Reborrow as a shrinkable view: `advance_slices` drops fully-written
-    // prefix slices, so the loop ends once every byte is written.
-    let mut rest = &mut *bufs;
-    while !rest.is_empty() {
-        match writer.write_vectored(rest)? {
-            0 => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "failed to write whole buffer",
-                )
-                .into())
-            },
-            n => IoSlice::advance_slices(&mut rest, n),
-        }
-    }
-    Ok(())
-}
-
 /// Streaming encryption loop: read plaintext chunks from `reader`, encrypt
 /// each with the cipher, and write `[NONCE | CIPHERTEXT | TAG]` to `writer`.
 fn encrypt_chunks(
@@ -43,14 +21,17 @@ fn encrypt_chunks(
     file_id: &[u8; FILE_ID_LEN],
     header_bytes: &[u8; HEADER_LEN],
 ) -> Result<()> {
-    // Reusable plaintext/ciphertext buffer. `encrypt_in_place` overwrites
-    // the plaintext chunk with its ciphertext and appends the 16 B Poly1305
-    // tag, so the capacity reserves CHUNK_SIZE + TAG_LEN up front — zero
-    // allocation and zero copy per chunk (the old `encrypt()` +
-    // `extend_from_slice` path allocated a fresh Vec and memcopied the whole
-    // chunk every iteration).
+    // Reusable buffer laid out as `[NONCE | chunk | TAG]`, so each chunk
+    // reaches the writer as ONE contiguous `write_all`. The previous layout
+    // issued a 24 B nonce write + a payload write per chunk via vectored IO —
+    // fine where writev exists, but on Windows files it degrades to two
+    // syscalls per chunk. The detached AEAD variant encrypts a plain
+    // `&mut [u8]` window in place (no `Buffer` growth needed), the tag is
+    // copied into the reserved tail, and the physical chunk format is
+    // unchanged. Zero allocation and zero chunk-sized copies per iteration.
     const TAG_LEN: usize = 16;
-    let mut buffer: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(CHUNK_SIZE + TAG_LEN));
+    let mut buffer: Zeroizing<Vec<u8>> =
+        Zeroizing::new(Vec::with_capacity(NONCE_LEN + CHUNK_SIZE + TAG_LEN));
     let mut aad = {
         let mut aad = [0u8; HEADER_LEN + 9];
         aad[..HEADER_LEN].copy_from_slice(header_bytes);
@@ -59,12 +40,12 @@ fn encrypt_chunks(
     let mut chunk_idx = 0u64;
 
     loop {
-        // Restore a full CHUNK_SIZE window for reading; `encrypt_in_place`
+        // Restore a full CHUNK_SIZE window for reading; `truncate` below
         // changes the length each iteration, so resize at the top.
-        buffer.resize(CHUNK_SIZE, 0);
+        buffer.resize(NONCE_LEN + CHUNK_SIZE, 0);
         let mut bytes_read = 0;
         while bytes_read < CHUNK_SIZE {
-            let n = reader.read(&mut buffer[bytes_read..])?;
+            let n = reader.read(&mut buffer[NONCE_LEN + bytes_read..NONCE_LEN + CHUNK_SIZE])?;
             if n == 0 {
                 break;
             }
@@ -75,21 +56,22 @@ fn encrypt_chunks(
         aad[HEADER_LEN..HEADER_LEN + 8].copy_from_slice(&chunk_idx.to_le_bytes());
         aad[HEADER_LEN + 8] = u8::from(is_last_chunk);
 
-        // Nonce is derived from the *plaintext* chunk, so compute it before
-        // `encrypt_in_place` overwrites the buffer with ciphertext.
-        let nonce = derive_nonce(key_mac, file_id, &buffer[..bytes_read], chunk_idx);
+        let (nonce_head, chunk) = buffer.split_at_mut(NONCE_LEN);
+        let chunk = &mut chunk[..bytes_read];
 
-        // Drop the zero-padding tail so the buffer holds exactly the plaintext,
-        // then encrypt in place: buffer becomes ciphertext+tag (len += 16).
-        buffer.truncate(bytes_read);
-        cipher
-            .encrypt_in_place(&nonce, &aad, &mut *buffer)
+        // Nonce is derived from the *plaintext* chunk, so compute it before
+        // the detached encrypt overwrites the window with ciphertext.
+        let nonce = derive_nonce(key_mac, file_id, chunk, chunk_idx);
+        nonce_head.copy_from_slice(&nonce);
+
+        let tag = cipher
+            .encrypt_in_place_detached(&nonce, &aad, chunk)
             .map_err(|e| Error::EncryptFailed(e.to_string()))?;
 
-        // Single vectored write per chunk: `[NONCE | CIPHERTEXT+TAG]` reaches
-        // the writer in one call instead of two syscalls on unbuffered `File`s.
-        let mut bufs = [IoSlice::new(&nonce), IoSlice::new(&buffer)];
-        write_all_vectored(writer, &mut bufs)?;
+        // Exactly `[NONCE | CIPHERTEXT | TAG]`, one write.
+        buffer.truncate(NONCE_LEN + bytes_read);
+        buffer.extend_from_slice(&tag);
+        writer.write_all(&buffer)?;
 
         chunk_idx += 1;
 
