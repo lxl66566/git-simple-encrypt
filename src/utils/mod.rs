@@ -20,6 +20,7 @@ use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
 use crate::{
+    config::CONFIG_FILE_NAME,
     crypt::{is_encrypted_header, read_header_bytes},
     error::{Error, Result},
     utils::style::Colorize,
@@ -219,10 +220,11 @@ fn join_repo_relative(repo_root: &Path, relative: &Path) -> PathBuf {
 
 /// Collect all regular files under `roots` (recursively for directories).
 ///
-/// Entries with a `.git` path component are always skipped, regardless of
-/// the ignore setting. When `apply_ignore` is false, gitignore-style
-/// filtering is disabled — used by [`ignored_in_crypt_entries`] to detect
-/// files the crypt list promised to cover but the walker silently excluded.
+/// Entries with a `.git` path component, and the tool's own config file at
+/// the repository root, are always skipped, regardless of the ignore
+/// setting. When `apply_ignore` is false, gitignore-style filtering is
+/// disabled — used by [`ignored_in_crypt_entries`] to detect files the
+/// crypt list promised to cover but the walker silently excluded.
 fn walk_files(roots: &[PathBuf], cwd: &Path, apply_ignore: bool) -> Vec<PathBuf> {
     let Some((first, rest)) = roots.split_first() else {
         return Vec::new();
@@ -252,6 +254,17 @@ fn walk_files(roots: &[PathBuf], cwd: &Path, apply_ignore: bool) -> Vec<PathBuf>
             if let Ok(entry) = result {
                 if has_git_component(entry.path()) {
                     // Refuse to emit anything from `.git` and do not descend.
+                    return WalkState::Skip;
+                }
+                // The tool's own config is off limits for directory walks:
+                // encrypting it would break every later command, decrypt
+                // included. As an explicitly targeted walk ROOT (depth 0) it
+                // stays reachable, so `d git_simple_encrypt.toml` can still
+                // recover a file an older release encrypted.
+                if entry.depth() > 0
+                    && entry.path().parent() == Some(cwd)
+                    && entry.file_name() == OsStr::new(CONFIG_FILE_NAME)
+                {
                     return WalkState::Skip;
                 }
                 if let Some(file_type) = entry.file_type()
@@ -578,13 +591,24 @@ mod tests {
         fs::write(base.join(".!git"), "lookalike").unwrap();
         fs::write(base.join(".gitignore"), "ig").unwrap();
         fs::write(base.join("normal.txt"), "n").unwrap();
+        // The tool's own config is off limits at the repo root during
+        // directory walks, and the same name inside a subdirectory is an
+        // ordinary file. Explicitly targeting the config as a walk root
+        // stays allowed (rescue path for `d`).
+        fs::write(base.join(CONFIG_FILE_NAME), "cfg").unwrap();
+        fs::write(base.join("sub").join(CONFIG_FILE_NAME), "cfg2").unwrap();
 
         let res = list_files(["."], base);
         assert_eq!(res, vec![
             base.join(".!git"),
             base.join(".gitignore"),
             base.join("normal.txt"),
+            base.join("sub").join(CONFIG_FILE_NAME),
         ]);
+
+        // As an explicit root the config is reachable (decrypt-rescue path).
+        let res = list_files([base.join(CONFIG_FILE_NAME)], base);
+        assert_eq!(res, vec![base.join(CONFIG_FILE_NAME)]);
     }
 
     #[test]

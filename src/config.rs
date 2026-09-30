@@ -148,6 +148,12 @@ impl Config {
                         relative.display()
                     )));
                 }
+                if relative == Path::new(CONFIG_FILE_NAME) {
+                    return Err(Error::Other(format!(
+                        "refusing to add `{CONFIG_FILE_NAME}`: encrypting the tool's own config \
+                         would make every later command (including decrypt) fail to load it",
+                    )));
+                }
                 let path_str = relative.fuck_backslash().to_string_lossy().into_owned();
                 // Entries are stored as repo-relative `/`-separated lossy strings;
                 // compare in exactly that form so a path never enters the list twice
@@ -244,6 +250,9 @@ mod tests {
                 "adding {bad:?} must be rejected"
             );
         }
+        // The tool's own config must not be put on the crypt list either.
+        fs::write(temp_dir.path().join(CONFIG_FILE_NAME), "use_zstd = true")?;
+        assert!(config.add_one_path_to_crypt_list(CONFIG_FILE_NAME).is_err());
         // The absolute repo root is the same case as `.`.
         assert!(config.add_one_path_to_crypt_list(temp_dir.path()).is_err());
         assert_eq!(config.crypt_list, Vec::<String>::new());

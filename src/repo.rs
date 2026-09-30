@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::{CONFIG_FILE_NAME, Config},
+    crypt::{HEADER_LEN, has_gitse_magic},
     error::{Error, Result},
     filter::is_ciphertext,
     gitattributes,
@@ -233,9 +234,26 @@ impl Repo {
                 config_file_path.display()
             );
         }
-        let conf = Config::load_or_default(&config_file_path)
-            .map_err(|e| Error::Config(e.to_string()))?
-            .with_repo_path(&repo_path);
+        // A GITSE-encrypted config (e.g. left behind by an `e .` from an
+        // older release that did not exclude it) would hard-fail every
+        // command — including the decrypt that could recover it. Fall back
+        // to the default config instead so `git-se d` remains usable.
+        let config_is_own_ciphertext = std::fs::read(&config_file_path).is_ok_and(|bytes| {
+            bytes
+                .first_chunk::<HEADER_LEN>()
+                .is_some_and(has_gitse_magic)
+        });
+        let conf = if config_is_own_ciphertext {
+            warn!(
+                "Config file `{}` is encrypted (likely by an `e .` run); using the default config \
+                 so the file can be decrypted back. Your settings return once it is restored.",
+                config_file_path.display()
+            );
+            Config::default()
+        } else {
+            Config::load_or_default(&config_file_path).map_err(|e| Error::Config(e.to_string()))?
+        }
+        .with_repo_path(&repo_path);
         Ok(Self {
             path: repo_path,
             conf,
@@ -1219,6 +1237,23 @@ mod tests {
 
         let repo = Repo::open(&repo_path)?;
         assert_eq!(repo.path(), repo_path.as_path());
+        Ok(())
+    }
+
+    #[test]
+    fn test_repo_open_recovers_from_encrypted_config() -> Result<()> {
+        // A config encrypted by an older release's `e .` must not lock out
+        // every command: open falls back to the default config so the file
+        // can be decrypted back.
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut encrypted_config = b"GITSE".to_vec();
+        encrypted_config.resize(HEADER_LEN, 0);
+        encrypted_config.extend_from_slice(b"ciphertext bytes");
+        std::fs::write(repo_path.join(CONFIG_FILE_NAME), encrypted_config)?;
+
+        let repo = Repo::open(&repo_path)?;
+        assert_eq!(repo.conf, Config::default().with_repo_path(&repo_path));
         Ok(())
     }
 
