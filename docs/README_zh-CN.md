@@ -12,7 +12,7 @@
 - 并行加速：多线程并行加解密，充分利用 CPU 多核性能。
 - 原子写入：加解密过程实现原子写入，防止中断时损坏文件；保留原文件的权限与时间戳。
 - 可配置的 Zstd 压缩：默认开启，减少空间占用。
-- 透明的 git 集成（v3.1+）：`git-se i` 安装 clean/smudge 过滤器，在 add/checkout 时自动加解密，工作区始终是明文，`git diff` 仍可读。
+- 透明的 git 集成（v3.1+）：`git-se i` 安装长驻进程过滤（git >= 2.16 优先使用）并保留 clean/smudge 作为回退，在 add/checkout 时自动加解密，工作区始终是明文，`git diff` 仍可读。
 
 ## 安装
 
@@ -50,6 +50,8 @@ git add . && git commit -m "..."   # 正常工作即可
 ```
 
 安装后加解密完全透明：`git add` / `git commit` 自动加密；`git checkout` / `git switch` / `git stash` 时自动解密。工作区始终是明文。支持 diff。迁移现有仓库请运行一次 `git-se i`。
+
+- 一次 git 操作只启动一个长驻进程过滤，为该操作的全部文件服务，不再每个文件启动一个进程；该操作内所有首次加密的文件共享同一个 salt，因此每次 git 操作只付出一次 Argon2 派生，而非每文件一次。这需要 git >= 2.16；更旧的 git 会自动回退到逐文件的 clean/smudge 过滤器，密文完全一致。旧版 git-se 安装的仓库重新运行 `git-se i` 即可获得进程过滤。
 
 - `.gitattributes` 会增加一个由 `# BEGIN git-simple-encrypt (managed)` / `# END git-simple-encrypt` 标记包围的托管块；自定义规则请放在块外。加密列表变更时 git-se 会自动刷新该块。
 

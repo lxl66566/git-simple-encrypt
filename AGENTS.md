@@ -81,3 +81,9 @@ sequenceDiagram
 - 加密（只读缓存）：通过 `fs::read` 将缓存文件一次性读入内存，rkyv 反序列化后查询。不使用 mmap：Windows 上活跃的内存映射会阻止缓存文件的原子替换（rename 被拒绝访问），导致并发写缓存失败。
 - 解密（写入缓存）：并行工作线程（默认 youpipe 后端，`rayon-backend` feature 可切换为 rayon）通过 mpsc channel 发送 `(path, salt, file_id)`，主线程收集后通过 rkyv 序列化，在独占文件锁（`<cache>.lock`，所有缓存写入方共用）保护下与已有缓存合并并原子写入到磁盘；批量解密按分块周期性落盘（checkpoint），不依赖 drop 兜底（release 构建为 panic=abort）。
   - 缓存 key 使用仓库相对路径的原始字节（`/` 作为分隔符），确保跨平台一致性；在大小写不敏感文件系统（Windows/macOS）上写入时对 key 做 ASCII 小写归一化，读取时先按原始大小写、再按归一化形式双重查找，兼容旧缓存中的原始大小写条目。
+
+### 5. git 过滤集成（process filter + clean/smudge 回退）
+
+- `install` 同时写入 `filter.git-se.process`（长驻进程过滤，git >= 2.16 优先使用）与 `filter.git-se.clean/smudge`（旧 git 自动回退，两者密文一致；无 process 配置的旧安装重新 `git-se i` 即升级）。textconv 仍是逐文件进程。
+- process 模式：一次 git 操作只 spawn 一个 `git-se filter-process` 进程，走 git 官方 filter protocol（pkt-line，version 2，capabilities 仅声明 clean+smudge，不声明 delay）；stdout 只允许协议字节，日志全走 stderr。协议实现位于 `src/filter/pktline.rs`（编解码）与 `src/filter/process.rs`（握手/命令循环），clean/smudge 内核在 `src/filter/mod.rs`，三种回调共用同一套内核。
+- process 模式下进程内所有 cache miss 共享一个 batch_salt（`OnceLock` 惰性生成，行为与手动批量模式的 batch_salt 对齐），配合进程内 KeyCache 将一次 git 操作的 Argon2 摊销为一次；file_id 仍逐文件随机。salt cache 协议不变（resolve_or_insert / merge_entries / 文件锁原样复用）。
