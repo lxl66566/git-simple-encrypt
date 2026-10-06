@@ -9,7 +9,16 @@ repository   = "https://github.com/lxl66566/git-simple-encrypt"
 license      = "MIT"
 keywords     = ["encryption", "git"]
 categories   = ["cryptography"]
-exclude      = [".github"]
+exclude      = [
+  ".gitattributes",
+  ".github",
+  ".tombi.toml",
+  "AGENTS.md",
+  "clippy.toml",
+  "docs",
+  "git_simple_encrypt.toml",
+  "rustfmt.toml"
+]
 
 [lib]
 path = "src/lib.rs"
@@ -46,7 +55,7 @@ thiserror             = "2"
 # Under --all-features cargo reports this as unused: rayon-backend cfg-swaps
 # the parallel backend away. The lint cannot model mutually exclusive
 # features; keep the dependency (it is the default backend).
-youpipe               = { version = "0.5.0", default-features = false }
+youpipe               = { version = "0.6", default-features = false }
 zeroize               = "1.9"
 zstdx                 = "0.2"
 
@@ -54,7 +63,6 @@ zstdx                 = "0.2"
 anyhow  = "1.0"
 assert2 = "0.4"
 colored = "3"
-# tempfile is already a regular dependency; dev-dependencies inherit it.
 tap     = "1"
 
 [features]
