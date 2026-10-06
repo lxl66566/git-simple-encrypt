@@ -2,6 +2,7 @@ use std::io::{Read, Write};
 
 use chacha20poly1305_simd::XChaCha20Poly1305;
 use zeroize::Zeroizing;
+use zstdx::Level;
 
 use crate::{
     crypt::{
@@ -165,7 +166,11 @@ pub(super) fn decrypt_body(
     header: &FileHeader,
 ) -> Result<()> {
     if header.is_compressed() {
-        let mut decoder = zstd::stream::write::Decoder::new(writer)?.auto_flush();
+        // zstdx errors convert into io::Error so they surface through
+        // Error::Io exactly like the old zstd-crate call did.
+        let mut decoder = zstdx::stream::write::Decoder::new(writer)
+            .map_err(std::io::Error::from)?
+            .auto_flush();
         decrypt_chunks(reader, &mut decoder, cipher, header.as_bytes())?;
         decoder.flush()?;
     } else {
@@ -191,7 +196,11 @@ pub fn encrypt_into<R: Read, W: Write>(
     let cipher = XChaCha20Poly1305::new(*key_enc);
 
     if let Some(level) = zstd {
-        let mut encoder = zstd::stream::read::Encoder::new(reader, i32::from(level))?;
+        // Config/CLI validate 1-22; from_zstd maps those onto the native
+        // Level type 1:1 (its 0 = Uncompressed branch is unreachable here).
+        let mut encoder =
+            zstdx::stream::read::Encoder::new(reader, Level::from_zstd(i32::from(level)))
+                .map_err(std::io::Error::from)?;
         encrypt_chunks(
             &mut encoder,
             writer,
