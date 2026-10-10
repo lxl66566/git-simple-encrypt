@@ -31,6 +31,7 @@ impl Progress {
 
     /// Advance the progress by `n` finished items.
     #[inline]
+    #[cfg_attr(not(feature = "progress"), allow(clippy::missing_const_for_fn))]
     pub fn inc(&self, n: u64) {
         #[cfg(feature = "progress")]
         self.inner.inc(n);
@@ -41,6 +42,7 @@ impl Progress {
 
     /// Finalize and clear the progress bar (if any).
     #[inline]
+    #[cfg_attr(not(feature = "progress"), allow(clippy::missing_const_for_fn))]
     pub fn finish_and_clear(&self) {
         #[cfg(feature = "progress")]
         self.inner.finish_and_clear();

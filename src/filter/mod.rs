@@ -40,7 +40,9 @@
 //! for the process filter server (one Argon2 run amortized over a whole git
 //! operation).
 
+#[cfg(feature = "bin")]
 mod pktline;
+#[cfg(feature = "bin")]
 pub(crate) mod process;
 
 use std::{
@@ -109,6 +111,7 @@ pub(crate) enum SaltSource {
     /// operation. Per-file unique salts add no meaningful precomputation
     /// resistance in the single-password design, and the batch mode has
     /// shared salts for a long time.
+    #[cfg(feature = "bin")]
     Process,
 }
 
@@ -131,6 +134,7 @@ pub(crate) struct FilterContext<'a> {
     cache: SaltCacheReader,
     salt: SaltSource,
     /// The process-wide batch salt ([`SaltSource::Process`]).
+    #[cfg(feature = "bin")]
     batch_salt: OnceLock<[u8; SALT_LEN]>,
 }
 
@@ -142,6 +146,7 @@ impl<'a> FilterContext<'a> {
             keys: DashMap::new(),
             cache: SaltCacheReader::load(repo.path()),
             salt,
+            #[cfg(feature = "bin")]
             batch_salt: OnceLock::new(),
         }
     }
@@ -156,6 +161,7 @@ impl<'a> FilterContext<'a> {
     fn mint_salt(&self) -> [u8; SALT_LEN] {
         match self.salt {
             SaltSource::PerFile => random_salt(),
+            #[cfg(feature = "bin")]
             SaltSource::Process => *self.batch_salt.get_or_init(random_salt),
         }
     }
@@ -453,6 +459,7 @@ mod tests {
     /// The process-mode context shares one salt across every cache miss of
     /// the same process (the Argon2 amortization basis); the one-shot
     /// per-file supply keeps minting distinct salts.
+    #[cfg(feature = "bin")]
     #[test]
     fn test_salt_source_process_shares_misses() {
         let (_dir, repo) = init_repo();

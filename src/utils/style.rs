@@ -31,8 +31,10 @@ pub trait Colorize {
     fn dimmed(self) -> String;
 }
 
+// Impl surface mirrors `colored` (only `&str`), so `String` receivers
+// auto-deref to `&str` in both configurations and are never moved.
 #[cfg(not(feature = "colored"))]
-impl<'a> Colorize for &'a str {
+impl Colorize for &str {
     fn bold(self) -> String {
         self.to_string()
     }
@@ -55,32 +57,5 @@ impl<'a> Colorize for &'a str {
 
     fn dimmed(self) -> String {
         self.to_string()
-    }
-}
-
-#[cfg(not(feature = "colored"))]
-impl Colorize for String {
-    fn bold(self) -> String {
-        self
-    }
-
-    fn green(self) -> String {
-        self
-    }
-
-    fn red(self) -> String {
-        self
-    }
-
-    fn yellow(self) -> String {
-        self
-    }
-
-    fn cyan(self) -> String {
-        self
-    }
-
-    fn dimmed(self) -> String {
-        self
     }
 }

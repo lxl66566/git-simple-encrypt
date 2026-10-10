@@ -341,7 +341,8 @@ fn test_metadata_preservation() {
 
     let plaintext = b"Executable script content";
     let file = create_temp_file(plaintext);
-    let path = file.path();
+    // `TempPath` derefs to `Path`; it has no `path()` accessor.
+    let path: &Path = &file;
 
     let mut perms = std::fs::metadata(path).unwrap().permissions();
     perms.set_mode(0o755);

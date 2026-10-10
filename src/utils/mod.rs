@@ -54,7 +54,7 @@ pub fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = fs::metadata(path).map_or(0o644, |m| m.permissions().mode());
-        std::fs::set_permissions(temp_file.path(), std::fs::Permissions::from_mode(mode))?;
+        fs::set_permissions(temp_file.path(), fs::Permissions::from_mode(mode))?;
     }
 
     temp_file.as_file().sync_all()?;
