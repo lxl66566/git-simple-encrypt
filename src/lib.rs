@@ -54,6 +54,7 @@ pub fn run(cli: Cli) -> Result<()> {
             InstallMode::Filter => repo.install_filter()?,
             InstallMode::Hook => repo.install_hook()?,
         },
+        SubCommand::Uninstall => repo.uninstall()?,
         SubCommand::Clean { path } => filter::clean(&repo, &path)?,
         SubCommand::Smudge { path } => filter::smudge(&repo, &path)?,
         SubCommand::Diff { file } => filter::diff(&repo, file.as_deref())?,

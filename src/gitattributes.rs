@@ -4,7 +4,8 @@
 //! git runs our filters on exactly those paths. The block is delimited by
 //! marker comments and regenerated in place, leaving user-managed lines
 //! untouched. `refresh_gitattributes` reuses it whenever the crypt list
-//! changes while filter mode is active.
+//! changes while filter mode is active; `uninstall` strips it again with
+//! [`without_managed_block`].
 
 /// Filter driver name used in `.gitattributes` lines and git config keys.
 pub const FILTER_NAME: &str = "git-se";
@@ -90,6 +91,22 @@ pub fn has_managed_block(content: &str) -> bool {
     content.contains(BEGIN_MARKER)
 }
 
+/// Byte range of the managed block in `content`: `(start, end)` where `end`
+/// is exclusive, pointing just past the END-marker line's newline — or EOF
+/// when the block is malformed (BEGIN without END).
+fn managed_block_range(content: &str) -> Option<(usize, usize)> {
+    let start = content.find(BEGIN_MARKER)?;
+    let end = content[start..]
+        .find(END_MARKER)
+        .map_or(content.len(), |rel| {
+            let marker_end = start + rel + END_MARKER.len();
+            content[marker_end..]
+                .find('\n')
+                .map_or(content.len(), |nl| marker_end + nl + 1)
+        });
+    Some((start, end))
+}
+
 /// Return `content` with the managed block replaced by one line per
 /// `patterns` entry, appending the block at the end when none exists yet.
 ///
@@ -107,7 +124,7 @@ pub fn with_managed_block(content: &str, patterns: &[String]) -> String {
     block.push('\n');
     block.push_str(END_MARKER);
 
-    let Some(start) = content.find(BEGIN_MARKER) else {
+    let Some((start, end)) = managed_block_range(content) else {
         // Append a fresh block at the end.
         let mut out = String::with_capacity(content.len() + block.len() + 2);
         out.push_str(content);
@@ -123,22 +140,33 @@ pub fn with_managed_block(content: &str, patterns: &[String]) -> String {
         return out;
     };
 
-    // Replace the existing block in place. `block_end` is the end of the
-    // END-marker line (exclusive), or EOF when the block is malformed.
-    let block_end = content[start..]
-        .find(END_MARKER)
-        .map_or(content.len(), |rel| {
-            let marker_end = start + rel + END_MARKER.len();
-            content[marker_end..]
-                .find('\n')
-                .map_or(content.len(), |nl| marker_end + nl + 1)
-        });
-
     let mut out = String::with_capacity(content.len());
     out.push_str(&content[..start]);
     out.push_str(&block);
     out.push('\n');
-    out.push_str(&content[block_end..]);
+    out.push_str(&content[end..]);
+    out
+}
+
+/// Return `content` with the managed block stripped; unchanged when no
+/// block exists.
+///
+/// The blank separator line `with_managed_block` adds before an appended
+/// block is removed with it, so install → uninstall round-trips the user's
+/// original file byte-for-byte. The result is empty when the block was the
+/// only content; the caller decides whether to delete the file.
+#[must_use]
+pub fn without_managed_block(content: &str) -> String {
+    let Some((start, end)) = managed_block_range(content) else {
+        return content.to_owned();
+    };
+    let mut prefix = &content[..start];
+    if prefix.ends_with("\n\n") {
+        prefix = &prefix[..prefix.len() - 1];
+    }
+    let mut out = String::with_capacity(prefix.len() + (content.len() - end));
+    out.push_str(prefix);
+    out.push_str(&content[end..]);
     out
 }
 
@@ -235,5 +263,49 @@ mod tests {
             "x\n# BEGIN git-simple-encrypt (managed)\na filter=git-se diff=git-se\n# END \
              git-simple-encrypt\n"
         );
+    }
+
+    #[test]
+    fn test_without_managed_block() {
+        // no block: unchanged
+        assert_eq!(without_managed_block("*.txt text\n"), "*.txt text\n");
+        assert_eq!(without_managed_block(""), "");
+
+        // block in the middle: user lines around it are kept
+        let full = "keep\n\n# BEGIN git-simple-encrypt (managed)\na filter=git-se diff=git-se\n# \
+                    END git-simple-encrypt\nmore\n";
+        assert_eq!(without_managed_block(full), "keep\nmore\n");
+
+        // block only: empty result (caller deletes the file)
+        let only = "# BEGIN git-simple-encrypt (managed)\na filter=git-se diff=git-se\n# END \
+                    git-simple-encrypt\n";
+        assert_eq!(without_managed_block(only), "");
+
+        // malformed BEGIN without END: stripped to EOF
+        let malformed = "keep\n\n# BEGIN git-simple-encrypt (managed)\nold line";
+        assert_eq!(without_managed_block(malformed), "keep\n");
+    }
+
+    /// install → uninstall must round-trip the user's original
+    /// `.gitattributes` byte-for-byte.
+    ///
+    /// The only tolerated delta: a file without a trailing newline (which
+    /// install itself normalizes) comes back with one added.
+    #[test]
+    fn test_with_without_managed_block_roundtrip() {
+        for original in [
+            "",
+            "*.txt text\n",
+            "*.txt text",
+            "*.txt text\n\n",
+            "a binary\nb text\n",
+        ] {
+            let installed = with_managed_block(original, &pats(&["s.txt"]));
+            let removed = without_managed_block(&installed);
+            assert!(
+                removed == original || removed == format!("{original}\n"),
+                "original {original:?} came back as {removed:?}"
+            );
+        }
     }
 }

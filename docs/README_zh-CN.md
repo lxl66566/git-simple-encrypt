@@ -47,9 +47,11 @@ git-se p                    # 设置/更新主密码
 git-se add file.txt mydir   # 将文件/文件夹添加到加密列表。如果是文件夹，则会递归加密文件夹下的所有文件
 git-se i                    # 安装 git 过滤器集成
 git add . && git commit -m "..."   # 正常工作即可
+git-se u                    # 卸载集成：移除过滤器配置与 .gitattributes 托管块，恢复工作区为密文
 ```
 
 - 安装后加解密完全透明：`git add` / `git commit` 自动加密；`git checkout` / `git switch` / `git stash` 时自动解密。工作区始终是明文。支持 diff。迁移现有仓库请运行一次 `git-se i`。
+- `git-se u` 可撤销安装（filter 与 hook 模式均可）：无未提交改动的加密文件会恢复为密文工作区副本，有未提交改动的文件保持原样不动，仓库回到手动 `e`/`d` 的工作流。
 - `.gitattributes` 会增加一个由 `# BEGIN git-simple-encrypt (managed)` / `# END git-simple-encrypt` 标记包围的托管块；自定义规则请放在块外。加密列表变更时 git-se 会自动刷新该块。
 
 ### 手动加解密（老版本）

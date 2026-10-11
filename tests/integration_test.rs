@@ -988,6 +988,181 @@ fn test_hook_mode_and_filter_migration() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Filter-mode uninstall removes every integration artifact (config keys,
+/// managed `.gitattributes` block, hook), restores the ciphertext working
+/// tree and leaves the repository clean. User-written `.gitattributes` lines
+/// survive byte-for-byte; a second uninstall is a no-op.
+#[test]
+fn test_uninstall_filter_mode() -> anyhow::Result<()> {
+    // Content assertions after `git checkout` require a default-config user:
+    // a global `core.autocrlf` would rewrite every checked-out file.
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+
+    fs::write(dir.join(".gitattributes"), "*.bin binary\n")?;
+    fs::write(
+        dir.join("secret.txt"),
+        "top secret
+",
+    )?;
+    fs::create_dir(dir.join("sub"))?;
+    fs::write(
+        dir.join("sub/nested.txt"),
+        "nested secret
+",
+    )?;
+    run(
+        SubCommand::Add {
+            paths: ["secret.txt", "sub"].map(PathBuf::from).to_vec(),
+        },
+        dir,
+    )?;
+    run_bin(dir, &["install"])?;
+    git(dir, &["add", "secret.txt", "sub"])?;
+    git(dir, &["commit", "-m", "enc"])?;
+    assert!(fs::read_to_string(dir.join("secret.txt"))?.starts_with("top")); // plaintext worktree
+
+    let out = run_bin(dir, &["uninstall"])?;
+    assert!(out.contains("Uninstalled"), "{out}");
+    assert!(
+        out.contains("Restored 2 ciphertext working-tree file(s)"),
+        "{out}"
+    );
+
+    // every config key written by install is gone
+    for key in [
+        "filter.git-se.clean",
+        "filter.git-se.smudge",
+        "filter.git-se.process",
+        "filter.git-se.required",
+        "diff.git-se.textconv",
+    ] {
+        assert!(
+            git(dir, &["config", "--local", "--get", key]).is_err(),
+            "{key} must be unset after uninstall"
+        );
+    }
+
+    // user lines survive byte-for-byte, the managed block is gone
+    assert_eq!(
+        fs::read_to_string(dir.join(".gitattributes"))?,
+        "*.bin binary\n"
+    );
+
+    // working tree holds the raw ciphertext blobs again
+    assert!(fs::read(dir.join("secret.txt"))?.starts_with(b"GITSE"));
+    assert!(fs::read(dir.join("sub/nested.txt"))?.starts_with(b"GITSE"));
+
+    // worktree matches HEAD without any filter: nothing dirty
+    assert_eq!(
+        git_str(dir, &["status", "--porcelain", "--", "secret.txt", "sub"])?,
+        ""
+    );
+
+    // idempotent: nothing left to remove
+    let out = run_bin(dir, &["uninstall"])?;
+    assert!(out.contains("No git-se integration found"), "{out}");
+    Ok(())
+}
+
+/// Uninstall never destroys uncommitted work: crypt files with changes
+/// (staged or unstaged) keep their plaintext worktree copy, clean ones are
+/// restored to ciphertext.
+#[test]
+fn test_uninstall_keeps_dirty_files() -> anyhow::Result<()> {
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+
+    fs::write(
+        dir.join("secret.txt"),
+        "top secret
+",
+    )?;
+    fs::create_dir(dir.join("sub"))?;
+    fs::write(
+        dir.join("sub/nested.txt"),
+        "nested secret
+",
+    )?;
+    run(
+        SubCommand::Add {
+            paths: ["secret.txt", "sub"].map(PathBuf::from).to_vec(),
+        },
+        dir,
+    )?;
+    run_bin(dir, &["install"])?;
+    git(dir, &["add", "secret.txt", "sub"])?;
+    git(dir, &["commit", "-m", "enc"])?;
+
+    // uncommitted modification after the commit: must survive uninstall
+    fs::write(
+        dir.join("secret.txt"),
+        "changed secret
+",
+    )?;
+
+    let out = run_bin(dir, &["uninstall"])?;
+    assert!(
+        out.contains("1 crypt-list file(s) with uncommitted changes stay plaintext"),
+        "{out}"
+    );
+
+    // the dirty file keeps its plaintext content...
+    assert_eq!(
+        fs::read_to_string(dir.join("secret.txt"))?,
+        "changed secret
+"
+    );
+    // ...while the clean one is restored to ciphertext
+    assert!(fs::read(dir.join("sub/nested.txt"))?.starts_with(b"GITSE"));
+
+    // the dirty file shows as modified (plaintext vs ciphertext blob), the
+    // restored one does not
+    let status = git_str(dir, &["status", "--porcelain", "--", "secret.txt", "sub"])?;
+    assert_eq!(status.lines().count(), 1, "{status}");
+    assert!(status.contains("secret.txt"), "{status}");
+    Ok(())
+}
+
+/// Hook-mode uninstall removes the managed pre-commit hook only; the filter
+/// config is never touched (hook mode never wrote any).
+#[test]
+fn test_uninstall_hook_mode() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+    fs::write(
+        dir.join("s.txt"),
+        "secret
+",
+    )?;
+    run(
+        SubCommand::Add {
+            paths: vec!["s.txt".into()],
+        },
+        dir,
+    )?;
+
+    run_bin(dir, &["install", "--mode", "hook"])?;
+    assert!(dir.join(".git/hooks/pre-commit").exists());
+
+    let out = run_bin(dir, &["uninstall"])?;
+    assert!(out.contains("Removed pre-commit hook"), "{out}");
+    assert!(!dir.join(".git/hooks/pre-commit").exists());
+    assert!(
+        git(dir, &["config", "--local", "--get", "filter.git-se.clean"]).is_err(),
+        "uninstall must not leave filter config behind"
+    );
+    Ok(())
+}
+
 /// Paths with spaces (and a directory with a space) must land in
 /// `.gitattributes` as C-quoted patterns and actually match: `git add`
 /// encrypts them instead of silently dropping the line.

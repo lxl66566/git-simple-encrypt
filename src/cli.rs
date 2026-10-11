@@ -18,6 +18,7 @@ git-se d                    # Decrypt all files in the list
 git-se e xxx.txt dir1 ...   # Encrypt specific files
 git-se d xxx.txt dir1 ...   # Decrypt specific files
 git-se i                    # Install git filter integration: automatic encryption / decryption
+git-se u                    # Uninstall git filter integration: back to manual e/d
 "#)]
 // No `args_conflicts_with_subcommands`: `--repo` is a global argument and must
 // stay usable both before and after the subcommand (`git-se --repo . add x`).
@@ -86,6 +87,13 @@ pub enum SubCommand {
         #[arg(long, value_enum, default_value_t = InstallMode::Filter)]
         mode: InstallMode,
     },
+    /// Uninstall the git integration: remove the filter/textconv config, the
+    /// managed `.gitattributes` block and the managed pre-commit hook (both
+    /// install modes), then restore the ciphertext working tree. Manual
+    /// `git-se e` / `git-se d` keep working; run `install` again to
+    /// re-integrate.
+    #[clap(alias("u"))]
+    Uninstall,
     /// Git clean filter: encrypt stdin to stdout. Invoked by git through
     /// `filter.git-se.clean` with the filtered path (git's %f placeholder).
     Clean {

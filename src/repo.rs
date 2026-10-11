@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
@@ -682,6 +682,146 @@ impl Repo {
         Ok(())
     }
 
+    /// Uninstall the git integration installed by `install` (either mode):
+    /// remove the filter/textconv config, the managed `.gitattributes`
+    /// block and the managed pre-commit hook, then restore the ciphertext
+    /// working-tree copies of the tracked crypt files. Afterwards the
+    /// repository behaves exactly as before the install: encryption and
+    /// decryption are manual again (`git-se e` / `git-se d`).
+    ///
+    /// The crypt list, the password config and the salt cache are data, not
+    /// integration — they are kept so manual operation (and a later
+    /// reinstall) keeps working.
+    pub fn uninstall(&self) -> Result<()> {
+        let attr_path = self.path.join(".gitattributes");
+        let attrs_installed = std::fs::read_to_string(&attr_path)
+            .is_ok_and(|content| gitattributes::has_managed_block(&content));
+        let (hooks_dir, _) = self.hooks_dir()?;
+        let hook = hooks_dir.join("pre-commit");
+        if !self.filter_installed() && !attrs_installed && !is_managed_hook(&hook)? {
+            println!("No git-se integration found in {}.", self.path.display());
+            return Ok(());
+        }
+
+        // The migration analysis MUST run while the filter config is still
+        // in place: only then does `git diff HEAD` compare the worktree
+        // through the clean filter and recognize the plaintext copy of a
+        // ciphertext blob as clean, i.e. safe to re-checkout later. Dirty
+        // files (staged or unstaged changes) keep their worktree copy — a
+        // force-checkout would destroy uncommitted work.
+        let migration = self.clean_crypt_paths();
+
+        // 1. Unset the filter driver and textconv config written by install; missing keys are
+        //    tolerated (partial installs).
+        let f = format!("filter.{}", gitattributes::FILTER_NAME);
+        for key in [
+            format!("{f}.clean"),
+            format!("{f}.smudge"),
+            format!("{f}.process"),
+            format!("{f}.required"),
+            format!("diff.{}.textconv", gitattributes::FILTER_NAME),
+        ] {
+            self.unset_raw_config(&key)?;
+        }
+
+        // 2. Strip the managed .gitattributes block; delete the file when the block was its only
+        //    content.
+        if let Ok(content) = std::fs::read_to_string(&attr_path) {
+            let rest = gitattributes::without_managed_block(&content);
+            if rest.trim().is_empty() {
+                std::fs::remove_file(&attr_path)?;
+            } else {
+                atomic_write(&attr_path, rest.as_bytes())?;
+            }
+        }
+
+        // 3. Remove the managed pre-commit hook (hook-mode artifact); foreign hooks are never
+        //    touched.
+        if is_managed_hook(&hook)? {
+            std::fs::remove_file(&hook)?;
+            println!("{} pre-commit hook", "Removed".green().bold());
+        } else if hook.exists() {
+            warn!(
+                "A foreign pre-commit hook exists at {}; left untouched.",
+                hook.display()
+            );
+        }
+
+        // 4. Restore the ciphertext worktree copies. With the filters and attributes gone, `git
+        //    checkout --force HEAD` writes the raw ciphertext blobs back to the worktree.
+        let mut restored = 0;
+        match migration {
+            Ok((to_restore, dirty)) => {
+                restored = self.force_recheckout(&to_restore, "uninstall");
+                if !dirty.is_empty() {
+                    println!(
+                        "{}",
+                        format!(
+                            "{} crypt-list file(s) with uncommitted changes stay plaintext; run \
+                             `git-se e` to encrypt them before committing.",
+                            dirty.len()
+                        )
+                        .yellow()
+                    );
+                }
+            },
+            Err(e) => warn!(
+                "could not analyze the working tree ({e}); it was left untouched. Restore the \
+                 ciphertext copies manually with `git checkout -- <paths>`."
+            ),
+        }
+
+        println!(
+            "{} git integration at {}",
+            "Uninstalled".green().bold(),
+            self.path.display()
+        );
+        if restored > 0 {
+            println!(
+                "{}",
+                format!("Restored {restored} ciphertext working-tree file(s).").dimmed()
+            );
+        }
+        Ok(())
+    }
+
+    /// Split the tracked crypt-list files into (clean, dirty) relative to
+    /// HEAD, compared through the currently configured clean filter. Clean
+    /// files are safe to force-checkout back to their raw ciphertext blobs
+    /// once the filters are removed; dirty files carry staged or unstaged
+    /// changes and must keep their worktree copy.
+    fn clean_crypt_paths(&self) -> Result<(Vec<String>, Vec<String>)> {
+        let mut candidates = Vec::new();
+        if !self.conf.crypt_list.is_empty() && self.head_exists()? {
+            let head = self.head_tree_blobs()?;
+            if !head.is_empty() {
+                let index = self.index_blobs()?;
+                candidates = head
+                    .keys()
+                    // Only files that are both committed and still tracked;
+                    // a staged deletion must not resurface through the tree.
+                    .filter(|p| index.contains_key(*p))
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .filter(|rel| crypt_covers(&self.conf.crypt_list, rel))
+                    .collect();
+            }
+        }
+
+        // `git diff --name-only -z HEAD` lists everything that differs from
+        // HEAD (staged and unstaged alike), so staged changes can never be
+        // reset by the later force-checkout. One chunked invocation covers
+        // any file count, unlike a per-file `git diff --quiet`.
+        let mut dirty = HashSet::new();
+        for chunk in candidates.chunks(64) {
+            let mut args: Vec<&str> = vec!["diff", "--name-only", "-z", "HEAD", "--"];
+            args.extend(chunk.iter().map(String::as_str));
+            for path in nul_records(&self.run_with_output_bytes(&args)?) {
+                dirty.insert(String::from_utf8_lossy(path).into_owned());
+            }
+        }
+        Ok(candidates.into_iter().partition(|rel| !dirty.contains(rel)))
+    }
+
     /// Refresh the managed `.gitattributes` block after crypt-list changes.
     ///
     /// No-op unless the block already exists (i.e. filter mode is active);
@@ -867,9 +1007,18 @@ impl Repo {
     /// worktree copies and `git checkout --force HEAD` them back so the
     /// smudge filter decrypts them. Returns the number of files decrypted.
     fn execute_migration(&self, plan: &MigrationPlan) -> usize {
+        self.force_recheckout(&plan.to_decrypt, "install")
+    }
+
+    /// Delete the worktree copies of `paths` and `git checkout --force HEAD`
+    /// them back, whatever that yields with the currently configured
+    /// filters (smudge installed → plaintext, no filters → raw ciphertext
+    /// blobs). `context` names the calling command in warnings. Returns the
+    /// number of files restored.
+    fn force_recheckout(&self, paths: &[String], context: &str) -> usize {
         // Chunk to stay clear of argv length limits on huge crypt lists.
-        let mut decrypted = 0;
-        'chunks: for chunk in plan.to_decrypt.chunks(64) {
+        let mut restored = 0;
+        'chunks: for chunk in paths.chunks(64) {
             for rel in chunk {
                 let _ = std::fs::remove_file(self.path.join(rel));
             }
@@ -880,21 +1029,21 @@ impl Repo {
                 .args(&args)
                 .output()
             {
-                Ok(out) if out.status.success() => decrypted += chunk.len(),
+                Ok(out) if out.status.success() => restored += chunk.len(),
                 Ok(out) => {
                     warn!(
-                        "git checkout failed during install: {}",
+                        "git checkout failed during {context}: {}",
                         String::from_utf8_lossy(&out.stderr)
                     );
                     break 'chunks;
                 },
                 Err(e) => {
-                    warn!("failed to run git checkout during install: {e}");
+                    warn!("failed to run git checkout during {context}: {e}");
                     break 'chunks;
                 },
             }
         }
-        decrypted
+        restored
     }
 
     /// Whether any of `paths` (repo-relative) differ between the index and
@@ -1023,11 +1172,29 @@ impl Repo {
     }
 
     /// Write to an unprefixed git config key (e.g. `filter.git-se.clean`) in
-    /// the repo-local config. Unlike [`Repo::set_config`], no namespace is
+    /// the repo-local git config. Unlike [`Repo::set_config`], no namespace is
     /// prepended — used for the git integration settings git itself reads.
     /// These values are not secrets, so the plain argv form is fine.
     pub fn set_raw_config(&self, key: &str, value: &str) -> Result<()> {
         self.run(&["config", "--local", key, value])
+    }
+
+    /// Remove an unprefixed repo-local git config key written by
+    /// [`Repo::set_raw_config`]. A missing key is not an error: uninstall
+    /// must stay idempotent across repeated or partial installs.
+    fn unset_raw_config(&self, key: &str) -> Result<()> {
+        let out = Command::new("git")
+            .current_dir(&self.path)
+            .args(["config", "--local", "--unset", key])
+            .output()?;
+        // Exit code 5 = the key did not exist; anything else is a real
+        // failure. Git drops the section header once its last key is gone.
+        if !out.status.success() && out.status.code() != Some(5) {
+            return Err(Error::Git(
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Read an unprefixed key from the repo-local git config only (no

@@ -47,9 +47,10 @@ git-se p                    # Set/update the master password
 git-se add file.txt mydir   # Add a file/folder to the encryption list. If it is a folder, all files under it are encrypted recursively
 git-se i                    # Install the Git filter integration
 git add . && git commit -m "..."   # Just work normally
+git-se u                    # Uninstall: remove the config and the managed .gitattributes block, restore the ciphertext working tree
 ```
 
-After installation, encryption/decryption is fully transparent: `git add` / `git commit` automatically encrypt; `git checkout` / `git switch` / `git stash` automatically decrypt. The working tree is always plaintext. diff is supported. To migrate an existing repository, run `git-se i` once.
+After installation, encryption/decryption is fully transparent: `git add` / `git commit` automatically encrypt; `git checkout` / `git switch` / `git stash` automatically decrypt. The working tree is always plaintext. diff is supported. To migrate an existing repository, run `git-se i` once. `git-se u` undoes an install (both filter and hook mode): crypt files without uncommitted changes are restored to their ciphertext working-tree copies, files with uncommitted changes are left untouched, and the repository returns to the manual `e`/`d` workflow.
 
 - A single long-lived process filter serves every file of one git operation, instead of spawning one process per file. All first-time encryptions of that operation share one salt, so the Argon2 derivation is paid once per git operation rather than once per file. This requires git >= 2.16; older git automatically falls back to the per-file clean/smudge filters with identical ciphertext. Repositories installed by older git-se versions get the process filter by running `git-se i` again.
 
