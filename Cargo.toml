@@ -1,6 +1,6 @@
 [package]
 name         = "git-simple-encrypt"
-version      = "3.1.0"
+version      = "3.1.1"
 edition      = "2024"
 rust-version = "1.89"
 description  = "Encrypt/decrypt files in your git repo using only one password"
