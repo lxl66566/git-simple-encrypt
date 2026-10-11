@@ -86,4 +86,5 @@ sequenceDiagram
 
 - `install` 同时写入 `filter.git-se.process`（长驻进程过滤，git >= 2.16 优先使用）与 `filter.git-se.clean/smudge`（旧 git 自动回退，两者密文一致；无 process 配置的旧安装重新 `git-se i` 即升级）。textconv 仍是逐文件进程。
 - process 模式：一次 git 操作只 spawn 一个 `git-se filter-process` 进程，走 git 官方 filter protocol（pkt-line，version 2，capabilities 仅声明 clean+smudge，不声明 delay）；stdout 只允许协议字节，日志全走 stderr。协议实现位于 `src/filter/pktline.rs`（编解码）与 `src/filter/process.rs`（握手/命令循环），clean/smudge 内核在 `src/filter/mod.rs`，三种回调共用同一套内核。
+- process 模式的请求体先完整 spool 再写响应（`RequestSpool`：≤64MiB 驻留内存，超出落无名临时文件）：git 客户端在写完整个请求之前不读任何响应字节，边读边写的流式响应会与请求写入互相填满管道而死锁（请求超过管道缓冲区即必现）；响应方向可以流式，git 写完请求后会连续读取。
 - process 模式下进程内所有 cache miss 共享一个 batch_salt（`OnceLock` 惰性生成，行为与手动批量模式的 batch_salt 对齐），配合进程内 KeyCache 将一次 git 操作的 Argon2 摊销为一次；file_id 仍逐文件随机。salt cache 协议不变（resolve_or_insert / merge_entries / 文件锁原样复用）。

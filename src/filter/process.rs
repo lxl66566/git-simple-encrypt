@@ -10,6 +10,16 @@
 //! content, and a second status list — which may turn an already-streamed
 //! `status=success` into `status=error`.
 //!
+//! Deadlock avoidance: git's client writes the ENTIRE request — every content
+//! packet — before reading a single response byte; its exchange loop has no
+//! concurrent read. A response written while request bytes are still unread
+//! fills the response pipe, stalls this process mid-read, and deadlocks both
+//! sides once the body exceeds the OS pipe buffers. The request body is
+//! therefore drained into a [`RequestSpool`] (memory up to
+//! [`SPOOL_MEMORY_LIMIT`], an unnamed temporary file beyond) before the
+//! response starts; the response itself may stream freely, since git reads it
+//! continuously once its write phase ends.
+//!
 //! Failure mapping:
 //! - per-blob failures (unsupported future version, corrupt ciphertext, ...) answer `status=error`
 //!   and keep serving;
@@ -24,7 +34,8 @@
 //! bytes only; all logging goes to stderr.
 
 use std::{
-    io::{self, BufReader, BufWriter, Read, Write},
+    fs::File,
+    io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write},
     path::PathBuf,
 };
 
@@ -202,6 +213,60 @@ fn command_loop<R: Read, W: Write>(
     }
 }
 
+/// In-memory ceiling for one spooled request body; larger bodies spill to an
+/// unnamed temporary file so multi-gigabyte checkouts do not scale RAM usage.
+const SPOOL_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// A request body buffered in full before the response starts.
+///
+/// Git's process filter client writes the entire request before reading a
+/// single response byte, so a response written while request bytes are still
+/// unread deadlocks both pipes once the body exceeds the OS pipe buffers
+/// (see the module docs). Draining into this spool first breaks that cycle;
+/// the response side may then stream freely, since git reads it
+/// continuously.
+enum RequestSpool {
+    /// Bodies within [`SPOOL_MEMORY_LIMIT`].
+    Memory(Cursor<Vec<u8>>),
+    /// Oversized bodies, spilled to an unnamed temporary file and positioned
+    /// at its first byte.
+    File(File),
+}
+
+impl RequestSpool {
+    /// Drain the pkt-line content section (its flush packet included) into a
+    /// spool. `Ok(0)` from the section reader marks the flush, so the drain
+    /// ends with the stream aligned for the next command.
+    fn drain(content: &mut pktline::PktReader, limit: usize) -> io::Result<Self> {
+        let mut mem = Vec::with_capacity(64 * 1024);
+        let mut chunk = vec![0u8; 64 * 1024];
+        loop {
+            let n = content.read(&mut chunk)?;
+            if n == 0 {
+                return Ok(Self::Memory(Cursor::new(mem)));
+            }
+            mem.extend_from_slice(&chunk[..n]);
+            if mem.len() > limit {
+                break; // over the memory budget: spill the whole body to a file
+            }
+        }
+        let mut file = tempfile::tempfile()?;
+        file.write_all(&mem)?;
+        io::copy(content, &mut file)?;
+        file.rewind()?;
+        Ok(Self::File(file))
+    }
+}
+
+impl Read for RequestSpool {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Memory(cursor) => cursor.read(buf),
+            Self::File(file) => file.read(buf),
+        }
+    }
+}
+
 fn handle_request<R: Read, W: Write>(
     ctx: &FilterContext<'_>,
     input: &mut BufReader<R>,
@@ -231,19 +296,23 @@ fn handle_request<R: Read, W: Write>(
         return Ok(Flow::Stop);
     }
 
+    // Consume the whole request body before writing any response byte (see
+    // [`RequestSpool`]); the drain includes the section's flush packet.
+    let mut body = RequestSpool::drain(&mut content, SPOOL_MEMORY_LIMIT)?;
+
     // Status first, then the streamed content section.
     pktline::write_line(output, "status=success")?;
     pktline::write_flush(output)?;
     let mut payload = pktline::PktWriter::new(output);
     let result = match command {
-        Command::Clean => clean_stream(ctx, &pathname, &mut content, &mut payload),
+        Command::Clean => clean_stream(ctx, &pathname, &mut body, &mut payload),
         Command::Smudge => {
             let key = cache_key(&pathname, ctx.repo.path());
-            decrypt_stream(ctx, &mut content, &mut payload, Some(&key))
+            decrypt_stream(ctx, &mut body, &mut payload, Some(&key))
         },
     };
-    // The cores read to EOF on success, but an error can leave unread
-    // payload behind — always drain to the flush so the next command parses.
+    // The spool consumed the section through its flush packet; this only
+    // confirms the stream stays aligned for the next command.
     content.finish()?;
     // Close the content section even on failure; the second status list may
     // then override the streamed success.
@@ -660,5 +729,57 @@ mod tests {
         let out = run_session(&repo, &script).unwrap();
         let (_, responses) = parse_session(out);
         assert_eq!(responses[0].1, payload);
+    }
+
+    // ---- request spool ----
+
+    /// Spool a scripted content section with `limit`.
+    ///
+    /// Asserts the body round-trips byte-exactly and the drain ends at the
+    /// section's flush packet (the trailing packet parses next, `finish` is a
+    /// no-op); returns whether the body stayed in memory.
+    fn spool_section(payload: &[u8], limit: usize) -> bool {
+        let mut wire = Vec::new();
+        for chunk in payload.chunks(pktline::MAX_PAYLOAD) {
+            wire.extend_from_slice(&data(chunk));
+        }
+        wire.extend_from_slice(FLUSH);
+        // One packet after the section proves the drain stops at the flush.
+        wire.extend_from_slice(&data(b"next section"));
+
+        let mut cur = Cursor::new(wire);
+        let mut content = pktline::PktReader::new(&mut cur);
+        let mut spool = RequestSpool::drain(&mut content, limit).unwrap();
+        content.finish().unwrap();
+
+        let mut body = Vec::new();
+        spool.read_to_end(&mut body).unwrap();
+        assert_eq!(body, payload);
+        assert_eq!(
+            pktline::read_pkt(&mut cur).unwrap(),
+            pktline::Pkt::Data(b"next section".to_vec()),
+            "the drain must consume exactly the section, flush included"
+        );
+        matches!(spool, RequestSpool::Memory(_))
+    }
+
+    #[test]
+    fn spool_within_limit_stays_in_memory() {
+        // A multi-packet body well under the budget.
+        let payload: Vec<u8> = (0..150_000)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        assert!(spool_section(&payload, 256 * 1024));
+        // Exactly at the limit: the memory budget is inclusive.
+        assert!(spool_section(&[7u8; 1024], 1024));
+    }
+
+    #[test]
+    fn spool_over_limit_spills_to_file() {
+        use rand::prelude::*;
+
+        let mut rng = SmallRng::from_seed([0x5e; 32]);
+        let payload: Vec<u8> = (0..150_000).map(|_| rng.random::<u8>()).collect();
+        assert!(!spool_section(&payload, 64 * 1024));
     }
 }

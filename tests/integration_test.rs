@@ -751,6 +751,68 @@ fn git_identity(pwd: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `git` under a hang guard: a regressed process filter deadlocks git
+/// mid-exchange (both pipes full, neither side reads), so invocations that
+/// push large bodies through the filter run under a deadline and fail the
+/// test instead of hanging it forever. Killing git closes the filter
+/// daemon's pipes, which ends that process as well. Both pipes are drained
+/// on reader threads — a command printing more than the pipe capacity
+/// (e.g. `cat-file blob` of a large staged file) would otherwise block on
+/// stdout with no filter involved at all.
+fn git_deadline(pwd: &Path, args: &[&str]) -> anyhow::Result<Vec<u8>> {
+    use std::{
+        process::Stdio,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    const DEADLINE_SECS: u64 = 120;
+
+    fn read_to_vec<R: std::io::Read + Send + 'static>(
+        mut reader: R,
+    ) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+        thread::spawn(move || {
+            let mut v = Vec::new();
+            reader.read_to_end(&mut v)?;
+            std::io::Result::Ok(v)
+        })
+    }
+
+    let mut child = Command::new("git")
+        .args(args)
+        .current_dir(pwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("git {args:?}"))?;
+    let out_handle = read_to_vec(child.stdout.take().unwrap());
+    let err_handle = read_to_vec(child.stderr.take().unwrap());
+
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait()? {
+            Some(status) => break status,
+            None if started.elapsed() > Duration::from_secs(DEADLINE_SECS) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!(
+                    "git {args:?} still running after {DEADLINE_SECS}s: process filter deadlock \
+                     regression"
+                );
+            },
+            None => thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    let stdout = out_handle.join().unwrap()?;
+    let stderr = err_handle.join().unwrap()?;
+    anyhow::ensure!(
+        status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&stderr)
+    );
+    Ok(stdout)
+}
+
 /// Full filter-mode lifecycle: install, transparent add (encrypt), checkout
 /// (decrypt), plaintext diff, deterministic re-clean, plaintext-blob migration
 /// via `git add --renormalize`.
@@ -1966,6 +2028,50 @@ fn filter_process_binary_speaks_pure_protocol() -> anyhow::Result<()> {
     assert!(plain.status.success());
     assert_eq!(plain.stdout, b"binary protocol session");
     fs::remove_file(dir.join("probe.enc"))?;
+    Ok(())
+}
+
+/// Large bodies through the process filter must not deadlock git: git writes
+/// the ENTIRE request (every content packet) before reading a single
+/// response byte, so a filter that streams its response mid-request fills
+/// both pipes and the git operation never returns. Both directions below
+/// push a body far past the pipe buffers through real git — whose own stdio
+/// pipes reproduce the deadlock — under a deadline guard that turns a
+/// regressed filter into a test failure instead of a hang.
+#[test]
+fn filter_process_large_file_does_not_deadlock_git() -> anyhow::Result<()> {
+    const BODY: usize = 8 * 1024 * 1024;
+
+    // Exact-content assertions after `git checkout` need a default-config
+    // user (no global core.autocrlf rewriting the file).
+    let empty_home = TempDir::new().context("create empty HOME")?;
+    let _guard = IsolatedGitConfig::new(empty_home.path());
+
+    let pwd = bench_init();
+    let dir = pwd.path();
+    git_identity(dir)?;
+
+    let mut rng = SmallRng::from_seed([0x5e; 32]);
+    let payload: Vec<u8> = (0..BODY).map(|_| rng.random::<u8>()).collect();
+    fs::write(dir.join("big.bin"), &payload)?;
+    run(
+        SubCommand::Add {
+            paths: vec!["big.bin".into()],
+        },
+        dir,
+    )?;
+    run_bin(dir, &["install"])?;
+
+    // clean: 8 MiB plaintext in, ciphertext blob staged, worktree untouched
+    git_deadline(dir, &["add", "big.bin"])?;
+    assert!(git_deadline(dir, &["cat-file", "blob", ":big.bin"])?.starts_with(b"GITSE"));
+    assert_eq!(fs::read(dir.join("big.bin"))?, payload);
+
+    // smudge: the checked-out ciphertext decrypts back to the exact bytes
+    git_deadline(dir, &["commit", "-m", "enc"])?;
+    fs::remove_file(dir.join("big.bin"))?;
+    git_deadline(dir, &["checkout", "--", "big.bin"])?;
+    assert_eq!(fs::read(dir.join("big.bin"))?, payload);
     Ok(())
 }
 
