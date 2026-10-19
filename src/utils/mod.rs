@@ -11,7 +11,7 @@ use std::{
     sync::mpsc,
 };
 
-use ignore::{WalkBuilder, WalkState};
+use ignore::{WalkBuilder, WalkState, gitignore::gitconfig_excludes_path};
 use log::warn;
 use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
@@ -305,6 +305,56 @@ fn normalized_crypt_entries(crypt_list: &[String], repo_path: &Path) -> Vec<Path
         .collect()
 }
 
+/// Rule-file names the walker reads from each directory it enters.
+const IGNORE_RULE_FILE_NAMES: [&str; 2] = [".gitignore", ".ignore"];
+
+/// Whether the path's own file name marks it as a per-directory
+/// ignore-rule file.
+fn is_ignore_rule_file(path: &Path) -> bool {
+    let Some(name) = path.file_name() else {
+        return false;
+    };
+    IGNORE_RULE_FILE_NAMES
+        .iter()
+        .any(|rule_name| name == OsStr::new(rule_name))
+}
+
+/// Whether any ignore-rule source could have filtered the ignore-aware walk.
+///
+/// Mirrors the sources [`walk_files`] enables on the walker:
+/// - `.gitignore`/`.ignore` files among the found entries: hidden-entry filtering is off, so
+///   in-tree rule files surface as ordinary files;
+/// - the same files in any ancestor of a covered root: the walker reads parent-directory rules up
+///   to the filesystem root;
+/// - the repo's `.git/info/exclude` (a `.git` pointer file marks a linked worktree whose real
+///   gitdir is not resolved here — conservatively treated as present);
+/// - the global excludes file from the git config.
+///
+/// A rule file that sits inside the walked tree and is itself excluded by
+/// rules never appears in `found`, yet the walker still applies its rules;
+/// the ancestor scan covers the common placement (above the walk roots),
+/// keeping the gate conservative in practice.
+fn ignore_rules_in_play(found: &[PathBuf], covered_roots: &[PathBuf], repo_path: &Path) -> bool {
+    if found.iter().any(|path| is_ignore_rule_file(path)) {
+        return true;
+    }
+    if covered_roots.iter().any(|root| {
+        root.ancestors().any(|dir| {
+            IGNORE_RULE_FILE_NAMES
+                .iter()
+                .any(|name| dir.join(name).exists())
+        })
+    }) {
+        return true;
+    }
+    let dot_git = repo_path.join(".git");
+    if dot_git.is_file() || dot_git.join("info").join("exclude").exists() {
+        return true;
+    }
+    // A configured-but-missing path carries no rules; only check existence.
+    gitconfig_excludes_path().is_some_and(|path| path.exists())
+}
+
 /// Files excluded by ignore rules from crypt-list coverage.
 ///
 /// Re-walks the covered roots with ignore filtering disabled and diffs
@@ -313,7 +363,9 @@ fn normalized_crypt_entries(crypt_list: &[String], repo_path: &Path) -> Vec<Path
 /// both `e` and the `check` pre-commit defense would skip them unnoticed.
 ///
 /// Only directory roots are re-walked: an explicit file root bypasses the
-/// ignore rules anyway, so it cannot hide anything.
+/// ignore rules anyway, so it cannot hide anything. The re-walk is skipped
+/// entirely when no ignore-rule source is in play ([`ignore_rules_in_play`]):
+/// with no rules anywhere the diff is provably empty.
 fn ignored_in_crypt_entries(
     covered_roots: &[PathBuf],
     repo_path: &Path,
@@ -325,6 +377,9 @@ fn ignored_in_crypt_entries(
         .cloned()
         .collect();
     if dir_roots.is_empty() {
+        return Vec::new();
+    }
+    if !ignore_rules_in_play(found, &dir_roots, repo_path) {
         return Vec::new();
     }
     let unfiltered = walk_files(&dir_roots, repo_path, false);
@@ -740,6 +795,55 @@ mod tests {
         fs::write(dir.join("keep.txt"), "keep").unwrap();
         fs::write(dir.join("x.env"), "ignored").unwrap();
         fs::write(base.join(".gitignore"), "*.env\n").unwrap();
+
+        let found = list_files(["dir"], base);
+        assert_eq!(found, vec![dir.join("keep.txt")]);
+
+        let missed = ignored_in_crypt_entries(std::slice::from_ref(&dir), base, &found);
+        assert_eq!(missed, vec![dir.join("x.env")]);
+    }
+
+    #[test]
+    fn test_is_ignore_rule_file() {
+        assert!(is_ignore_rule_file(Path::new(".gitignore")));
+        assert!(is_ignore_rule_file(Path::new("dir/.ignore")));
+        // Look-alikes and directories are not rule files.
+        assert!(!is_ignore_rule_file(Path::new("gitignore")));
+        assert!(!is_ignore_rule_file(Path::new(".git")));
+        assert!(!is_ignore_rule_file(Path::new("dir/")));
+    }
+
+    /// With no ignore-rule source anywhere, the diff is empty — and the
+    /// re-walk is skipped when the machine also carries no global excludes.
+    #[test]
+    fn test_ignored_in_crypt_entries_empty_without_rule_sources() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        fs::create_dir_all(base.join(".git")).unwrap();
+        let dir = base.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        fs::write(base.join(".git").join("HEAD"), "ref").unwrap();
+
+        let found = list_files(["dir"], base);
+        assert_eq!(
+            ignored_in_crypt_entries(std::slice::from_ref(&dir), base, &found),
+            Vec::<PathBuf>::new()
+        );
+    }
+
+    /// A rule file above the walk root (parent-directory rules) must keep
+    /// the re-walk running and reporting the excluded files.
+    #[test]
+    fn test_ignored_in_crypt_entries_detects_ancestor_rules() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        fs::create_dir_all(base.join(".git")).unwrap();
+        fs::write(base.join(".gitignore"), "*.env\n").unwrap();
+        let dir = base.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("keep.txt"), "keep").unwrap();
+        fs::write(dir.join("x.env"), "ignored").unwrap();
 
         let found = list_files(["dir"], base);
         assert_eq!(found, vec![dir.join("keep.txt")]);
