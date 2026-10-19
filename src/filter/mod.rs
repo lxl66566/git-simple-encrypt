@@ -153,7 +153,17 @@ impl<'a> FilterContext<'a> {
 
     fn password(&self) -> Result<&Zeroizing<String>> {
         self.password
-            .get_or_init(|| self.repo.get_key().map_err(|e| e.to_string()))
+            .get_or_init(|| {
+                self.repo
+                    .get_key()
+                    // An empty stored key (`git-se set key ""`) must fail like
+                    // the manual e/d path (Error::EmptyKey) instead of
+                    // encrypting with a near-zero-security password.
+                    .and_then(|key| {
+                        if key.is_empty() { Err(Error::EmptyKey) } else { Ok(key) }
+                    })
+                    .map_err(|e| e.to_string())
+            })
             .as_ref()
             .map_err(|msg| Error::Other(msg.clone()))
     }
@@ -498,5 +508,32 @@ mod tests {
         assert!(ctx.password().is_err());
         // sticky: the failed lookup is cached, not retried
         assert!(ctx.password().is_err());
+    }
+
+    /// An empty stored key (`git-se set key ""`) is rejected exactly like the
+    /// manual e/d commands (`Error::EmptyKey` semantics): clean must not
+    /// encrypt with it, and smudge must not run Argon2 with it.
+    #[test]
+    fn test_empty_key_rejected_by_filter() {
+        let (_dir, repo) = init_repo();
+        let ctx = FilterContext::new(&repo, SaltSource::PerFile);
+        let ciphertext = clean_into(&ctx, "f.txt", b"secret");
+
+        repo.set_config("key", "").unwrap();
+        let ctx = FilterContext::new(&repo, SaltSource::PerFile);
+
+        // clean fails with the EmptyKey message and writes nothing
+        let mut out = Vec::new();
+        let mut input = Cursor::new(b"plain".to_vec());
+        let err = clean_stream(&ctx, Path::new("f.txt"), &mut input, &mut out)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key must not be empty"), "got: {err}");
+        assert!(out.is_empty(), "no ciphertext may be produced");
+
+        // smudge of real ciphertext fails too (it needs the password)
+        let mut out = Vec::new();
+        let mut input = Cursor::new(ciphertext);
+        assert!(decrypt_stream(&ctx, &mut input, &mut out, None).is_err());
     }
 }
