@@ -295,17 +295,37 @@ fn split_byte_record(record: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
         .map(|i| (&record[..i], &record[i + 1..]))
 }
 
-/// Whether a repo-relative path (forward slashes) is covered by the crypt
-/// list: an exact file entry, or an entry naming an ancestor directory.
+/// Crypt-list coverage matcher over repo-relative (forward-slashed) paths.
+///
+/// The per-entry directory prefixes are built once per query batch, so
+/// per-file checks neither rescan-and-reallocate the list nor repeat the
+/// prefix concatenation.
 ///
 /// Deliberately free of the walker's ignore semantics: this predicate feeds
 /// staged/index queries, and a tracked, staged file must never be hidden by
 /// .gitignore rules (the pre-commit check would silently skip it). Crypt
 /// entries are plain paths, never globs, so the prefix test is exact.
-fn crypt_covers(crypt_list: &[String], rel: &str) -> bool {
-    crypt_list
-        .iter()
-        .any(|e| rel == e || rel.starts_with(&format!("{e}/")))
+struct CryptCoverage {
+    /// (entry, entry + "/") per crypt-list line.
+    prefixes: Vec<(String, String)>,
+}
+
+impl CryptCoverage {
+    fn new(crypt_list: &[String]) -> Self {
+        Self {
+            prefixes: crypt_list
+                .iter()
+                .map(|entry| (entry.clone(), format!("{entry}/")))
+                .collect(),
+        }
+    }
+
+    /// Whether `rel` is an exact crypt-list entry or lies underneath one.
+    fn covers(&self, rel: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|(file, dir)| rel == file || rel.starts_with(dir.as_str()))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -935,6 +955,7 @@ impl Repo {
         if !self.conf.crypt_list.is_empty() && self.head_exists()? {
             let head = self.head_tree_blobs()?;
             if !head.is_empty() {
+                let coverage = CryptCoverage::new(&self.conf.crypt_list);
                 let index = self.index_blobs()?;
                 candidates = head
                     .keys()
@@ -942,7 +963,7 @@ impl Repo {
                     // a staged deletion must not resurface through the tree.
                     .filter(|p| index.contains_key(*p))
                     .map(|p| String::from_utf8_lossy(p).into_owned())
-                    .filter(|rel| crypt_covers(&self.conf.crypt_list, rel))
+                    .filter(|rel| coverage.covers(rel))
                     .collect();
             }
         }
@@ -1027,9 +1048,10 @@ impl Repo {
         if names.is_empty() {
             return Ok(Vec::new());
         }
+        let coverage = CryptCoverage::new(&self.conf.crypt_list);
         let index = self.index_blobs()?;
         Ok(nul_records(&names)
-            .filter(|p| crypt_covers(&self.conf.crypt_list, &String::from_utf8_lossy(p)))
+            .filter(|p| coverage.covers(&String::from_utf8_lossy(p)))
             .filter_map(|p| {
                 index
                     .get(p)
@@ -1111,6 +1133,7 @@ impl Repo {
             return Ok(plan); // unborn branch: nothing committed to migrate
         }
         let index = self.index_blobs()?;
+        let coverage = CryptCoverage::new(&self.conf.crypt_list);
         let mut batch = CatFileBatch::spawn(&self.path)?;
         for (path, oid) in &head {
             // Only files that are both committed and still tracked; a staged
@@ -1119,7 +1142,7 @@ impl Repo {
                 continue;
             }
             let rel = String::from_utf8_lossy(path).into_owned();
-            if !crypt_covers(&self.conf.crypt_list, &rel) {
+            if !coverage.covers(&rel) {
                 continue;
             }
             let Some(mut stream) = batch.blob_stream(oid)? else {
@@ -1585,6 +1608,23 @@ mod tests {
 
         let err = Repo::open(&repo_path).unwrap_err().to_string();
         assert!(err.contains("not a git repository"), "got: {err}");
+    }
+
+    /// Coverage must be prefix-exact on path-component boundaries: an entry
+    /// names a file or an ancestor directory, never a string prefix.
+    #[test]
+    fn test_crypt_coverage_prefix_boundaries() {
+        let coverage = CryptCoverage::new(&["secret.txt".to_string(), "docs".to_string()]);
+
+        assert!(coverage.covers("secret.txt"));
+        assert!(coverage.covers("docs"));
+        assert!(coverage.covers("docs/a/b.md"));
+        // Longer names sharing the prefix are different components.
+        assert!(!coverage.covers("docsx"));
+        assert!(!coverage.covers("docsx/a.md"));
+        assert!(!coverage.covers("other.txt"));
+        // An empty crypt list covers nothing.
+        assert!(!CryptCoverage::new(&[]).covers("docs/a.md"));
     }
 
     #[test]
