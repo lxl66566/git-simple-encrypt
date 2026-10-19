@@ -111,11 +111,10 @@ impl CatFileBatch {
         })
     }
 
-    /// Read one blob by its object id; `None` when the object is missing.
-    ///
-    /// Response framing: `<oid> <type> <size> LF <size bytes> LF`, or
-    /// `<spec> missing LF`.
-    fn blob(&mut self, oid: &str) -> Result<Option<Vec<u8>>> {
+    /// Send one lookup and parse its response header: `Some(size)` means a
+    /// `<oid> <type> <size> LF` header whose payload of `size` bytes (plus a
+    /// trailing LF) is now waiting on the pipe; `None` means "missing".
+    fn response_header(&mut self, oid: &str) -> Result<Option<usize>> {
         self.stdin.write_all(oid.as_bytes())?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
@@ -123,25 +122,124 @@ impl CatFileBatch {
         self.stdout.read_line(&mut header)?;
         let header = header.trim_end();
         // Response header: `<oid> <type> <size>` or `<spec> missing`.
-        let Some(size) = header
+        match header
             .rsplit_once(' ')
             .and_then(|(_, size)| size.parse::<usize>().ok())
-        else {
-            if header.ends_with(" missing") {
-                return Ok(None);
-            }
-            return Err(Error::Other(format!(
+        {
+            Some(size) => Ok(Some(size)),
+            None if header.ends_with(" missing") => Ok(None),
+            None => Err(Error::Other(format!(
                 "unexpected git cat-file response: {header}"
-            )));
+            ))),
+        }
+    }
+
+    /// Read one blob by its object id; `None` when the object is missing.
+    ///
+    /// Response framing: `<oid> <type> <size> LF <size bytes> LF`, or
+    /// `<spec> missing LF`.
+    fn blob(&mut self, oid: &str) -> Result<Option<Vec<u8>>> {
+        let Some(mut stream) = self.blob_stream(oid)? else {
+            return Ok(None);
         };
-        // Payload of exactly `size` bytes, then one LF terminator.
-        let mut buf = vec![0u8; size + 1];
-        self.stdout.read_exact(&mut buf)?;
-        buf.truncate(size);
+        let mut buf = vec![0u8; stream.len()];
+        stream.read_exact(&mut buf)?;
+        stream.skip_to_end()?;
         Ok(Some(buf))
+    }
+
+    /// Read only the leading bytes of one blob (up to `keep`, clamped to the
+    /// payload size) and drain the remainder without buffering it; `None`
+    /// when the object is missing.
+    fn blob_prefix(&mut self, oid: &str, keep: usize) -> Result<Option<Vec<u8>>> {
+        let Some(mut stream) = self.blob_stream(oid)? else {
+            return Ok(None);
+        };
+        stream.take_prefix(keep).map(Some)
+    }
+
+    /// Begin reading one blob payload; `None` when the object is missing.
+    /// The returned stream must be fully consumed, or ended via
+    /// [`BlobStream::skip_to_end`], before the next lookup on this session:
+    /// leftover bytes would desync every later response.
+    fn blob_stream(&mut self, oid: &str) -> Result<Option<BlobStream<'_>>> {
+        let Some(size) = self.response_header(oid)? else {
+            return Ok(None);
+        };
+        Ok(Some(BlobStream {
+            batch: self,
+            size,
+            remaining: size,
+        }))
     }
 }
 
+/// A blob payload currently being read from a [`CatFileBatch`] session.
+///
+/// Holds the borrow while the caller consumes the payload piecewise; the
+/// session stays aligned as long as every stream is read to its end or
+/// explicitly skipped.
+struct BlobStream<'a> {
+    batch: &'a mut CatFileBatch,
+    /// Payload size advertised by the response header.
+    size: usize,
+    /// Payload bytes not yet consumed.
+    remaining: usize,
+}
+
+impl BlobStream<'_> {
+    /// The payload size advertised by the response header.
+    #[must_use]
+    const fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Read exactly `buf.len()` payload bytes; the caller must stay within
+    /// [`BlobStream::len`].
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        debug_assert!(
+            buf.len() <= self.remaining,
+            "blob read past the advertised payload size"
+        );
+        self.batch.stdout.read_exact(buf)?;
+        self.remaining -= buf.len();
+        Ok(())
+    }
+
+    /// Read the first `keep` payload bytes (clamped to the payload size),
+    /// end the stream and return them: magic checks only need the leading
+    /// bytes, and draining keeps the session aligned without holding the
+    /// whole blob in memory.
+    fn take_prefix(&mut self, keep: usize) -> Result<Vec<u8>> {
+        let mut head = vec![0u8; keep.min(self.size)];
+        self.read_exact(&mut head)?;
+        self.skip_to_end()?;
+        Ok(head)
+    }
+
+    /// Consume and discard the unread payload plus the trailing LF
+    /// terminator, leaving the session ready for the next request. The
+    /// payload bytes still cross the pipe (the protocol leaves no way
+    /// around them) but never the heap.
+    fn skip_to_end(&mut self) -> Result<()> {
+        if self.remaining > 0 {
+            let remaining = self.remaining as u64;
+            let mut payload = self.batch.stdout.by_ref().take(remaining);
+            let copied = std::io::copy(&mut payload, &mut std::io::sink())?;
+            if copied < remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "git cat-file payload ended early",
+                )
+                .into());
+            }
+            self.remaining = 0;
+        }
+        let mut lf = [0u8; 1];
+        self.batch.stdout.read_exact(&mut lf)?;
+        Ok(())
+    }
+}
 impl Drop for CatFileBatch {
     fn drop(&mut self) {
         // The session lives exactly as long as the caller's questions;
@@ -356,9 +454,12 @@ impl Repo {
         let mut first_error: Option<Error> = None;
         let mut batch = CatFileBatch::spawn(&self.path)?;
         for (rel, oid) in &targets {
-            match batch.blob(oid) {
-                Ok(Some(blob)) => {
-                    if !is_ciphertext(&blob) {
+            // The magic check only needs the leading header bytes; the rest
+            // of the payload is drained without buffering, so staged blobs
+            // of any size cost a fixed ~64-byte allocation.
+            match batch.blob_prefix(oid, HEADER_LEN) {
+                Ok(Some(head)) => {
+                    if !is_ciphertext(&head) {
                         not_encrypted.push(rel.clone());
                     }
                 },
@@ -1473,6 +1574,70 @@ mod tests {
             .output()
             .unwrap();
         dir
+    }
+
+    /// Write `bytes` into the object store of the repo at `repo_path` and
+    /// return the printed blob oid.
+    fn hash_object(repo_path: &Path, bytes: &[u8]) -> Result<String> {
+        use std::process::Stdio;
+
+        let mut child = Command::new("git")
+            .current_dir(repo_path)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(bytes)?;
+        // EOF before git prints the oid.
+        drop(stdin);
+        let out = child.wait_with_output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// `blob_prefix` drains exactly the unread payload.
+    ///
+    /// Across any mix of prefix reads, full reads and missing-object
+    /// responses, the session stays aligned and later responses still
+    /// parse. Covers the exact `HEADER_LEN` boundary (prefix covers the
+    /// whole payload, only the LF gets drained) and blobs smaller than the
+    /// prefix.
+    #[test]
+    fn test_cat_file_batch_prefix_keeps_session_aligned() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize()?.to_path_buf();
+
+        let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let big_oid = hash_object(&repo_path, &big)?;
+        let edge: Vec<u8> = (0..HEADER_LEN)
+            .map(u8::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let edge_oid = hash_object(&repo_path, &edge)?;
+        let small = b"tiny blob".to_vec();
+        let small_oid = hash_object(&repo_path, &small)?;
+
+        let mut batch = CatFileBatch::spawn(&repo_path)?;
+        let head = batch.blob_prefix(&big_oid, HEADER_LEN)?.unwrap();
+        assert_eq!(head, &big[..HEADER_LEN]);
+
+        let head = batch.blob_prefix(&edge_oid, HEADER_LEN)?.unwrap();
+        assert_eq!(head, edge);
+
+        // A missing object between two hits must not shift the framing.
+        assert!(
+            batch
+                .blob_prefix("0000000000000000000000000000000000000000", HEADER_LEN)?
+                .is_none()
+        );
+
+        let head = batch.blob_prefix(&small_oid, HEADER_LEN)?.unwrap();
+        assert_eq!(head, small);
+
+        // Full reads still work after all the prefix reads.
+        assert_eq!(batch.blob(&big_oid)?, Some(big));
+        assert_eq!(batch.blob(&small_oid)?, Some(small));
+        Ok(())
     }
 
     #[test]
