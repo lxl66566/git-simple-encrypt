@@ -1,12 +1,25 @@
+//! The repository handle ([`Repo`]) and its git-se commands: checking
+//! encryption status, installing/uninstalling the integrations, and the
+//! install-time migration analysis.
+//!
+//! Submodules split the supporting layers:
+//! - [`git`]: git subprocess plumbing (the cat-file batch session, `-z` parsers, HEAD tree / index
+//!   enumeration)
+//! - [`config_file`]: repo-local config reads/writes, incl. the direct config-file surgery that
+//!   keeps secret values out of argv
+
+mod config_file;
+mod git;
+
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io::{BufRead, BufReader, Read, Write},
+    collections::HashSet,
     path::{Path, PathBuf},
-    process::{Child, ChildStdin, Command, Stdio},
+    process::Command,
 };
 
 use config_file2::LoadConfigFile;
-use log::{debug, info, warn};
+use git::{CatFileBatch, CryptCoverage, nul_records, read_prefix, stream_eq_file};
+use log::{info, warn};
 use parking_lot::Mutex;
 use zeroize::Zeroizing;
 
@@ -69,263 +82,6 @@ fn is_managed_hook(hook_path: &Path) -> Result<bool> {
 fn quote_exe_for_sh(exe: &Path) -> String {
     let exe = exe.to_string_lossy().replace('\\', "/");
     format!("'{}'", exe.replace('\'', "'\\''"))
-}
-
-/// A persistent `git cat-file --batch` session.
-///
-/// Spawning one git process per blob costs 20-50ms on Windows; at a thousand
-/// staged files the pre-commit check spent 30-50s just spawning git. One
-/// session serves any number of lookups over a single pipe pair. Requests
-/// are answered strictly in lockstep (write one request line, then read the
-/// full response) so arbitrarily large blobs cannot deadlock on a full
-/// pipe.
-struct CatFileBatch {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<std::process::ChildStdout>,
-}
-
-impl CatFileBatch {
-    fn spawn(cwd: &Path) -> Result<Self> {
-        let mut child = Command::new("git")
-            .current_dir(cwd)
-            .args(["cat-file", "--batch"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Per-object errors are conveyed by the batch protocol itself
-            // ("<spec> missing"); git's stderr would only add noise.
-            .stderr(Stdio::null())
-            .spawn()?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::Other("git cat-file stdin unavailable".to_string()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::Other("git cat-file stdout unavailable".to_string()))?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
-    }
-
-    /// Send one lookup and parse its response header: `Some(size)` means a
-    /// `<oid> <type> <size> LF` header whose payload of `size` bytes (plus a
-    /// trailing LF) is now waiting on the pipe; `None` means "missing".
-    fn response_header(&mut self, oid: &str) -> Result<Option<usize>> {
-        self.stdin.write_all(oid.as_bytes())?;
-        self.stdin.write_all(b"\n")?;
-        self.stdin.flush()?;
-        let mut header = String::new();
-        self.stdout.read_line(&mut header)?;
-        let header = header.trim_end();
-        // Response header: `<oid> <type> <size>` or `<spec> missing`.
-        match header
-            .rsplit_once(' ')
-            .and_then(|(_, size)| size.parse::<usize>().ok())
-        {
-            Some(size) => Ok(Some(size)),
-            None if header.ends_with(" missing") => Ok(None),
-            None => Err(Error::Other(format!(
-                "unexpected git cat-file response: {header}"
-            ))),
-        }
-    }
-
-    /// Read only the leading bytes of one blob (up to `keep`, clamped to the
-    /// payload size) and drain the remainder without buffering it; `None`
-    /// when the object is missing.
-    fn blob_prefix(&mut self, oid: &str, keep: usize) -> Result<Option<Vec<u8>>> {
-        let Some(mut stream) = self.blob_stream(oid)? else {
-            return Ok(None);
-        };
-        stream.take_prefix(keep).map(Some)
-    }
-
-    /// Begin reading one blob payload; `None` when the object is missing.
-    /// The returned stream must be fully consumed, or ended via
-    /// [`BlobStream::skip_to_end`], before the next lookup on this session:
-    /// leftover bytes would desync every later response.
-    fn blob_stream(&mut self, oid: &str) -> Result<Option<BlobStream<'_>>> {
-        let Some(size) = self.response_header(oid)? else {
-            return Ok(None);
-        };
-        Ok(Some(BlobStream {
-            batch: self,
-            size,
-            remaining: size,
-        }))
-    }
-}
-
-/// A blob payload currently being read from a [`CatFileBatch`] session.
-///
-/// Holds the borrow while the caller consumes the payload piecewise; the
-/// session stays aligned as long as every stream is read to its end or
-/// explicitly skipped.
-struct BlobStream<'a> {
-    batch: &'a mut CatFileBatch,
-    /// Payload size advertised by the response header.
-    size: usize,
-    /// Payload bytes not yet consumed.
-    remaining: usize,
-}
-
-impl BlobStream<'_> {
-    /// The payload size advertised by the response header.
-    #[must_use]
-    const fn len(&self) -> usize {
-        self.size
-    }
-
-    /// Read exactly `buf.len()` payload bytes; the caller must stay within
-    /// [`BlobStream::len`].
-    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        debug_assert!(
-            buf.len() <= self.remaining,
-            "blob read past the advertised payload size"
-        );
-        self.batch.stdout.read_exact(buf)?;
-        self.remaining -= buf.len();
-        Ok(())
-    }
-
-    /// Read up to `buf.len()` payload bytes (fewer only at the payload end).
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
-        let want = buf.len().min(self.remaining);
-        let n = self.batch.stdout.read(&mut buf[..want])?;
-        self.remaining -= n;
-        Ok(n)
-    }
-
-    /// Read the first `keep` payload bytes (clamped to the payload size),
-    /// end the stream and return them: magic checks only need the leading
-    /// bytes, and draining keeps the session aligned without holding the
-    /// whole blob in memory.
-    fn take_prefix(&mut self, keep: usize) -> Result<Vec<u8>> {
-        let mut head = vec![0u8; keep.min(self.size)];
-        self.read_exact(&mut head)?;
-        self.skip_to_end()?;
-        Ok(head)
-    }
-
-    /// Consume and discard the unread payload plus the trailing LF
-    /// terminator, leaving the session ready for the next request. The
-    /// payload bytes still cross the pipe (the protocol leaves no way
-    /// around them) but never the heap.
-    fn skip_to_end(&mut self) -> Result<()> {
-        if self.remaining > 0 {
-            let remaining = self.remaining as u64;
-            let mut payload = self.batch.stdout.by_ref().take(remaining);
-            let copied = std::io::copy(&mut payload, &mut std::io::sink())?;
-            if copied < remaining {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "git cat-file payload ended early",
-                )
-                .into());
-            }
-            self.remaining = 0;
-        }
-        let mut lf = [0u8; 1];
-        self.batch.stdout.read_exact(&mut lf)?;
-        Ok(())
-    }
-}
-
-/// Chunk size for the streaming blob-vs-file compare.
-const COMPARE_CHUNK: usize = 8 * 1024;
-
-/// Read up to `buf.len()` bytes from `file`, filling as much as possible
-/// before EOF; returns the number of bytes read.
-fn read_prefix(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
-    let mut filled = 0;
-    while filled < buf.len() {
-        match file.read(&mut buf[filled..])? {
-            0 => break,
-            n => filled += n,
-        }
-    }
-    Ok(filled)
-}
-
-/// Compare the unconsumed blob payload against the remainder of `file` in
-/// fixed chunks, stopping at the first difference.
-///
-/// The caller has already matched the total lengths; a file that ends early
-/// — truncated concurrently with the compare — simply reads as differing.
-fn stream_eq_file(stream: &mut BlobStream<'_>, file: &mut std::fs::File) -> Result<bool> {
-    let mut blob_chunk = [0u8; COMPARE_CHUNK];
-    let mut file_chunk = [0u8; COMPARE_CHUNK];
-    loop {
-        let n = stream.read(&mut blob_chunk)?;
-        if n == 0 {
-            return Ok(true);
-        }
-        let filled = read_prefix(file, &mut file_chunk[..n])?;
-        if filled < n || blob_chunk[..n] != file_chunk[..n] {
-            return Ok(false);
-        }
-    }
-}
-impl Drop for CatFileBatch {
-    fn drop(&mut self) {
-        // The session lives exactly as long as the caller's questions;
-        // kill+reap deterministically cleans up even mid-stream.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// Split raw NUL-terminated git output into records (dropping the empty
-/// trailing record). Every multi-path git parse goes through here so the
-/// `-z` handling lives in exactly one place.
-fn nul_records(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
-    bytes.split(|&b| b == 0).filter(|r| !r.is_empty())
-}
-
-/// Split a byte record at its first `sep` byte (`slice::split_once` is not
-/// stable for byte slices yet).
-fn split_byte_record(record: &[u8], sep: u8) -> Option<(&[u8], &[u8])> {
-    record
-        .iter()
-        .position(|&b| b == sep)
-        .map(|i| (&record[..i], &record[i + 1..]))
-}
-
-/// Crypt-list coverage matcher over repo-relative (forward-slashed) paths.
-///
-/// The per-entry directory prefixes are built once per query batch, so
-/// per-file checks neither rescan-and-reallocate the list nor repeat the
-/// prefix concatenation.
-///
-/// Deliberately free of the walker's ignore semantics: this predicate feeds
-/// staged/index queries, and a tracked, staged file must never be hidden by
-/// .gitignore rules (the pre-commit check would silently skip it). Crypt
-/// entries are plain paths, never globs, so the prefix test is exact.
-struct CryptCoverage {
-    /// (entry, entry + "/") per crypt-list line.
-    prefixes: Vec<(String, String)>,
-}
-
-impl CryptCoverage {
-    fn new(crypt_list: &[String]) -> Self {
-        Self {
-            prefixes: crypt_list
-                .iter()
-                .map(|entry| (entry.clone(), format!("{entry}/")))
-                .collect(),
-        }
-    }
-
-    /// Whether `rel` is an exact crypt-list entry or lies underneath one.
-    fn covers(&self, rel: &str) -> bool {
-        self.prefixes
-            .iter()
-            .any(|(file, dir)| rel == file || rel.starts_with(dir.as_str()))
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -1027,90 +783,6 @@ impl Repo {
             .collect()
     }
 
-    /// Crypt-list files staged for the current commit, with the oid of their
-    /// staged (index) blob: `Vec<(repo-relative path, oid)>`.
-    ///
-    /// Two git processes total, regardless of file count:
-    /// - `git diff --cached --name-only -z --no-renames --diff-filter=ACMR` enumerates the staged
-    ///   paths raw (NUL-separated; `-z` disables C-quoting so any byte spelling survives).
-    ///   `--no-renames` keeps records single-path (a rename would drag the old path along).
-    /// - `git ls-files -s -z` maps every index path to its full blob oid (`diff --raw` abbreviates
-    ///   oids, which could turn ambiguous in huge repositories; ls-files never does).
-    fn staged_crypt_blobs(&self) -> Result<Vec<(String, String)>> {
-        let names = self.run_with_output_bytes(&[
-            "diff",
-            "--cached",
-            "--name-only",
-            "-z",
-            "--no-renames",
-            "--diff-filter=ACMR",
-        ])?;
-        if names.is_empty() {
-            return Ok(Vec::new());
-        }
-        let coverage = CryptCoverage::new(&self.conf.crypt_list);
-        let index = self.index_blobs()?;
-        Ok(nul_records(&names)
-            .filter(|p| coverage.covers(&String::from_utf8_lossy(p)))
-            .filter_map(|p| {
-                index
-                    .get(p)
-                    .map(|oid| (String::from_utf8_lossy(p).into_owned(), oid.clone()))
-            })
-            .collect())
-    }
-
-    /// Full blob oid for every staged path, keyed by raw path bytes.
-    /// (`git ls-files -s -z`: `<mode> <oid> <stage>\t<path>` per NUL.)
-    fn index_blobs(&self) -> Result<HashMap<Vec<u8>, String>> {
-        let out = self.run_with_output_bytes(&["ls-files", "-s", "-z"])?;
-        let mut map = HashMap::new();
-        for record in nul_records(&out) {
-            let Some((meta, path)) = split_byte_record(record, b'\t') else {
-                continue;
-            };
-            let Some(oid) = meta.split(|&b| b == b' ').nth(1) else {
-                continue;
-            };
-            map.insert(path.to_vec(), String::from_utf8_lossy(oid).into_owned());
-        }
-        Ok(map)
-    }
-
-    /// Raw path bytes → full blob oid for every blob in the HEAD tree
-    /// (`git ls-tree -r -z HEAD`: `<mode> <type> <oid>\t<path>` per NUL).
-    /// Empty when HEAD does not exist yet (fresh repository).
-    fn head_tree_blobs(&self) -> Result<BTreeMap<Vec<u8>, String>> {
-        if !self.head_exists()? {
-            return Ok(BTreeMap::new());
-        }
-        let out = self.run_with_output_bytes(&["ls-tree", "-r", "-z", "HEAD"])?;
-        let mut map = BTreeMap::new();
-        for record in nul_records(&out) {
-            let Some((meta, path)) = split_byte_record(record, b'\t') else {
-                continue;
-            };
-            let mut fields = meta.split(|&b| b == b' ');
-            let kind = fields.nth(1);
-            let oid = fields.next();
-            // Keep blobs only; submodules (commit entries) are not files.
-            if kind == Some(b"blob")
-                && let Some(oid) = oid
-            {
-                map.insert(path.to_vec(), String::from_utf8_lossy(oid).into_owned());
-            }
-        }
-        Ok(map)
-    }
-
-    fn head_exists(&self) -> Result<bool> {
-        let out = Command::new("git")
-            .current_dir(&self.path)
-            .args(["rev-parse", "--verify", "--quiet", "HEAD"])
-            .output()?;
-        Ok(out.status.success())
-    }
-
     /// Transcrypt-style migration analysis at install time, over tracked
     /// crypt-list files whose worktree copy still equals the committed blob
     /// byte-for-byte (typical right after a clone, before any filter was
@@ -1265,163 +937,6 @@ impl Repo {
         }
         Ok(false)
     }
-
-    /// Run a `git` command in the repo, discarding its stdout/stderr.
-    pub fn run(&self, args: &[&str]) -> Result<()> {
-        let output = Command::new("git")
-            .current_dir(&self.path)
-            .args(args)
-            .output()?;
-        if !output.status.success() {
-            return Err(Error::Git(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Run a `git` command and return its stdout as a `String`.
-    pub fn run_with_output(&self, args: &[&str]) -> Result<String> {
-        String::from_utf8(self.run_with_output_bytes(args)?)
-            .map_err(|e| Error::Other(format!("git output not UTF-8: {e}")))
-    }
-
-    /// Run a `git` command and return its raw stdout bytes — the base for
-    /// every `-z` (NUL-separated) parse, where text conversion would be
-    /// lossy for arbitrary path bytes.
-    fn run_with_output_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
-        let mut cmd = Command::new("git");
-
-        // Force English output in tests so we can match on stderr reliably.
-        if cfg!(test) {
-            cmd.env("LC_ALL", "C.UTF-8").env("LANGUAGE", "C.UTF-8");
-        }
-
-        let output = cmd.current_dir(&self.path).args(args).output()?;
-        if !output.status.success() {
-            return Err(Error::Git(
-                String::from_utf8_lossy(&output.stderr).into_owned(),
-            ));
-        }
-        Ok(output.stdout)
-    }
-
-    /// Write a value to `<prefix>.<key>` in the repo-local git config.
-    ///
-    /// The value never appears in a subprocess argv (process listings would
-    /// briefly expose it — this key holds a user password): the local config
-    /// file is edited directly with git-compatible escaping, falling back to
-    /// a plain `git config` invocation only when the file cannot be parsed
-    /// confidently (see [`Repo::set_local_config_file`]).
-    ///
-    /// Note: the value is stored verbatim (no trimming); callers sanitize
-    /// their input themselves. Both key-setting paths trim before calling
-    /// this — the interactive `p` prompt (inside `prompt_password`) and the
-    /// deprecated `set key` — so they agree on the stored key, while inner
-    /// whitespace always survives.
-    pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
-        let temp = String::from(GIT_CONFIG_PREFIX) + key;
-        if let Err(e) = self.set_local_config_file(&temp, value) {
-            debug!("direct config-file write failed ({e}); falling back to `git config` argv");
-            return self.run(&["config", "--local", &temp, value]);
-        }
-        Ok(())
-    }
-
-    /// Set `section.var = value` by editing the repo-local config file
-    /// directly, keeping the value out of every child process.
-    ///
-    /// `git config` has no stdin mode for writes (there is no `--stdin`
-    /// option for it up to git 2.50), and an argv value is briefly visible
-    /// in process listings. The value is escaped exactly the way git's own
-    /// config writer does ([`escape_config_value`]), so the result is
-    /// byte-compatible with git-written values and reads back identically
-    /// (newlines, quotes, tabs, leading/trailing spaces, non-ASCII).
-    fn set_local_config_file(&self, full_key: &str, value: &str) -> Result<()> {
-        let Some((section, var)) = split_config_key(full_key) else {
-            return Err(Error::Other(format!(
-                "unsupported config key for file write: {full_key}"
-            )));
-        };
-        let path = self.local_config_file()?;
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            // A missing file is the fresh-repo case: start from empty.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            // Any other failure (encoding, permissions) must NOT be masked:
-            // rewriting from an empty misread would clobber the user's config.
-            Err(e) => return Err(e.into()),
-        };
-        let updated = set_config_line(&content, section, var, &escape_config_value(value));
-        atomic_write(&path, updated.as_bytes())
-    }
-
-    /// Absolute path of the repo-local config file (the `git config --local`
-    /// target). `--git-path config` resolves linked-worktree pointers to the
-    /// shared config — the same file `--local` writes — and may return a
-    /// repo-root-relative path.
-    fn local_config_file(&self) -> Result<PathBuf> {
-        let out = self.run_with_output(&["rev-parse", "--git-path", "config"])?;
-        let path = PathBuf::from(out.trim());
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.path.join(path)
-        })
-    }
-
-    /// Write to an unprefixed git config key (e.g. `filter.git-se.clean`) in
-    /// the repo-local git config. Unlike [`Repo::set_config`], no namespace is
-    /// prepended — used for the git integration settings git itself reads.
-    /// These values are not secrets, so the plain argv form is fine.
-    pub fn set_raw_config(&self, key: &str, value: &str) -> Result<()> {
-        self.run(&["config", "--local", key, value])
-    }
-
-    /// Remove an unprefixed repo-local git config key written by
-    /// [`Repo::set_raw_config`]. A missing key is not an error: uninstall
-    /// must stay idempotent across repeated or partial installs.
-    fn unset_raw_config(&self, key: &str) -> Result<()> {
-        let out = Command::new("git")
-            .current_dir(&self.path)
-            .args(["config", "--local", "--unset", key])
-            .output()?;
-        // Exit code 5 = the key did not exist; anything else is a real
-        // failure. Git drops the section header once its last key is gone.
-        if !out.status.success() && out.status.code() != Some(5) {
-            return Err(Error::Git(
-                String::from_utf8_lossy(&out.stderr).into_owned(),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Read an unprefixed key from the repo-local git config only (no
-    /// global/system lookup, matching [`Repo::set_raw_config`]).
-    ///
-    /// The value is read with `-z` (NUL-terminated) so its exact bytes
-    /// survive; trimming the LF of plain output would corrupt values that
-    /// legitimately end in whitespace.
-    pub fn get_raw_config(&self, key: &str) -> Result<String> {
-        self.run_with_output_bytes(&["config", "--local", "--get", "-z", key])
-            .map(|out| {
-                // `--get` emits at most one record; cut at the first NUL
-                // defensively anyway.
-                let end = out.iter().position(|&b| b == 0).unwrap_or(out.len());
-                String::from_utf8_lossy(&out[..end]).into_owned()
-            })
-    }
-
-    /// Read `<prefix>.<key>` from the repo-local git config only.
-    ///
-    /// `--local` matches [`Repo::set_config`]: a stray key in the user's
-    /// global/system config must not be silently adopted — it would surface
-    /// as inexplicable decrypt failures in new repositories instead of a
-    /// clear "key not set" error.
-    pub fn get_config(&self, key: &str) -> Result<String> {
-        let temp = String::from(GIT_CONFIG_PREFIX) + key;
-        self.get_raw_config(&temp)
-    }
 }
 
 /// Whether leftover `.gitattributes` content is blank (whitespace only):
@@ -1479,107 +994,18 @@ struct MigrationPlan {
     needs_renormalize: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Repo-local config file surgery (secret values never enter argv)
-// ---------------------------------------------------------------------------
-
-/// Split `section.var` for the plain (non-subsection) section syntax used
-/// by all git-se keys.
-///
-/// Splits at the FIRST dot: a second dot would denote a
-/// `[section "subsection"]` key, which this writer does not support.
-fn split_config_key(key: &str) -> Option<(&str, &str)> {
-    let (section, var) = key.split_once('.')?;
-    (!section.is_empty() && !var.is_empty() && !var.contains('.')).then_some((section, var))
-}
-
-/// Escape a config value in git's double-quoted syntax, mirroring what
-/// `git config` itself writes.
-///
-/// `\`, `"`, LF and TAB become their backslash escapes; every other byte
-/// (CR and non-ASCII included) stays raw inside the quotes, exactly how git
-/// serializes such values.
-fn escape_config_value(value: &str) -> String {
-    let mut out = String::with_capacity(value.len() + 2);
-    out.push('"');
-    for c in value.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\t' => out.push_str("\\t"),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-/// Whether a trimmed line is the plain section header `[section]`
-/// (case-insensitive; a subsection form `[section "x"]` is a different key
-/// namespace and never matches; a trailing comment is tolerated).
-fn is_plain_section(trimmed: &str, section: &str) -> bool {
-    trimmed
-        .strip_prefix('[')
-        .and_then(|rest| rest.split(']').next())
-        .is_some_and(|name| name.trim().eq_ignore_ascii_case(section))
-}
-
-/// Whether a trimmed line assigns `var` (case-insensitive name, `=` with
-/// optional spaces; comment lines never match because their pre-`=` text
-/// contains the `#`/`;` marker).
-fn is_var_assignment(trimmed: &str, var: &str) -> bool {
-    trimmed
-        .find('=')
-        .is_some_and(|eq| trimmed[..eq].trim().eq_ignore_ascii_case(var))
-}
-
-/// Replace or insert `var = escaped_value` inside `[section]` of a config
-/// file body, appending a fresh section when absent.
-///
-/// Line-oriented and conservative: existing lines outside the touched entry
-/// are preserved verbatim.
-fn set_config_line(content: &str, section: &str, var: &str, escaped_value: &str) -> String {
-    let entry = format!("\t{var} = {escaped_value}");
-    // split('\n') (not lines()) keeps any \r attached to line bodies, so a
-    // CRLF file is not silently normalized; the trailing "" element
-    // represents the final newline.
-    let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
-
-    // Pass 1: an existing assignment of `var` inside the section?
-    let mut in_section = false;
-    let mut existing = None;
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_section = is_plain_section(trimmed, section);
-        } else if in_section && existing.is_none() && is_var_assignment(trimmed, var) {
-            existing = Some(i);
-        }
-    }
-
-    match existing {
-        Some(i) => lines[i] = entry,
-        None => {
-            if let Some(header) = lines
-                .iter()
-                .position(|l| is_plain_section(l.trim(), section))
-            {
-                // Insert right below the section header.
-                lines.insert(header + 1, entry);
-            } else {
-                lines.push(format!("[{section}]"));
-                lines.push(entry);
-            }
-        },
-    }
-    let mut out = lines.join("\n");
-    // Config files are newline-terminated; appending after a body without a
-    // trailing newline (or to an empty one) must not break that.
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out
+/// Create a temp directory holding a freshly `git init`-ed repository, for
+/// tests across this module tree.
+#[cfg(test)]
+fn init_temp_repo() -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    // `git init` so that .git/ exists for hook installation & config.
+    Command::new("git")
+        .args(["init"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    dir
 }
 
 #[cfg(test)]
@@ -1587,7 +1013,6 @@ mod tests {
     use std::process::Command;
 
     use path_absolutize::Absolutize;
-    use tempfile::TempDir;
 
     use super::*;
     use crate::crypt::{HEADER_LEN, VERSION};
@@ -1603,28 +1028,11 @@ mod tests {
 
     #[test]
     fn test_repo_open_rejects_non_git_directory() {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let repo_path = dir.path().absolutize().unwrap().to_path_buf();
 
         let err = Repo::open(&repo_path).unwrap_err().to_string();
         assert!(err.contains("not a git repository"), "got: {err}");
-    }
-
-    /// Coverage must be prefix-exact on path-component boundaries: an entry
-    /// names a file or an ancestor directory, never a string prefix.
-    #[test]
-    fn test_crypt_coverage_prefix_boundaries() {
-        let coverage = CryptCoverage::new(&["secret.txt".to_string(), "docs".to_string()]);
-
-        assert!(coverage.covers("secret.txt"));
-        assert!(coverage.covers("docs"));
-        assert!(coverage.covers("docs/a/b.md"));
-        // Longer names sharing the prefix are different components.
-        assert!(!coverage.covers("docsx"));
-        assert!(!coverage.covers("docsx/a.md"));
-        assert!(!coverage.covers("other.txt"));
-        // An empty crypt list covers nothing.
-        assert!(!CryptCoverage::new(&[]).covers("docs/a.md"));
     }
 
     #[test]
@@ -1632,7 +1040,7 @@ mod tests {
         // A linked worktree's `.git` is a file pointing at the main gitdir;
         // only its form (file vs directory) is checked here, validating the
         // target is git's own job.
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
         let repo_path = dir.path().absolutize().unwrap().to_path_buf();
         std::fs::write(
             repo_path.join(".git"),
@@ -1661,94 +1069,6 @@ mod tests {
 
         let repo = Repo::open(&repo_path)?;
         assert_eq!(repo.conf, Config::default().with_repo_path(&repo_path));
-        Ok(())
-    }
-
-    fn init_temp_repo() -> TempDir {
-        let dir = TempDir::new().unwrap();
-        // `git init` so that .git/ exists for hook installation & config.
-        Command::new("git")
-            .args(["init"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap();
-        dir
-    }
-
-    /// Write `bytes` into the object store of the repo at `repo_path` and
-    /// return the printed blob oid.
-    fn hash_object(repo_path: &Path, bytes: &[u8]) -> Result<String> {
-        use std::process::Stdio;
-
-        let mut child = Command::new("git")
-            .current_dir(repo_path)
-            .args(["hash-object", "-w", "--stdin"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(bytes)?;
-        // EOF before git prints the oid.
-        drop(stdin);
-        let out = child.wait_with_output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
-    }
-
-    /// Read a whole blob payload through the stream interface (the mirror of
-    /// the former whole-blob `blob` method, exercising `read_exact` over the
-    /// full payload).
-    fn read_full(batch: &mut CatFileBatch, oid: &str) -> Result<Option<Vec<u8>>> {
-        let Some(mut stream) = batch.blob_stream(oid)? else {
-            return Ok(None);
-        };
-        let mut buf = vec![0u8; stream.len()];
-        stream.read_exact(&mut buf)?;
-        stream.skip_to_end()?;
-        Ok(Some(buf))
-    }
-
-    /// `blob_prefix` drains exactly the unread payload.
-    ///
-    /// Across any mix of prefix reads, full reads and missing-object
-    /// responses, the session stays aligned and later responses still
-    /// parse. Covers the exact `HEADER_LEN` boundary (prefix covers the
-    /// whole payload, only the LF gets drained) and blobs smaller than the
-    /// prefix.
-    #[test]
-    fn test_cat_file_batch_prefix_keeps_session_aligned() -> Result<()> {
-        let dir = init_temp_repo();
-        let repo_path = dir.path().absolutize()?.to_path_buf();
-
-        let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
-        let big_oid = hash_object(&repo_path, &big)?;
-        let edge: Vec<u8> = (0..HEADER_LEN)
-            .map(u8::try_from)
-            .collect::<Result<_, _>>()
-            .unwrap();
-        let edge_oid = hash_object(&repo_path, &edge)?;
-        let small = b"tiny blob".to_vec();
-        let small_oid = hash_object(&repo_path, &small)?;
-
-        let mut batch = CatFileBatch::spawn(&repo_path)?;
-        let head = batch.blob_prefix(&big_oid, HEADER_LEN)?.unwrap();
-        assert_eq!(head, &big[..HEADER_LEN]);
-
-        let head = batch.blob_prefix(&edge_oid, HEADER_LEN)?.unwrap();
-        assert_eq!(head, edge);
-
-        // A missing object between two hits must not shift the framing.
-        assert!(
-            batch
-                .blob_prefix("0000000000000000000000000000000000000000", HEADER_LEN)?
-                .is_none()
-        );
-
-        let head = batch.blob_prefix(&small_oid, HEADER_LEN)?.unwrap();
-        assert_eq!(head, small);
-
-        // Full reads still work after all the prefix reads.
-        assert_eq!(read_full(&mut batch, &big_oid)?, Some(big));
-        assert_eq!(read_full(&mut batch, &small_oid)?, Some(small));
         Ok(())
     }
 
@@ -1820,79 +1140,6 @@ mod tests {
         assert_eq!(plan.to_decrypt, ["same.bin"]);
         assert!(!plan.needs_renormalize);
         Ok(())
-    }
-
-    #[test]
-    fn test_set_get_config_roundtrip() -> Result<()> {
-        let dir = init_temp_repo();
-        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
-        let repo = Repo::open(&repo_path)?;
-
-        repo.set_config("key", "hunter2")?;
-        let read_back = repo.get_config("key")?;
-        assert_eq!(read_back, "hunter2");
-        Ok(())
-    }
-
-    /// Passwords are config values too: every byte spelling that can come
-    /// out of a terminal or argv must survive a write→read cycle untouched.
-    ///
-    /// This locks both the direct-file escaping and the `-z` exact read
-    /// (a trimming read used to corrupt leading/trailing whitespace).
-    #[test]
-    fn test_set_get_config_special_value_roundtrip() -> Result<()> {
-        let dir = init_temp_repo();
-        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
-        let repo = Repo::open(&repo_path)?;
-
-        let values = [
-            "with space",
-            "  padded  ",
-            "a\"b\\c",
-            "tab\there",
-            "line1\nline2",
-            "crlf\r\nend",
-            "密码🔐パス",
-            "#comment ;semi",
-            "",
-        ];
-        for value in values {
-            repo.set_config("key", value)?;
-            assert_eq!(
-                repo.get_config("key")?,
-                value,
-                "roundtrip failed for {value:?}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_config_line_surgery() {
-        // replace within existing section
-        let base = "[core]\n\tbare = false\n[git-simple-encrypt]\n\tkey = \"old\"\n";
-        assert_eq!(
-            set_config_line(base, "git-simple-encrypt", "key", "\"new\""),
-            "[core]\n\tbare = false\n[git-simple-encrypt]\n\tkey = \"new\"\n"
-        );
-        // insert into an existing section that lacks the var
-        assert_eq!(
-            set_config_line(base, "git-simple-encrypt", "other", "1"),
-            "[core]\n\tbare = false\n[git-simple-encrypt]\n\tother = 1\n\tkey = \"old\"\n"
-        );
-        // append a missing section
-        assert_eq!(
-            set_config_line("[core]\n\tbare = false\n", "git-se", "k", "v"),
-            "[core]\n\tbare = false\n\n[git-se]\n\tk = v\n"
-        );
-        // case-insensitive section/var matching, subsections never match
-        let mixed = "[Git-Simple-Encrypt]\nKEY = x\n[git-simple-encrypt \"sub\"]\n\tkey = y\n";
-        assert_eq!(
-            set_config_line(mixed, "git-simple-encrypt", "key", "\"z\""),
-            "[Git-Simple-Encrypt]\n\tkey = \"z\"\n[git-simple-encrypt \"sub\"]\n\tkey = y\n"
-        );
-        // empty body
-        assert_eq!(set_config_line("", "s", "v", "1"), "\n[s]\n\tv = 1\n");
     }
 
     /// The managed-hook marker must stay the template's second line; the
