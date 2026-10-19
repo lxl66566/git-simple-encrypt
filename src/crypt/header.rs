@@ -55,20 +55,13 @@ pub fn read_header_bytes<R: std::io::Read>(
     }
 }
 
-/// Sniff-level check on raw header bytes: do they carry our magic and a
-/// version we can decrypt? (Full validation, including `enc_algo`, happens in
-/// [`FileHeader::from_bytes`].)
-#[must_use]
-pub fn is_encrypted_header(bytes: &[u8; HEADER_LEN]) -> bool {
-    &bytes[0..5] == MAGIC && is_encrypted_version(bytes[5])
-}
-
 /// Sniff-level check on raw header bytes: do they carry our magic?
 ///
-/// Magic alone means "this file claims to be a GITSE product" — the right
-/// gate for *skip/leave-untouched* decisions (re-encrypting over it would
-/// double-wrap data from another format version), as opposed to
-/// *can-we-decrypt* decisions, which need [`sniff`] or [`FileHeader::from_bytes`].
+/// Users: [`sniff`] (as its first gate) and the config-rescue path in
+/// `repo`, which must treat a GITSE-magic config of ANY version as "ours
+/// and unparseable". Every other decision goes through [`sniff`] /
+/// [`Sniffed::is_our_ciphertext`]: magic alone cannot tell a real
+/// ciphertext from plaintext imitating the header.
 #[must_use]
 pub fn has_gitse_magic(bytes: &[u8; HEADER_LEN]) -> bool {
     &bytes[0..5] == MAGIC
@@ -90,6 +83,26 @@ pub enum Sniffed {
     /// GITSE magic, supported version, but an unknown algorithm byte — almost
     /// certainly a plaintext imitating our header. Safe to encrypt as-is.
     UnknownAlgo(u8),
+}
+
+impl Sniffed {
+    /// Whether this classification denotes a file this tool produced — a
+    /// format this build fully understands or a future one.
+    ///
+    /// The single authority behind every "leave it alone" gate (manual `e`'s
+    /// skip, `check`'s already-encrypted verdict, the clean filter's
+    /// passthrough): such files are never re-encrypted over. Re-encrypting a
+    /// future-version file would double-wrap data no current build can
+    /// unwrap in one step; refusing to skip it loses nothing because its
+    /// bytes are not plaintext either.
+    ///
+    /// [`Sniffed::UnknownAlgo`] answers `false`: a magic-carrying header
+    /// with an unrecognized algorithm byte is almost certainly plaintext
+    /// imitating the format and must be encrypted / flagged as such.
+    #[must_use]
+    pub const fn is_our_ciphertext(&self) -> bool {
+        matches!(self, Self::Ciphertext | Self::FutureVersion(_))
+    }
 }
 
 /// Classify raw header bytes (see [`Sniffed`]).

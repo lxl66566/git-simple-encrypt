@@ -10,7 +10,7 @@ use tempfile::NamedTempFile;
 
 use crate::{
     crypt::{
-        header::{FILE_ID_LEN, FileHeader, SALT_LEN, has_gitse_magic, read_header_bytes},
+        header::{FILE_ID_LEN, FileHeader, SALT_LEN, Sniffed, read_header_bytes, sniff},
         key::{KeyCache, KeyDerivation, split_key_enc},
         stream::{decrypt_body, encrypt_into},
     },
@@ -46,14 +46,24 @@ pub fn encrypt_file_to(
 ) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
-    // Magic-only skip: a GITSE file of ANY version is one of ours —
-    // re-encrypting it would double-wrap data (needing two decrypts), so it
-    // is left untouched regardless of whether this build understands it.
-    if let Some(bytes) = read_header_bytes(&mut src_file)?
-        && has_gitse_magic(&bytes)
-    {
-        warn!("Source file already encrypted, skipping: {}", src.display());
-        return Ok(None);
+    // Sniff-based skip, aligned with the clean filter: a GITSE file of this
+    // or a future format version is one of ours — re-encrypting it would
+    // double-wrap data, so it is left untouched regardless of whether this
+    // build understands it. A header carrying our magic with an unknown
+    // algorithm byte is almost certainly plaintext imitating the format and
+    // is encrypted as such.
+    if let Some(bytes) = read_header_bytes(&mut src_file)? {
+        let sniffed = sniff(&bytes);
+        if sniffed.is_our_ciphertext() {
+            warn!("Source file already encrypted, skipping: {}", src.display());
+            return Ok(None);
+        }
+        if let Sniffed::UnknownAlgo(algo) = sniffed {
+            warn!(
+                "GITSE magic with unknown algorithm byte {algo}, encrypting as plaintext: {}",
+                src.display()
+            );
+        }
     }
     src_file.seek(SeekFrom::Start(0))?;
 
@@ -113,7 +123,7 @@ pub(super) fn decrypt_file_impl(
         );
         return Ok(None);
     };
-    if !has_gitse_magic(&header_bytes) {
+    if matches!(sniff(&header_bytes), Sniffed::Plaintext) {
         debug!("File not encrypted (no magic), skipping: {}", src.display());
         return Ok(None);
     }

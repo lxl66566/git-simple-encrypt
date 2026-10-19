@@ -21,7 +21,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     config::CONFIG_FILE_NAME,
-    crypt::{is_encrypted_header, read_header_bytes},
+    crypt::{read_header_bytes, sniff},
     error::{Error, Result},
     utils::style::Colorize,
 };
@@ -428,13 +428,19 @@ pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usi
     }
 }
 
-/// Check whether a single file has a valid GITSE encrypted header.
-/// Returns an error if the file cannot be read (IO error).
+/// Check whether a single file is ciphertext produced by this tool.
+///
+/// Classified via `Sniffed`, aligned with the clean filter's passthrough
+/// gate: a fully recognized header or a future format version counts as
+/// encrypted (`check` passes), while a magic-carrying header with an
+/// unknown algorithm byte is plaintext imitating the format and is
+/// reported as unencrypted. Returns an error if the file cannot be read
+/// (IO error).
 pub fn is_file_encrypted(path: &Path) -> Result<bool> {
     let mut file = fs::File::open(path)?;
     // Shared sniff helper: a file shorter than the header cannot be
     // encrypted (Ok(None)); real IO errors propagate.
-    Ok(read_header_bytes(&mut file)?.is_some_and(|bytes| is_encrypted_header(&bytes)))
+    Ok(read_header_bytes(&mut file)?.is_some_and(|bytes| sniff(&bytes).is_our_ciphertext()))
 }
 
 /// Resolve the target file list for the repo. If `paths` is empty, use the
@@ -511,6 +517,38 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::crypt::HEADER_LEN;
+
+    #[test]
+    fn test_is_file_encrypted_classification() {
+        // The verdict must match the clean filter's passthrough gate.
+        let temp_dir = TempDir::new().unwrap();
+        let make = |tag: &str, magic: bool, version: u8, algo: u8| {
+            let mut bytes = vec![0u8; HEADER_LEN];
+            if magic {
+                bytes[..5].copy_from_slice(b"GITSE");
+            }
+            bytes[5] = version;
+            bytes[7] = algo;
+            let path = temp_dir.path().join(tag);
+            fs::write(&path, bytes).unwrap();
+            path
+        };
+
+        // Fully recognized header, and a future format version: ours.
+        assert!(is_file_encrypted(&make("full.bin", true, 3, 1)).unwrap());
+        assert!(is_file_encrypted(&make("future.bin", true, 4, 1)).unwrap());
+        // Magic + supported version but unknown algorithm byte: plaintext
+        // imitating the header — check must flag it, not pass it.
+        assert!(!is_file_encrypted(&make("fake.bin", true, 3, 9)).unwrap());
+        // No magic at all.
+        assert!(!is_file_encrypted(&make("plain.bin", false, 3, 1)).unwrap());
+
+        // Shorter than a header cannot be encrypted.
+        let short = temp_dir.path().join("short.bin");
+        fs::write(&short, b"GITSE\x03").unwrap();
+        assert!(!is_file_encrypted(&short).unwrap());
+    }
 
     #[test]
     fn test_list_files() {

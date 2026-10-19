@@ -60,7 +60,7 @@ pub use header::{
 // Sniff helpers shared with `utils::is_file_encrypted`, the file pre-reads,
 // the config rescue path and the git filter; crate-internal to avoid
 // growing the public API.
-pub(crate) use header::{Sniffed, has_gitse_magic, is_encrypted_header, read_header_bytes, sniff};
+pub(crate) use header::{Sniffed, has_gitse_magic, read_header_bytes, sniff};
 pub use key::{KeyCache, KeyDerivation, derive_key, get_or_derive_key};
 pub use repo::{cache_key, decrypt_repo, encrypt_repo};
 pub use stream::{decrypt_into, decrypt_into_with, encrypt_into};
