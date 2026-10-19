@@ -109,7 +109,8 @@ pub fn serve_io<R: Read, W: Write>(repo: &Repo, input: R, output: W) -> Result<(
 
     handshake(&mut input, &mut output)?;
     let ctx = FilterContext::new(repo, SaltSource::Process);
-    let result = command_loop(&ctx, &mut input, &mut output);
+    let mut scratch = SessionScratch::default();
+    let result = command_loop(&ctx, &mut input, &mut output, &mut scratch);
     // Flush the staged smudge records at every session end: normal EOF, a
     // sent abort, or an error bubbling out of the loop all pass here (a
     // handshake failure returns above, before anything can be staged).
@@ -207,13 +208,14 @@ fn command_loop<R: Read, W: Write>(
     ctx: &FilterContext<'_>,
     input: &mut BufReader<R>,
     output: &mut BufWriter<W>,
+    scratch: &mut SessionScratch,
 ) -> Result<()> {
     loop {
         // None = git closed the pipe: normal end of the session.
         let Some(request) = read_request(input)? else {
             return Ok(());
         };
-        match handle_request(ctx, input, output, request)? {
+        match handle_request(ctx, input, output, request, scratch)? {
             Flow::Continue => {},
             Flow::Stop => return Ok(()),
         }
@@ -223,6 +225,34 @@ fn command_loop<R: Read, W: Write>(
 /// In-memory ceiling for one spooled request body; larger bodies spill to an
 /// unnamed temporary file so multi-gigabyte checkouts do not scale RAM usage.
 const SPOOL_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Upper bound on the body-buffer capacity kept between requests (see
+/// [`SessionScratch`]); a bigger in-memory body falls back to a fresh
+/// allocation instead of anchoring its size for the rest of the session.
+const RETAINED_BODY_CAPACITY: usize = 1024 * 1024;
+
+/// Buffers reused across every request of one session.
+///
+/// Without reuse, every drain would allocate a 64 KiB read scratch plus a
+/// 64 KiB starting body buffer, which adds up on git operations that clean
+/// or smudge thousands of small files. The scratch is borrowed by every
+/// drain, and an in-memory body's buffer is handed back via
+/// [`RequestSpool::reclaim`] once the request is served.
+struct SessionScratch {
+    /// Read scratch shared by every drain call.
+    chunk: Vec<u8>,
+    /// Retained starting capacity for the next in-memory body.
+    body: Vec<u8>,
+}
+
+impl Default for SessionScratch {
+    fn default() -> Self {
+        Self {
+            chunk: vec![0u8; 64 * 1024],
+            body: Vec::new(),
+        }
+    }
+}
 
 /// A request body buffered in full before the response starts.
 ///
@@ -242,17 +272,22 @@ enum RequestSpool {
 
 impl RequestSpool {
     /// Drain the pkt-line content section (its flush packet included) into a
-    /// spool. `Ok(0)` from the section reader marks the flush, so the drain
-    /// ends with the stream aligned for the next command.
-    fn drain(content: &mut pktline::PktReader, limit: usize) -> io::Result<Self> {
-        let mut mem = Vec::with_capacity(64 * 1024);
-        let mut chunk = vec![0u8; 64 * 1024];
+    /// spool, reading through `scratch`'s buffers. `Ok(0)` from the section
+    /// reader marks the flush, so the drain ends with the stream aligned for
+    /// the next command.
+    fn drain(
+        content: &mut pktline::PktReader,
+        limit: usize,
+        scratch: &mut SessionScratch,
+    ) -> io::Result<Self> {
+        let mut mem = std::mem::take(&mut scratch.body);
+        mem.reserve(64 * 1024);
         loop {
-            let n = content.read(&mut chunk)?;
+            let n = content.read(&mut scratch.chunk)?;
             if n == 0 {
                 return Ok(Self::Memory(Cursor::new(mem)));
             }
-            mem.extend_from_slice(&chunk[..n]);
+            mem.extend_from_slice(&scratch.chunk[..n]);
             if mem.len() > limit {
                 break; // over the memory budget: spill the whole body to a file
             }
@@ -261,7 +296,23 @@ impl RequestSpool {
         file.write_all(&mem)?;
         io::copy(content, &mut file)?;
         file.rewind()?;
+        // `mem` grew past `limit` before the spill and is dropped here, not
+        // returned to the scratch: one oversized body must not anchor tens
+        // of MiB for the rest of the session.
         Ok(Self::File(file))
+    }
+
+    /// Hand a served in-memory body's buffer back to the scratch (its
+    /// capacity becomes the next drain's starting capacity, up to
+    /// [`RETAINED_BODY_CAPACITY`]); a file spool frees nothing extra.
+    fn reclaim(self, scratch: &mut SessionScratch) {
+        if let Self::Memory(cursor) = self {
+            let mut body = cursor.into_inner();
+            body.clear();
+            if body.capacity() <= RETAINED_BODY_CAPACITY {
+                scratch.body = body;
+            }
+        }
     }
 }
 
@@ -279,6 +330,7 @@ fn handle_request<R: Read, W: Write>(
     input: &mut BufReader<R>,
     output: &mut BufWriter<W>,
     request: Request,
+    scratch: &mut SessionScratch,
 ) -> Result<Flow> {
     let mut content = pktline::PktReader::new(input);
 
@@ -305,7 +357,7 @@ fn handle_request<R: Read, W: Write>(
 
     // Consume the whole request body before writing any response byte (see
     // [`RequestSpool`]); the drain includes the section's flush packet.
-    let mut body = RequestSpool::drain(&mut content, SPOOL_MEMORY_LIMIT)?;
+    let mut body = RequestSpool::drain(&mut content, SPOOL_MEMORY_LIMIT, scratch)?;
 
     // Status first, then the streamed content section.
     pktline::write_line(output, "status=success")?;
@@ -324,6 +376,9 @@ fn handle_request<R: Read, W: Write>(
     // Close the content section even on failure; the second status list may
     // then override the streamed success.
     payload.finish()?;
+    // The body is fully served; its buffer returns to the session scratch
+    // for the next request.
+    body.reclaim(scratch);
 
     match result {
         Ok(()) => pktline::write_flush(output)?, // empty list: keep success
@@ -853,23 +908,30 @@ mod tests {
 
     // ---- request spool ----
 
+    /// A content section (data packets + flush packet) for `payload`.
+    fn section(payload: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for chunk in payload.chunks(pktline::MAX_PAYLOAD) {
+            wire.extend_from_slice(&data(chunk));
+        }
+        wire.extend_from_slice(FLUSH);
+        wire
+    }
+
     /// Spool a scripted content section with `limit`.
     ///
     /// Asserts the body round-trips byte-exactly and the drain ends at the
     /// section's flush packet (the trailing packet parses next, `finish` is a
     /// no-op); returns whether the body stayed in memory.
     fn spool_section(payload: &[u8], limit: usize) -> bool {
-        let mut wire = Vec::new();
-        for chunk in payload.chunks(pktline::MAX_PAYLOAD) {
-            wire.extend_from_slice(&data(chunk));
-        }
-        wire.extend_from_slice(FLUSH);
         // One packet after the section proves the drain stops at the flush.
+        let mut wire = section(payload);
         wire.extend_from_slice(&data(b"next section"));
 
         let mut cur = Cursor::new(wire);
         let mut content = pktline::PktReader::new(&mut cur);
-        let mut spool = RequestSpool::drain(&mut content, limit).unwrap();
+        let mut scratch = SessionScratch::default();
+        let mut spool = RequestSpool::drain(&mut content, limit, &mut scratch).unwrap();
         content.finish().unwrap();
 
         let mut body = Vec::new();
@@ -901,5 +963,43 @@ mod tests {
         let mut rng = SmallRng::from_seed([0x5e; 32]);
         let payload: Vec<u8> = (0..150_000).map(|_| rng.random::<u8>()).collect();
         assert!(!spool_section(&payload, 64 * 1024));
+    }
+
+    /// A served in-memory body's buffer returns to the scratch (so the next
+    /// drain of the session starts from its capacity), while a spilled body
+    /// anchors nothing.
+    #[test]
+    fn spool_reclaims_body_capacity_between_requests() {
+        let mut scratch = SessionScratch::default();
+
+        // Two rounds of a small body: round two drains into round one's
+        // reclaimed buffer.
+        for payload in [&b"first"[..], &b"second-longer-body"[..]] {
+            let mut cur = Cursor::new(section(payload));
+            let mut content = pktline::PktReader::new(&mut cur);
+            let mut spool = RequestSpool::drain(&mut content, 64 * 1024, &mut scratch).unwrap();
+            content.finish().unwrap();
+            let mut body = Vec::new();
+            spool.read_to_end(&mut body).unwrap();
+            assert_eq!(body, payload);
+            spool.reclaim(&mut scratch);
+            assert!(
+                scratch.body.capacity() >= 64 * 1024,
+                "the reclaimed buffer carries the drain's starting capacity"
+            );
+        }
+
+        // An over-limit body spills to a file; its oversized buffer is
+        // dropped instead of being retained.
+        let big: Vec<u8> = (0..150_000)
+            .map(|i| u8::try_from(i % 251).unwrap())
+            .collect();
+        let mut cur = Cursor::new(section(&big));
+        let mut content = pktline::PktReader::new(&mut cur);
+        let spool = RequestSpool::drain(&mut content, 64 * 1024, &mut scratch).unwrap();
+        content.finish().unwrap();
+        assert!(matches!(spool, RequestSpool::File(_)));
+        spool.reclaim(&mut scratch);
+        assert!(scratch.body.capacity() <= RETAINED_BODY_CAPACITY);
     }
 }
