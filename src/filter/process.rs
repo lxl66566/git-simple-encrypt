@@ -41,7 +41,7 @@ use std::{
 
 use log::error;
 
-use super::{FilterContext, SaltSource, clean_stream, decrypt_stream, pktline};
+use super::{FilterContext, Record, SaltSource, clean_stream, decrypt_stream, pktline};
 use crate::{
     crypt::cache_key,
     error::{Error, Result},
@@ -109,7 +109,14 @@ pub fn serve_io<R: Read, W: Write>(repo: &Repo, input: R, output: W) -> Result<(
 
     handshake(&mut input, &mut output)?;
     let ctx = FilterContext::new(repo, SaltSource::Process);
-    command_loop(&ctx, &mut input, &mut output)
+    let result = command_loop(&ctx, &mut input, &mut output);
+    // Flush the staged smudge records at every session end: normal EOF, a
+    // sent abort, or an error bubbling out of the loop all pass here (a
+    // handshake failure returns above, before anything can be staged).
+    // Explicit on every path — release builds abort on panic, so no
+    // Drop-based fallback exists.
+    ctx.flush_records();
+    result
 }
 
 /// Version and capability negotiation (the only version is 2; the reply must
@@ -308,7 +315,7 @@ fn handle_request<R: Read, W: Write>(
         Command::Clean => clean_stream(ctx, &pathname, &mut body, &mut payload),
         Command::Smudge => {
             let key = cache_key(&pathname, ctx.repo.path());
-            decrypt_stream(ctx, &mut body, &mut payload, Some(&key))
+            decrypt_stream(ctx, &mut body, &mut payload, Record::Session(&key))
         },
     };
     // The spool consumed the section through its flush packet; this only
@@ -345,7 +352,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::{crypt::HEADER_LEN, filter::is_ciphertext, salt_cache::SaltCacheReader};
+    use crate::{
+        crypt::{FileHeader, HEADER_LEN},
+        filter::is_ciphertext,
+        salt_cache::{CachedEntry, SaltCacheReader},
+    };
 
     const FLUSH: &[u8] = b"0000";
 
@@ -563,6 +574,115 @@ mod tests {
         run_session(&repo, &script).unwrap();
         let reader = SaltCacheReader::load(repo.path());
         assert!(!salts.contains(&reader.get(b"w.txt").unwrap().salt));
+    }
+
+    /// A multi-file smudge session records every path's real blob header.
+    ///
+    /// The records are staged in the session buffer and flushed at session
+    /// end: the cache afterwards holds each path's delivered header, and a
+    /// clean of a just-smudged path adopts the staged entry, reproducing the
+    /// delivered blob byte for byte (checkout + re-add determinism within
+    /// one git operation).
+    #[test]
+    fn smudge_session_records_cache_for_every_file() {
+        let (_dir, repo) = init_repo();
+
+        // Reference ciphertexts minted through the one-shot driver: their
+        // headers are exactly what a checkout would deliver.
+        let files = [
+            ("a.txt", b"alpha".as_slice()),
+            ("b.txt", b"beta"),
+            ("sub/c.txt", b"gamma"),
+        ];
+        let one_shot = FilterContext::new(&repo, SaltSource::PerFile);
+        let ciphertexts: Vec<(&str, Vec<u8>)> = files
+            .iter()
+            .map(|(path, plain)| {
+                let mut out = Vec::new();
+                let mut input = Cursor::new(plain.to_vec());
+                clean_stream(&one_shot, std::path::Path::new(path), &mut input, &mut out).unwrap();
+                (*path, out)
+            })
+            .collect();
+
+        let mut script = handshake_request();
+        for (path, ciphertext) in &ciphertexts {
+            script.extend(command("smudge", path, ciphertext));
+        }
+        // clean of a just-smudged path must reuse the staged entry
+        script.extend(command("clean", "a.txt", b"alpha"));
+
+        let out = run_session(&repo, &script).unwrap();
+        let (_, responses) = parse_session(out);
+        assert_eq!(responses.len(), 4);
+        assert_eq!(responses[0].1, b"alpha");
+        assert_eq!(responses[1].1, b"beta");
+        assert_eq!(responses[2].1, b"gamma");
+        assert_eq!(
+            responses[3].1, ciphertexts[0].1,
+            "clean must reproduce the delivered blob from the staged entry"
+        );
+
+        // Every path's flushed entry is the real header of its delivered blob.
+        let reader = SaltCacheReader::load(repo.path());
+        for (path, ciphertext) in &ciphertexts {
+            let header =
+                FileHeader::from_bytes(ciphertext.first_chunk::<HEADER_LEN>().unwrap()).unwrap();
+            assert_eq!(
+                reader.get(path.as_bytes()),
+                Some(CachedEntry {
+                    salt: header.salt,
+                    file_id: header.file_id,
+                })
+            );
+        }
+
+        // A fresh process re-encrypting the plaintexts reproduces the blobs:
+        // the flushed cache drives clean determinism across processes.
+        let one_shot = FilterContext::new(&repo, SaltSource::PerFile);
+        for ((path, plain), (_, ciphertext)) in files.iter().zip(&ciphertexts) {
+            let mut out = Vec::new();
+            let mut input = Cursor::new(plain.to_vec());
+            clean_stream(&one_shot, std::path::Path::new(path), &mut input, &mut out).unwrap();
+            assert_eq!(out, *ciphertext);
+        }
+    }
+
+    /// A session that dies on a protocol error after a successful smudge
+    /// still persists the staged record: the flush runs on the error path,
+    /// not only at a clean EOF.
+    #[test]
+    fn protocol_error_after_smudge_still_flushes_records() {
+        let (_dir, repo) = init_repo();
+
+        let one_shot = FilterContext::new(&repo, SaltSource::PerFile);
+        let mut ciphertext = Vec::new();
+        let mut input = Cursor::new(b"alpha".to_vec());
+        clean_stream(
+            &one_shot,
+            std::path::Path::new("a.txt"),
+            &mut input,
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        let mut script = handshake_request();
+        script.extend(command("smudge", "a.txt", &ciphertext));
+        // A command-list line without '=' is a protocol error: the session
+        // returns Err while the smudge's record is still only staged.
+        script.extend(line("garbage-without-equals"));
+        script.extend(FLUSH);
+
+        assert!(run_session(&repo, &script).is_err());
+        let header =
+            FileHeader::from_bytes(ciphertext.first_chunk::<HEADER_LEN>().unwrap()).unwrap();
+        assert_eq!(
+            SaltCacheReader::load(repo.path()).get(b"a.txt"),
+            Some(CachedEntry {
+                salt: header.salt,
+                file_id: header.file_id,
+            })
+        );
     }
 
     /// Per-file failures answer status=error and the session keeps serving.

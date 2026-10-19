@@ -33,7 +33,9 @@
 //! blob it just checked out, so a checkout + re-add cycle reproduces the
 //! identical blob. `diff` never records: textconv also runs on *old* blobs
 //! (`git log -p`), and a stale entry would make the next clean diverge from
-//! the index.
+//! the index. Where a smudge's recording goes is decided by [`Record`]: the
+//! one-shot driver merges straight to disk, the process filter server stages
+//! records in a session buffer that its command loop flushes in batches.
 //!
 //! Salt supply: which salt a cache-miss clean mints is decided by
 //! [`SaltSource`] — per-file for the one-shot drivers, one shared batch salt
@@ -45,6 +47,8 @@ mod pktline;
 #[cfg(feature = "bin")]
 pub(crate) mod process;
 
+#[cfg(feature = "bin")]
+use std::collections::HashMap;
 use std::{
     io::{self, BufWriter, Read, Write},
     path::Path,
@@ -53,6 +57,8 @@ use std::{
 
 use dashmap::DashMap;
 use log::warn;
+#[cfg(feature = "bin")]
+use parking_lot::Mutex;
 use rand::prelude::Rng;
 use zeroize::Zeroizing;
 
@@ -115,6 +121,35 @@ pub(crate) enum SaltSource {
     Process,
 }
 
+/// Where a decrypt call's salt-cache recording goes (see module docs).
+#[derive(Clone, Copy)]
+pub(crate) enum Record<'a> {
+    /// Record nothing (diff: textconv also runs on old blobs, where a stale
+    /// entry would corrupt the next clean).
+    Skip,
+    /// Merge straight into the on-disk cache (the one-shot smudge driver:
+    /// one file per process, nothing to amortize).
+    Disk(&'a [u8]),
+    /// Stage into [`FilterContext`]'s session buffer (the process filter
+    /// server). Per-file merges would lock/read/serialize/write the whole
+    /// cache once per file — O(N²) bytes over an N-file checkout — so the
+    /// command loop flushes the buffer in batches instead; entries have no
+    /// inter-dependencies (re-smudging one blob yields the same entry, a new
+    /// blob must win anyway), which keeps the flush equivalent to the
+    /// per-file merges it replaces.
+    #[cfg(feature = "bin")]
+    Session(&'a [u8]),
+}
+
+/// Staged records that trigger a checkpoint flush mid-session.
+///
+/// Bounds the cache loss of a hard process kill to one batch instead of the
+/// whole git operation; 512 matches the manual batch decrypt's checkpoint
+/// cadence (one locked cache read+write per 512 files balances flush
+/// overhead against the loss window).
+#[cfg(feature = "bin")]
+const SESSION_CHECKPOINT_EVERY: usize = 512;
+
 /// Per-process filter state shared by every stream this process serves: the
 /// password (one `git config` spawn), an Argon2 [`KeyCache`] deduplicating
 /// derivations of the same salt, and the salt-cache snapshot.
@@ -128,14 +163,22 @@ pub(crate) struct FilterContext<'a> {
     password: OnceLock<Result<Zeroizing<String>, String>>,
     keys: KeyCache,
     /// Snapshot loaded once per process. Entries minted after the load are
-    /// not visible here, but [`salt_cache::resolve_or_insert`] re-checks the
-    /// on-disk cache under its lock before minting, so a later lookup can
-    /// never diverge from an entry that exists on disk.
+    /// not visible here, but [`Self::cached_entry`] extends the lookup with
+    /// this session's staged records and
+    /// [`salt_cache::resolve_or_insert`] re-checks the on-disk cache under
+    /// its lock before minting, so a later lookup can never diverge from an
+    /// entry that exists on disk or in this session.
     cache: SaltCacheReader,
     salt: SaltSource,
     /// The process-wide batch salt ([`SaltSource::Process`]).
     #[cfg(feature = "bin")]
     batch_salt: OnceLock<[u8; SALT_LEN]>,
+    /// Smudge records staged for a batched flush ([`Record::Session`]):
+    /// one disk merge per checkpoint batch and per session end instead of
+    /// one per file. Same-key inserts overwrite, mirroring the
+    /// last-writer-wins of [`salt_cache::merge_entries`].
+    #[cfg(feature = "bin")]
+    pending: Mutex<HashMap<Vec<u8>, CachedEntry>>,
 }
 
 impl<'a> FilterContext<'a> {
@@ -148,6 +191,8 @@ impl<'a> FilterContext<'a> {
             salt,
             #[cfg(feature = "bin")]
             batch_salt: OnceLock::new(),
+            #[cfg(feature = "bin")]
+            pending: Mutex::new(HashMap::new()),
         }
     }
 
@@ -174,6 +219,49 @@ impl<'a> FilterContext<'a> {
             #[cfg(feature = "bin")]
             SaltSource::Process => *self.batch_salt.get_or_init(random_salt),
         }
+    }
+
+    /// Look up the cached entry for `key`, extending the start-of-process
+    /// snapshot with this session's staged records: an entry a smudge of
+    /// this same process recorded is not on disk yet, and clean must see it
+    /// to keep a checkout + re-add cycle deterministic within one git
+    /// operation.
+    fn cached_entry(&self, key: &[u8]) -> Option<CachedEntry> {
+        if let Some(entry) = self.cache.get(key) {
+            return Some(entry);
+        }
+        #[cfg(feature = "bin")]
+        {
+            let pending = self.pending.lock();
+            if let Some(entry) = salt_cache::lookup_entry(&pending, key) {
+                return Some(entry.clone());
+            }
+        }
+        None
+    }
+
+    /// Stage one smudge record for the session-end flush, checkpointing to
+    /// disk every [`SESSION_CHECKPOINT_EVERY`] records so a hard process
+    /// kill loses at most one batch.
+    #[cfg(feature = "bin")]
+    fn stage_record(&self, key: &[u8], entry: CachedEntry) {
+        let mut pending = self.pending.lock();
+        pending.insert(key.to_vec(), entry);
+        if pending.len() < SESSION_CHECKPOINT_EVERY {
+            return;
+        }
+        drop(pending);
+        self.flush_records();
+    }
+
+    /// Flush every staged record through the locked merge path (no-op when
+    /// nothing is staged). The process-filter session calls this at every
+    /// session end; release builds abort on panic, so there is deliberately
+    /// no Drop-based fallback to rely on.
+    #[cfg(feature = "bin")]
+    fn flush_records(&self) {
+        let staged = std::mem::take(&mut *self.pending.lock());
+        salt_cache::merge_entries(self.repo.path(), staged);
     }
 }
 
@@ -205,7 +293,7 @@ pub(crate) fn clean_stream<W: Write>(
 
     let password = ctx.password()?;
     let key = cache_key(path, ctx.repo.path());
-    let (salt, file_id) = ctx.cache.get(&key).map_or_else(
+    let (salt, file_id) = ctx.cached_entry(&key).map_or_else(
         || {
             // First clean of this path: mint an entry and record it
             // atomically under the cache lock, so concurrent first-cleans of
@@ -239,14 +327,14 @@ pub(crate) fn clean_stream<W: Write>(
 
 /// Decrypt-stream core shared by smudge and diff.
 ///
-/// Non-encrypted input passes through unchanged. `record_key`, when given,
-/// persists the header entry for deterministic re-encryption (smudge only,
-/// see module docs).
+/// Non-encrypted input passes through unchanged. `record`, when not
+/// [`Record::Skip`], persists the header entry for deterministic
+/// re-encryption (smudge only, see module docs).
 pub(crate) fn decrypt_stream<W: Write>(
     ctx: &FilterContext<'_>,
     input: &mut dyn Read,
     out: &mut W,
-    record_key: Option<&[u8]>,
+    record: Record<'_>,
 ) -> Result<()> {
     let prefix = peek(input, HEADER_LEN)?;
     match prefix
@@ -273,11 +361,17 @@ pub(crate) fn decrypt_stream<W: Write>(
     )?;
     out.flush()?;
 
-    if let Some(key) = record_key {
-        salt_cache::merge_entries(ctx.repo.path(), [(key.to_vec(), CachedEntry {
-            salt: header.salt,
-            file_id: header.file_id,
-        })]);
+    let entry = CachedEntry {
+        salt: header.salt,
+        file_id: header.file_id,
+    };
+    match record {
+        Record::Skip => {},
+        Record::Disk(key) => {
+            salt_cache::merge_entries(ctx.repo.path(), [(key.to_vec(), entry)]);
+        },
+        #[cfg(feature = "bin")]
+        Record::Session(key) => ctx.stage_record(key, entry),
     }
     Ok(())
 }
@@ -303,7 +397,7 @@ pub fn smudge(repo: &Repo, path: &Path) -> Result<()> {
     let key = cache_key(path, repo.path());
     let mut stdin = io::stdin().lock();
     let mut stdout = BufWriter::new(io::stdout().lock());
-    decrypt_stream(&ctx, &mut stdin, &mut stdout, Some(&key))
+    decrypt_stream(&ctx, &mut stdin, &mut stdout, Record::Disk(&key))
 }
 
 /// Diff textconv: decrypt the ciphertext blob in `file` (the temp file git
@@ -313,10 +407,10 @@ pub fn diff(repo: &Repo, file: Option<&Path>) -> Result<()> {
     let mut stdout = BufWriter::new(io::stdout().lock());
     let Some(path) = file else {
         let mut stdin = io::stdin().lock();
-        return decrypt_stream(&ctx, &mut stdin, &mut stdout, None);
+        return decrypt_stream(&ctx, &mut stdin, &mut stdout, Record::Skip);
     };
     let mut input = std::fs::File::open(path)?;
-    decrypt_stream(&ctx, &mut input, &mut stdout, None)
+    decrypt_stream(&ctx, &mut input, &mut stdout, Record::Skip)
 }
 
 #[cfg(test)]
@@ -361,7 +455,7 @@ mod tests {
         out
     }
 
-    fn decrypt_into_buf(ctx: &FilterContext<'_>, data: &[u8], record: Option<&[u8]>) -> Vec<u8> {
+    fn decrypt_into_buf(ctx: &FilterContext<'_>, data: &[u8], record: Record<'_>) -> Vec<u8> {
         let mut out = Vec::new();
         let mut input = Cursor::new(data.to_vec());
         decrypt_stream(ctx, &mut input, &mut out, record).unwrap();
@@ -377,7 +471,7 @@ mod tests {
         assert!(is_ciphertext(&ciphertext));
 
         // smudge records the salt cache entry under the path key
-        let plaintext = decrypt_into_buf(&ctx, &ciphertext, Some(b"f.txt"));
+        let plaintext = decrypt_into_buf(&ctx, &ciphertext, Record::Disk(b"f.txt"));
         assert_eq!(plaintext, b"plain");
         let reader = SaltCacheReader::load(repo.path());
         assert!(reader.get(b"f.txt").is_some());
@@ -400,11 +494,11 @@ mod tests {
         let (_dir, repo) = init_repo();
         let ctx = FilterContext::new(&repo, SaltSource::PerFile);
         assert_eq!(
-            decrypt_into_buf(&ctx, b"not encrypted", None),
+            decrypt_into_buf(&ctx, b"not encrypted", Record::Skip),
             b"not encrypted"
         );
-        assert_eq!(decrypt_into_buf(&ctx, b"ab", None), b"ab");
-        assert_eq!(decrypt_into_buf(&ctx, b"", None), b"");
+        assert_eq!(decrypt_into_buf(&ctx, b"ab", Record::Skip), b"ab");
+        assert_eq!(decrypt_into_buf(&ctx, b"", Record::Skip), b"");
     }
 
     #[test]
@@ -417,7 +511,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = Cursor::new(ciphertext);
         // failure propagates as a non-zero exit, making git abort the operation
-        assert!(decrypt_stream(&ctx, &mut input, &mut out, None).is_err());
+        assert!(decrypt_stream(&ctx, &mut input, &mut out, Record::Skip).is_err());
     }
 
     /// A file with valid magic+version but a bogus algorithm byte: plaintext
@@ -439,7 +533,7 @@ mod tests {
         let out = clean_into(&ctx, "f.txt", &fake);
         assert_ne!(out, fake);
         assert!(is_ciphertext(&out));
-        assert_eq!(decrypt_into_buf(&ctx, &out, None), fake);
+        assert_eq!(decrypt_into_buf(&ctx, &out, Record::Skip), fake);
     }
 
     /// A GITSE file of a future version is never double-wrapped by clean and
@@ -462,7 +556,7 @@ mod tests {
         // smudge refuses with an explicit unsupported-version error
         let mut out = Vec::new();
         let mut input = Cursor::new(future);
-        let err = decrypt_stream(&ctx, &mut input, &mut out, None).unwrap_err();
+        let err = decrypt_stream(&ctx, &mut input, &mut out, Record::Skip).unwrap_err();
         assert!(matches!(err, Error::UnsupportedVersion(4)));
     }
 
@@ -495,7 +589,11 @@ mod tests {
 
         // all three decrypt with the same password
         assert_eq!(
-            decrypt_into_buf(&FilterContext::new(&repo, SaltSource::PerFile), &a, None),
+            decrypt_into_buf(
+                &FilterContext::new(&repo, SaltSource::PerFile),
+                &a,
+                Record::Skip
+            ),
             b"1"
         );
     }
@@ -534,6 +632,6 @@ mod tests {
         // smudge of real ciphertext fails too (it needs the password)
         let mut out = Vec::new();
         let mut input = Cursor::new(ciphertext);
-        assert!(decrypt_stream(&ctx, &mut input, &mut out, None).is_err());
+        assert!(decrypt_stream(&ctx, &mut input, &mut out, Record::Skip).is_err());
     }
 }

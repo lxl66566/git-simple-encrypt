@@ -25,10 +25,13 @@
 //!
 //! ## Single-Writer Lock Protocol
 //!
-//! All mutations — the filter drivers' per-file merges ([`merge_entries`],
+//! All mutations — the filter drivers' merges ([`merge_entries`],
 //! [`resolve_or_insert`]) and the batch saver's checkpoints/final save — run
 //! under an exclusive OS lock on `<cache>.lock`, so concurrent processes
-//! cannot lose each other's entries.
+//! cannot lose each other's entries. The process filter server stages its
+//! smudge records in a session buffer and flushes them through
+//! [`merge_entries`] in batches: one locked merge per batch (plus one at
+//! session end) instead of one per file.
 //!
 //! # Key Format
 //!
@@ -184,7 +187,13 @@ fn storage_key(key: &[u8]) -> Cow<'_, [u8]> {
 /// spelling differs from both lookups (e.g. a case-only rename happened since
 /// it was written) is unreachable — it costs one fresh entry once, after which
 /// the cache converges to normalized keys.
-fn lookup_entry<'a>(map: &'a HashMap<Vec<u8>, CachedEntry>, key: &[u8]) -> Option<&'a CachedEntry> {
+///
+/// Shared by the on-disk read paths and the process filter's in-session
+/// staging buffer, so both apply the same case-folding rules.
+pub(crate) fn lookup_entry<'a>(
+    map: &'a HashMap<Vec<u8>, CachedEntry>,
+    key: &[u8],
+) -> Option<&'a CachedEntry> {
     if !CASE_INSENSITIVE_FS {
         return map.get(key);
     }
