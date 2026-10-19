@@ -60,6 +60,26 @@ fn test_header_serialization() {
 }
 
 #[test]
+fn test_from_bytes_rejects_unknown_flag_bits() {
+    // A header valid in every other field but carrying a flag bit this
+    // build does not know must be refused: future 3.x formats may give new
+    // bits semantic meaning, and silently parsing them under the current
+    // semantics would misinterpret the file.
+    let header = FileHeader::new(true, [0xab; SALT_LEN], [0xcd; FILE_ID_LEN]);
+    let mut bytes = *header.as_bytes();
+    bytes[6] |= 1 << 1; // an unrecognized flag bit
+
+    let err = FileHeader::from_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::UnknownFlags(flags) if flags == bytes[6]),
+        "unexpected error: {err:?}"
+    );
+
+    // The known bit alone keeps parsing fine.
+    FileHeader::from_bytes(header.as_bytes()).unwrap();
+}
+
+#[test]
 fn test_nonce_derivation_deterministic() {
     let key_mac = [0x42u8; 32];
     let file_id = [0x99u8; FILE_ID_LEN];

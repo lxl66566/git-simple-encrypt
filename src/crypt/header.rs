@@ -15,6 +15,13 @@ use rand::Rng;
 pub const MAGIC: &[u8; 5] = b"GITSE";
 pub const VERSION: u8 = 3;
 pub(super) const FLAG_COMPRESSED: u8 = 1 << 0;
+/// Every flag bit this build assigns meaning to.
+///
+/// `from_bytes` rejects headers carrying bits outside this mask: a
+/// future 3.x format may attach new semantics to a new bit, and an older
+/// binary silently parsing such a header under the current semantics would
+/// misinterpret the file instead of failing loudly.
+const KNOWN_FLAGS: u8 = FLAG_COMPRESSED;
 pub(super) const ENC_ALGO: u8 = 1;
 
 pub const SALT_LEN: usize = 16;
@@ -157,6 +164,9 @@ impl FileHeader {
         }
         if header.enc_algo != ENC_ALGO {
             return Err(Error::UnsupportedAlgo(header.enc_algo));
+        }
+        if header.flags & !KNOWN_FLAGS != 0 {
+            return Err(Error::UnknownFlags(header.flags));
         }
 
         Ok(header)
