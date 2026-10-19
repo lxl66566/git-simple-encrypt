@@ -192,7 +192,9 @@ impl SetField {
         match self {
             Self::Key { value } => {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
-                repo.set_config("key", value)?;
+                // Trim like the interactive `p` prompt does, so both
+                // key-setting paths agree on the stored value.
+                repo.set_config("key", value.trim())?;
                 info!("Master key updated.");
                 // The key lives in git config, not in the toml; nothing to
                 // persist in the config file.
@@ -287,5 +289,31 @@ mod tests {
         // A missing subcommand is still an error, with or without --repo.
         assert!(Cli::try_parse_from(["git-se", "--repo", "."]).is_err());
         assert!(Cli::try_parse_from(["git-se"]).is_err());
+    }
+
+    /// `set key` trims the value before storing it, matching the interactive
+    /// `p` prompt, so both key-setting paths produce the same stored key.
+    #[test]
+    fn set_key_trims_value_like_interactive_prompt() {
+        use std::process::Command;
+
+        use path_absolutize::Absolutize;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut repo = Repo::open(&repo_path).unwrap();
+
+        SetField::Key {
+            value: "  padded\t".to_owned(),
+        }
+        .set(&mut repo)
+        .unwrap();
+        assert!(repo.get_config("key").unwrap() == "padded");
     }
 }

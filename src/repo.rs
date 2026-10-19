@@ -1117,9 +1117,11 @@ impl Repo {
     /// a plain `git config` invocation only when the file cannot be parsed
     /// confidently (see [`Repo::set_local_config_file`]).
     ///
-    /// Note: the value is stored verbatim (no trimming), so callers should
-    /// sanitize it themselves if needed. This matters for the `key` field,
-    /// which holds a user-supplied password and must not be silently modified.
+    /// Note: the value is stored verbatim (no trimming); callers sanitize
+    /// their input themselves. Both key-setting paths trim before calling
+    /// this — the interactive `p` prompt (inside `prompt_password`) and the
+    /// deprecated `set key` — so they agree on the stored key, while inner
+    /// whitespace always survives.
     pub fn set_config(&self, key: &str, value: &str) -> Result<()> {
         let temp = String::from(GIT_CONFIG_PREFIX) + key;
         if let Err(e) = self.set_local_config_file(&temp, value) {
