@@ -130,15 +130,45 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
     report_summary("Encrypt", summary)
 }
 
-/// How many files a batch decrypt processes between salt-cache save points.
+/// Files per parallel decrypt chunk; also the interval between the first
+/// two salt-cache save points.
 ///
 /// Release builds abort on panic without unwinding, so the saver's `Drop`
 /// fallback cannot rescue a mid-batch failure. Flushing the entries buffered
-/// so far after every chunk bounds the loss to one chunk of cache entries
-/// instead of the whole run (the already-decrypted files stay decrypted —
-/// only their re-encryption determinism is at risk). 512 balances flush
-/// overhead (one locked cache read+write per chunk) against the loss window.
+/// so far at a save point bounds the loss to the entries since the previous
+/// one instead of the whole run (the already-decrypted files stay decrypted
+/// — only their re-encryption determinism is at risk).
+///
+/// Each checkpoint re-serializes the full merged cache, so a fixed interval
+/// would make the accumulated rewrite volume grow quadratically with the
+/// file count on huge repositories; [`CheckpointSchedule`] doubles the
+/// interval after every save point to keep it linear.
 const DECRYPT_CHECKPOINT_EVERY: usize = 512;
+
+/// Doubling save-point schedule for batch-decrypt salt-cache checkpoints.
+///
+/// Save points fire at 512 files, then every doubling of the processed
+/// count (1024, 2048, ...). The loss window of a mid-run death therefore
+/// grows with the run size instead of staying fixed at one chunk, while the
+/// total checkpoint rewrite volume stays proportional to the final cache
+/// size rather than quadratic in it.
+struct CheckpointSchedule {
+    /// File count at which the next save point fires.
+    next: usize,
+}
+
+impl CheckpointSchedule {
+    /// Whether a save point is due after `processed` files; a due check
+    /// advances the schedule so the next interval spans twice the processed
+    /// count.
+    const fn checkpoint_due(&mut self, processed: usize) -> bool {
+        if processed < self.next {
+            return false;
+        }
+        self.next = processed.saturating_mul(2);
+        true
+    }
+}
 
 /// Decrypt given files in the repo.
 pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
@@ -163,6 +193,10 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         total: target_files.len(),
         ..BatchSummary::default()
     };
+    let mut schedule = CheckpointSchedule {
+        next: DECRYPT_CHECKPOINT_EVERY,
+    };
+    let mut processed = 0;
     for chunk in target_files.chunks(DECRYPT_CHECKPOINT_EVERY) {
         let part = run_batch(chunk, Some(&pb), |f| {
             let relative_key = cache_key(f, repo.path());
@@ -182,7 +216,10 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         summary.succeeded += part.succeeded;
         summary.skipped += part.skipped;
         summary.errors.extend(part.errors);
-        saver.checkpoint();
+        processed += chunk.len();
+        if schedule.checkpoint_due(processed) {
+            saver.checkpoint();
+        }
     }
     summary.failed = summary.errors.len();
 
@@ -282,5 +319,28 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"plain");
         encrypt_repo(&repo, &[]).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), original_ct);
+    }
+
+    /// Save points double their interval (512, 1024, 2048, ...): a 20k-file
+    /// run fires 6 instead of 39, keeping the accumulated checkpoint rewrite
+    /// volume linear in the run size.
+    #[test]
+    fn test_checkpoint_schedule_doubles_interval() {
+        let mut schedule = CheckpointSchedule {
+            next: DECRYPT_CHECKPOINT_EVERY,
+        };
+        assert!(!schedule.checkpoint_due(0));
+        assert!(!schedule.checkpoint_due(DECRYPT_CHECKPOINT_EVERY - 1));
+
+        let mut fired = 0;
+        let mut processed = 0;
+        for _ in 0..20_000 / DECRYPT_CHECKPOINT_EVERY {
+            processed += DECRYPT_CHECKPOINT_EVERY;
+            if schedule.checkpoint_due(processed) {
+                fired += 1;
+            }
+        }
+        // Save points at 512, 1024, 2048, 4096, 8192, 16384.
+        assert_eq!(fired, 6);
     }
 }
