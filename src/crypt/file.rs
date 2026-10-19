@@ -44,6 +44,30 @@ pub fn encrypt_file_to(
     file_id: Option<[u8; FILE_ID_LEN]>,
     zstd: Option<u8>,
 ) -> Result<Option<FileHeader>> {
+    encrypt_file_impl(src, dst, derived_key, salt, file_id, zstd, None)
+}
+
+/// Implementation behind [`encrypt_file_to`] with optional salt-cache writeback.
+///
+/// `salt_cache`, when given, keeps the cache in sync with the ciphertext
+/// that ends up on disk:
+/// - on the skip path the header actually found on disk is recorded, so a later external-decrypt →
+///   re-encrypt cycle reproduces that exact ciphertext; a freshly minted pair would instead diverge
+///   from a file encrypted by an older build or another machine, making the next `e` after an
+///   external decrypt diverge from the committed blob as a phantom modification. Only headers this
+///   build fully validates are mined for salt/`file_id`: a future-version file may lay the header
+///   out differently.
+/// - on success the freshly written header is recorded, so re-encrypting externally restored
+///   plaintext stays deterministic.
+pub(super) fn encrypt_file_impl(
+    src: &Path,
+    dst: &Path,
+    derived_key: &[u8; 32],
+    salt: [u8; SALT_LEN],
+    file_id: Option<[u8; FILE_ID_LEN]>,
+    zstd: Option<u8>,
+    salt_cache: Option<CacheRef<'_>>,
+) -> Result<Option<FileHeader>> {
     let mut src_file = fs::File::open(src)?;
 
     // Sniff-based skip, aligned with the clean filter: a GITSE file of this
@@ -56,6 +80,14 @@ pub fn encrypt_file_to(
         let sniffed = sniff(&bytes);
         if sniffed.is_our_ciphertext() {
             warn!("Source file already encrypted, skipping: {}", src.display());
+            if let Some(cache) = salt_cache
+                && let Ok(header) = FileHeader::from_bytes(&bytes)
+            {
+                cache.sender.insert(cache.key, CachedEntry {
+                    salt: header.salt,
+                    file_id: header.file_id,
+                });
+            }
             return Ok(None);
         }
         if let Sniffed::UnknownAlgo(algo) = sniffed {
@@ -92,6 +124,15 @@ pub fn encrypt_file_to(
 
     drop(src_file);
     persist_temp_file(temp_file, dst, Some(src))?;
+
+    // Record only after the atomic persist succeeded: a failed write must
+    // not leave an entry for a ciphertext that never landed on disk.
+    if let Some(cache) = salt_cache {
+        cache.sender.insert(cache.key, CachedEntry {
+            salt: header.salt,
+            file_id: header.file_id,
+        });
+    }
 
     Ok(Some(header))
 }

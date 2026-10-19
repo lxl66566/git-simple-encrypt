@@ -10,7 +10,7 @@ use crate::{
     crypt::{
         FileHeader,
         batch::{BatchSummary, run_batch},
-        file::{decrypt_file_impl, encrypt_file},
+        file::{decrypt_file_impl, encrypt_file_impl},
         header::SALT_LEN,
         key::{KeyCache, KeyDerivation, get_or_derive_key},
     },
@@ -89,32 +89,34 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     let summary = run_batch(&target_files, Some(&pb), |f| {
         let relative_key = cache_key(f, repo.path());
+        // On a miss, mint the pair but do NOT persist it up front: what
+        // belongs in the cache is decided by `encrypt_file_impl` from the
+        // run's outcome — the pair actually used on success (so a later
+        // external-decrypt → re-encrypt cycle reproduces this exact
+        // ciphertext, mirroring the clean filter's first-time writeback),
+        // or the real header of an already-encrypted file on skip.
+        // Persisting a minted pair up front would leave an entry that
+        // diverges from a skipped file's real header. The clean filter can
+        // insert before encrypting only because its sniff gate already
+        // rejected already-encrypted input before the cache lookup.
         let (salt, file_id) = reader.get(&relative_key).map_or_else(
-            || {
-                // Fresh entry: mint a file_id up front and record the pair, so
-                // a later external-decrypt → re-encrypt cycle reproduces this
-                // exact ciphertext (mirrors what the clean filter does for
-                // first-time files; without the writeback the file_id would
-                // change every time the plaintext reappears, surfacing as a
-                // one-time phantom modification).
-                let file_id = FileHeader::generate_file_id();
-                sender.insert(&relative_key, salt_cache::CachedEntry {
-                    salt: batch_salt,
-                    file_id,
-                });
-                (batch_salt, Some(file_id))
-            },
+            || (batch_salt, Some(FileHeader::generate_file_id())),
             |entry| (entry.salt, Some(entry.file_id)),
         );
 
         get_or_derive_key(&key_cache, key.as_bytes(), &salt)
             .and_then(|derived_key| {
-                encrypt_file(
+                encrypt_file_impl(
+                    f,
                     f,
                     &derived_key,
-                    &salt,
+                    salt,
                     file_id,
                     repo.conf.use_zstd.then_some(repo.conf.zstd_level),
+                    Some(CacheRef {
+                        sender: &sender,
+                        key: &relative_key,
+                    }),
                 )
             })
             .map_err(|e| with_file_context("encrypt", f, e))
@@ -200,6 +202,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::{
+        crypt::{FILE_ID_LEN, derive_key, encrypt_file},
+        salt_cache::SaltCacheReader,
+    };
 
     fn init_repo() -> (TempDir, Repo) {
         let dir = TempDir::new().unwrap();
@@ -232,5 +238,49 @@ mod tests {
         let ct2 = std::fs::read(repo.path().join("f.txt")).unwrap();
 
         assert_eq!(ct1, ct2);
+    }
+
+    #[test]
+    fn test_encrypt_repo_records_real_header_of_uncached_encrypted_file() {
+        let (_dir, mut repo) = init_repo();
+        let file = repo.path().join("f.txt");
+        std::fs::write(&file, b"plain").unwrap();
+        repo.conf.add_one_path_to_crypt_list("f.txt").unwrap();
+
+        // Simulate a file encrypted by an older build or another machine:
+        // a real header on disk, but no cache entry for it. Encrypted with
+        // the repo's own compression setting so a later deterministic
+        // re-encrypt can be compared byte-for-byte.
+        let salt = [0x42; SALT_LEN];
+        let file_id = [0x13; FILE_ID_LEN];
+        let derived = derive_key(b"test-key", &salt).unwrap();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&*derived);
+        let zstd = repo.conf.use_zstd.then_some(repo.conf.zstd_level);
+        encrypt_file(&file, &key, &salt, Some(file_id), zstd).unwrap();
+        let original_ct = std::fs::read(&file).unwrap();
+
+        // The run skips the file (already encrypted); the writeback must
+        // record the file's REAL header — a freshly minted pair would make
+        // the next `e` after an external decrypt diverge from the committed
+        // blob.
+        encrypt_repo(&repo, &[]).unwrap();
+        assert_eq!(
+            std::fs::read(&file).unwrap(),
+            original_ct,
+            "must stay untouched"
+        );
+
+        let entry = SaltCacheReader::load(repo.path())
+            .get(&cache_key(&file, repo.path()))
+            .expect("skip must write back the real header");
+        assert_eq!(entry.salt, salt);
+        assert_eq!(entry.file_id, file_id);
+
+        // The d → e cycle stays deterministic: identical ciphertext.
+        decrypt_repo(&repo, &[]).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"plain");
+        encrypt_repo(&repo, &[]).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), original_ct);
     }
 }
