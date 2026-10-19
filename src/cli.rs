@@ -39,22 +39,40 @@ fn repo_path_parser(path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Absolutize a positional path argument against the process cwd.
+///
+/// git pathspecs resolve relative to the cwd, not the repo root, so
+/// `git-se e foo.txt` run inside `<repo>/sub` must target `sub/foo.txt`
+/// (resolving against the repo root would encrypt the wrong file or fail,
+/// and `../foo.txt` would be rejected as an escape). The library layer
+/// keeps its repo-relative contract and maps these absolute paths onto it.
+/// Lexical only, like [`repo_path_parser`]; an empty argument is an error
+/// rather than a synonym for the whole repo root.
+fn cwd_path_parser(path: &str) -> Result<PathBuf, String> {
+    std::path::absolute(path).map_err(|e| e.to_string())
+}
+
 #[derive(Subcommand, Debug)]
 pub enum SubCommand {
     /// Encrypt all files with crypt attr.
     #[clap(alias("e"))]
     Encrypt {
         /// The files or folders to be encrypted.
+        #[clap(value_parser = cwd_path_parser)]
         paths: Vec<PathBuf>,
     },
     /// Decrypt all files with crypt attr and `.enc` extension.
     #[clap(alias("d"))]
     Decrypt {
         /// The files or folders to be decrypted.
+        #[clap(value_parser = cwd_path_parser)]
         paths: Vec<PathBuf>,
     },
     /// Mark files or folders as need-to-be-crypted.
-    Add { paths: Vec<PathBuf> },
+    Add {
+        #[clap(value_parser = cwd_path_parser)]
+        paths: Vec<PathBuf>,
+    },
     /// Set key or other config items.
     Set {
         #[clap(subcommand)]
@@ -67,7 +85,9 @@ pub enum SubCommand {
     #[clap(alias("c"))]
     Check {
         /// The files or folders to check. If empty, checks all files in the
-        /// crypt list.
+        /// crypt list. Resolved against the process cwd (git pathspec
+        /// convention).
+        #[clap(value_parser = cwd_path_parser)]
         paths: Vec<PathBuf>,
         /// Only check files staged for commit (used by pre-commit hook).
         #[arg(long, default_value_t = false)]
@@ -230,6 +250,20 @@ mod tests {
         assert!(parsed.is_absolute());
     }
 
+    #[test]
+    fn cwd_path_parser_anchors_at_process_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(cwd_path_parser("foo.txt").unwrap(), cwd.join("foo.txt"));
+        // An absolute input passes through (normalized, still absolute).
+        let absolute = cwd.join("foo.txt");
+        assert_eq!(
+            cwd_path_parser(absolute.to_str().unwrap()).unwrap(),
+            absolute
+        );
+        // An empty positional must not fall through as the repo root.
+        assert!(cwd_path_parser("").is_err());
+    }
+
     /// `--repo` is a global argument: it must parse before the subcommand,
     /// between the subcommand and its positionals, and after them.
     #[test]
@@ -244,7 +278,10 @@ mod tests {
             let SubCommand::Add { paths } = cli.command else {
                 panic!("expected Add subcommand for {argv:?}");
             };
-            assert!(paths == [PathBuf::from("a.txt")]);
+            // Positionals go through `cwd_path_parser`: absolute, cwd-joined.
+            assert_eq!(paths.len(), 1, "{argv:?}");
+            assert!(paths[0].is_absolute(), "{argv:?}: {paths:?}");
+            assert_eq!(paths[0].file_name(), Some(std::ffi::OsStr::new("a.txt")));
         }
 
         // A missing subcommand is still an error, with or without --repo.

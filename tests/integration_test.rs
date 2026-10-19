@@ -1627,6 +1627,46 @@ fn subdir_encrypt_check_decrypt() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Positional path arguments resolve against the process cwd (git pathspec
+/// convention), not the repo root. Run through the real binary so the clap
+/// value_parser is exercised: in `sub`, `e s.txt` must target `sub/s.txt`
+/// and never the repo-root decoy of the same name, and `../s.txt` must
+/// reach the decoy instead of being rejected as a repo escape.
+#[test]
+fn subdir_positional_paths_resolve_from_cwd() -> anyhow::Result<()> {
+    let pwd = bench_init();
+    let dir = pwd.path();
+    fs::create_dir(dir.join("sub"))?;
+    fs::write(dir.join("sub/s.txt"), "secret\n")?;
+    // Same-named decoy at the repo root: the old repo-root-relative
+    // resolution would encrypt (or report missing) this one instead.
+    fs::write(dir.join("s.txt"), "decoy\n")?;
+
+    let sub = dir.join("sub");
+    run_bin(&sub, &["e", "s.txt"])?;
+    assert!(dir.join("sub/s.txt").is_encrypted());
+    assert!(dir.join("s.txt").is_not_encrypted());
+
+    run_bin(&sub, &["check", "s.txt"])?;
+    run_bin(&sub, &["d", "s.txt"])?;
+    assert_eq!(fs::read_to_string(dir.join("sub/s.txt"))?, "secret\n");
+
+    // `..` escapes only the subdir, not the repo: the decoy is reachable.
+    run_bin(&sub, &["e", "../s.txt"])?;
+    assert!(dir.join("s.txt").is_encrypted());
+    run_bin(&sub, &["d", "../s.txt"])?;
+    assert_eq!(fs::read_to_string(dir.join("s.txt"))?, "decoy\n");
+
+    // `add` from the subdir records the repo-relative `sub/s.txt`.
+    run_bin(&sub, &["add", "s.txt"])?;
+    let conf = fs::read_to_string(dir.join("git_simple_encrypt.toml"))?;
+    assert!(
+        conf.contains("\"sub/s.txt\""),
+        "crypt list should hold sub/s.txt, got: {conf}"
+    );
+    Ok(())
+}
+
 /// Staged files whose names contain spaces, non-ASCII (and quotes /
 /// backslashes on unix) must be enumerated and checked byte-exactly: the
 /// staged enumeration uses `-z`, so git's C-quoting cannot hide them.
