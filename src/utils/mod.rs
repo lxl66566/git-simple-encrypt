@@ -6,7 +6,7 @@ use std::{
     collections::HashSet,
     ffi::OsStr,
     fs,
-    io::Write,
+    io::{BufRead as _, BufReader, ErrorKind, Write},
     path::{Component, Path, PathBuf},
     sync::mpsc,
 };
@@ -327,6 +327,49 @@ fn is_ignore_rule_file(path: &Path) -> bool {
         .any(|rule_name| name == OsStr::new(rule_name))
 }
 
+/// Whether the gitignore-style file at `path` carries at least one rule
+/// line.
+///
+/// Line handling mirrors the `ignore` crate — the walker's own rule engine:
+/// a line is a comment only when `#` is its first byte (leading whitespace
+/// keeps the line a literal rule, as in git), trailing whitespace is
+/// insignificant unless escaped, and what remains after trimming must be
+/// non-empty. Escaped (`\#`) and negated (`!`) lines count as rules.
+///
+/// A missing file carries no rules; any other read failure counts as rules,
+/// so doubt resolves toward keeping the gate active.
+fn has_rule_lines(path: &Path) -> bool {
+    let lines = match fs::File::open(path) {
+        Ok(file) => BufReader::new(file).lines(),
+        // Absent (or its parent is): nothing the walker could apply.
+        Err(err) if err.kind() == ErrorKind::NotFound => return false,
+        // Unreadable: the file may hold rules — assume it does.
+        Err(_) => return true,
+    };
+    for line in lines {
+        match line {
+            Ok(line) if is_rule_line(&line) => return true,
+            // A failed read may hide rule lines: stay conservative.
+            Err(_) => return true,
+            Ok(_) => {},
+        }
+    }
+    false
+}
+
+/// Whether one line of a gitignore-style file contributes a rule.
+fn is_rule_line(line: &str) -> bool {
+    if line.starts_with('#') {
+        return false;
+    }
+    // A trailing `\ ` escapes the space: the line stays verbatim and is
+    // never empty. Otherwise trailing whitespace carries no meaning.
+    if line.ends_with("\\ ") {
+        return true;
+    }
+    !line.trim_end().is_empty()
+}
+
 /// Whether any ignore-rule source could have filtered the ignore-aware walk.
 ///
 /// Mirrors the sources [`walk_files`] enables on the walker:
@@ -334,14 +377,18 @@ fn is_ignore_rule_file(path: &Path) -> bool {
 ///   in-tree rule files surface as ordinary files;
 /// - the same files in any ancestor of a covered root: the walker reads parent-directory rules up
 ///   to the filesystem root;
-/// - the repo's `.git/info/exclude` (a `.git` pointer file marks a linked worktree whose real
-///   gitdir is not resolved here — conservatively treated as present);
-/// - the global excludes file from the git config.
+/// - the repo's `.git/info/exclude` and the global excludes file from the git config, but only when
+///   they carry at least one rule line ([`has_rule_lines`]): the templates `git init` and `git
+///   clone` ship (and tool-created global excludes files) are comment-only, which the walker parses
+///   into zero rules. A `.git` pointer file marks a linked worktree whose real gitdir is not
+///   resolved here — conservatively treated as present.
 ///
-/// A rule file that sits inside the walked tree and is itself excluded by
-/// rules never appears in `found`, yet the walker still applies its rules;
-/// the ancestor scan covers the common placement (above the walk roots),
-/// keeping the gate conservative in practice.
+/// Known conservative gaps, both contrived: the gate does not inspect the
+/// `.git/info/exclude` of a nested repository inside the covered tree (the
+/// walker does apply it), nor a rule file inside the walked tree that its
+/// own rules exclude (it never appears in `found`; the ancestor scan covers
+/// the common placement above the walk roots). Wherever the gate is unsure,
+/// it errs toward running the re-walk.
 fn ignore_rules_in_play(found: &[PathBuf], covered_roots: &[PathBuf], repo_path: &Path) -> bool {
     if found.iter().any(|path| is_ignore_rule_file(path)) {
         return true;
@@ -356,11 +403,10 @@ fn ignore_rules_in_play(found: &[PathBuf], covered_roots: &[PathBuf], repo_path:
         return true;
     }
     let dot_git = repo_path.join(".git");
-    if dot_git.is_file() || dot_git.join("info").join("exclude").exists() {
+    if dot_git.is_file() || has_rule_lines(&dot_git.join("info").join("exclude")) {
         return true;
     }
-    // A configured-but-missing path carries no rules; only check existence.
-    gitconfig_excludes_path().is_some_and(|path| path.exists())
+    gitconfig_excludes_path().is_some_and(|path| has_rule_lines(&path))
 }
 
 /// Files excluded by ignore rules from crypt-list coverage.
@@ -373,7 +419,9 @@ fn ignore_rules_in_play(found: &[PathBuf], covered_roots: &[PathBuf], repo_path:
 /// Only directory roots are re-walked: an explicit file root bypasses the
 /// ignore rules anyway, so it cannot hide anything. The re-walk is skipped
 /// entirely when no ignore-rule source is in play ([`ignore_rules_in_play`]):
-/// with no rules anywhere the diff is provably empty.
+/// a source counts once it carries at least one rule line — comment-only
+/// templates such as a fresh `.git/info/exclude` filter nothing — and with
+/// no rules anywhere the diff is provably empty.
 fn ignored_in_crypt_entries(
     covered_roots: &[PathBuf],
     repo_path: &Path,
@@ -578,6 +626,8 @@ pub fn resolve_target_files(
 // Exercises the deprecated `list_files` helper as an external caller would.
 #[allow(deprecated)]
 mod tests {
+    use std::{env, ffi::OsString};
+
     use assert2::assert;
     use tempfile::TempDir;
 
@@ -860,5 +910,113 @@ mod tests {
 
         let missed = ignored_in_crypt_entries(std::slice::from_ref(&dir), base, &found);
         assert_eq!(missed, vec![dir.join("x.env")]);
+    }
+
+    /// Isolate the global-excludes lookup from the host machine.
+    ///
+    /// Every location `gitconfig_excludes_path` reads is redirected to an
+    /// empty home for the guard's lifetime, mirroring `IsolatedGitConfig`
+    /// in the integration tests. Previous values are restored on drop, even
+    /// on panic.
+    struct IsolatedHomeEnv(Vec<(&'static str, Option<OsString>)>);
+
+    impl IsolatedHomeEnv {
+        fn new(empty_home: &Path) -> Self {
+            // `std::env::home_dir` reads USERPROFILE on Windows and HOME
+            // elsewhere; the remaining keys are config redirections the
+            // lookup honors.
+            #[cfg(windows)]
+            const HOME_KEY: &str = "USERPROFILE";
+            #[cfg(not(windows))]
+            const HOME_KEY: &str = "HOME";
+            const KEYS: [&str; 4] = [
+                HOME_KEY,
+                "GIT_CONFIG_GLOBAL",
+                "GIT_CONFIG_SYSTEM",
+                "XDG_CONFIG_HOME",
+            ];
+            let guard = Self(KEYS.iter().map(|&k| (k, env::var_os(k))).collect());
+            // SAFETY: the temporary values only affect git-config lookups
+            // inside one test assertion; concurrent tests in this binary
+            // walk throwaway directories where an absent global excludes
+            // file changes nothing.
+            #[allow(unsafe_code)]
+            unsafe {
+                env::set_var(HOME_KEY, empty_home);
+                // Redirect the config overrides at missing files instead of
+                // removing them, so the fallbacks they guard (the home/XDG
+                // lookups, /etc/gitconfig) never see host settings either.
+                env::set_var("GIT_CONFIG_GLOBAL", empty_home.join("no-gitconfig"));
+                env::set_var("GIT_CONFIG_SYSTEM", empty_home.join("no-gitconfig"));
+                env::remove_var("XDG_CONFIG_HOME");
+            }
+            guard
+        }
+    }
+
+    impl Drop for IsolatedHomeEnv {
+        fn drop(&mut self) {
+            // SAFETY: restores the values captured at construction.
+            #[allow(unsafe_code)]
+            unsafe {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(v) => env::set_var(key, v),
+                        None => env::remove_var(key),
+                    }
+                }
+            }
+        }
+    }
+
+    /// A comment-only `.git/info/exclude` (what `git init` and `git clone`
+    /// ship) carries no rule: the gate must treat it as absent and skip the
+    /// re-walk.
+    #[test]
+    fn test_ignore_rules_in_play_info_exclude_comment_only() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let info = base.join(".git").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(
+            info.join("exclude"),
+            "# git ls-files --others --exclude-from=.git/info/exclude\n# *.[oa]\n# *~\n\n   \n",
+        )
+        .unwrap();
+        let dir = base.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        let found = list_files(["dir"], base);
+
+        let empty_home = TempDir::new().unwrap();
+        let _guard = IsolatedHomeEnv::new(empty_home.path());
+        assert!(!ignore_rules_in_play(
+            &found,
+            std::slice::from_ref(&dir),
+            base
+        ));
+    }
+
+    /// One real rule line in `.git/info/exclude` keeps the gate — and thus
+    /// the re-walk — active.
+    #[test]
+    fn test_ignore_rules_in_play_info_exclude_rule_line() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path();
+        let info = base.join(".git").join("info");
+        fs::create_dir_all(&info).unwrap();
+        fs::write(info.join("exclude"), "# comments only above\n*.env\n").unwrap();
+        let dir = base.join("dir");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("a.txt"), "a").unwrap();
+        let found = list_files(["dir"], base);
+
+        let empty_home = TempDir::new().unwrap();
+        let _guard = IsolatedHomeEnv::new(empty_home.path());
+        assert!(ignore_rules_in_play(
+            &found,
+            std::slice::from_ref(&dir),
+            base
+        ));
     }
 }
