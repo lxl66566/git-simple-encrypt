@@ -57,6 +57,15 @@ pub enum Error {
     #[error("unsupported encryption algorithm: {0}")]
     UnsupportedAlgo(u8),
 
+    /// Header advertises flag bits unknown to this build.
+    ///
+    /// Future 3.x formats may give new flag bits semantic meaning (e.g. a
+    /// different AAD layout), so an older binary must refuse the file
+    /// instead of silently parsing it under the current semantics. The
+    /// payload is the raw flags byte.
+    #[error("unsupported header flags: {0:#04x}")]
+    UnknownFlags(u8),
+
     /// XChaCha20-Poly1305 encryption failure.
     #[error("encryption failed: {0}")]
     EncryptFailed(String),

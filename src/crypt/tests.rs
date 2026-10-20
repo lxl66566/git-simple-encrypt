@@ -60,6 +60,26 @@ fn test_header_serialization() {
 }
 
 #[test]
+fn test_from_bytes_rejects_unknown_flag_bits() {
+    // A header valid in every other field but carrying a flag bit this
+    // build does not know must be refused: future 3.x formats may give new
+    // bits semantic meaning, and silently parsing them under the current
+    // semantics would misinterpret the file.
+    let header = FileHeader::new(true, [0xab; SALT_LEN], [0xcd; FILE_ID_LEN]);
+    let mut bytes = *header.as_bytes();
+    bytes[6] |= 1 << 1; // an unrecognized flag bit
+
+    let err = FileHeader::from_bytes(&bytes).unwrap_err();
+    assert!(
+        matches!(err, crate::error::Error::UnknownFlags(flags) if flags == bytes[6]),
+        "unexpected error: {err:?}"
+    );
+
+    // The known bit alone keeps parsing fine.
+    FileHeader::from_bytes(header.as_bytes()).unwrap();
+}
+
+#[test]
 fn test_nonce_derivation_deterministic() {
     let key_mac = [0x42u8; 32];
     let file_id = [0x99u8; FILE_ID_LEN];
@@ -477,7 +497,7 @@ fn test_future_version_file_not_wrapped_and_rejected_by_decrypt() {
     let path = create_temp_file(&file_bytes);
     let (key, salt) = get_test_key_and_salt();
 
-    // encrypt: magic-only detection → skipped, bytes unchanged
+    // encrypt: sniffed as a future version → skipped, bytes unchanged
     assert_eq!(
         encrypt_file(&path, &key, &salt, None, None).unwrap(),
         None,
@@ -493,6 +513,36 @@ fn test_future_version_file_not_wrapped_and_rejected_by_decrypt() {
     ));
 }
 
+#[test]
+fn test_encrypt_fake_gitse_header_with_unknown_algo_is_encrypted() {
+    // A plaintext that happens to start with GITSE + v3 but carries an
+    // unknown algorithm byte classifies as Sniffed::UnknownAlgo: the
+    // manual encrypt path must encrypt it, matching the clean filter
+    // (only recognized ciphertext and future versions are skipped).
+    let mut file_bytes = [0u8; HEADER_LEN + 64];
+    file_bytes[..MAGIC.len()].copy_from_slice(MAGIC);
+    file_bytes[5] = VERSION;
+    file_bytes[7] = 9; // unknown enc_algo
+    file_bytes[HEADER_LEN..].fill(0xcd);
+
+    let path = create_temp_file(&file_bytes);
+    let (key, salt) = get_test_key_and_salt();
+
+    let header = encrypt_file(&path, &key, &salt, None, None)
+        .unwrap()
+        .expect("fake header (unknown algo) must be encrypted, not skipped");
+    assert_eq!(header.enc_algo, ENC_ALGO);
+
+    // The whole file was re-encrypted (not passed through): new header +
+    // ciphertext, and the original bytes only recover via decrypt.
+    let encrypted = std::fs::read(&path).unwrap();
+    assert_ne!(encrypted, file_bytes);
+    assert_eq!(&encrypted[..MAGIC.len()], MAGIC);
+    assert_eq!(encrypted[7], ENC_ALGO);
+
+    decrypt_file(&path, b"super_secret_password").unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), file_bytes);
+}
 #[test]
 fn test_wrong_password_decrypt_fails() {
     let plaintext = b"data encrypted under one password";

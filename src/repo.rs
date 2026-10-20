@@ -1617,10 +1617,14 @@ mod tests {
         assert!(matches!(result, Err(Error::FilesNotEncrypted(1, 1))));
 
         // Encrypt the file (cheap path: just give it a valid 64-byte GITSE header so
-        // is_file_encrypted returns true), then check passes.
+        // is_file_encrypted returns true), then check passes. The algorithm
+        // byte must be valid too: a magic-only header with an unknown
+        // algorithm byte is plaintext imitating the format and check must
+        // flag it.
         let mut fake_header = vec![0u8; HEADER_LEN];
         fake_header[..5].copy_from_slice(b"GITSE");
         fake_header[5] = 3; // version
+        fake_header[7] = 1; // enc_algo
         std::fs::write(repo_path.join("plain.txt"), fake_header).unwrap();
         let result = repo.check(&[], false);
         assert!(result.is_ok());
