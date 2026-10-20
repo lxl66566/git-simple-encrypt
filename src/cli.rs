@@ -187,14 +187,20 @@ impl SetField {
     /// # Errors
     ///
     /// Returns an error if the underlying git command or the config file write
-    /// fails.
+    /// fails. `Key` additionally rejects a whitespace-only value with
+    /// [`Error::EmptyPassword`], matching the interactive `p` prompt.
     pub fn set(&self, repo: &mut Repo) -> Result<()> {
         match self {
             Self::Key { value } => {
                 warn!("`set key` is deprecated, please use `pwd` or `p` instead.");
-                // Trim like the interactive `p` prompt does, so both
+                // Trim like the interactive `p` prompt does, and reject a
+                // whitespace-only value with the same error, so both
                 // key-setting paths agree on the stored value.
-                repo.set_config("key", value.trim())?;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err(Error::EmptyPassword);
+                }
+                repo.set_config("key", value)?;
                 info!("Master key updated.");
                 // The key lives in git config, not in the toml; nothing to
                 // persist in the config file.
@@ -315,5 +321,33 @@ mod tests {
         .set(&mut repo)
         .unwrap();
         assert!(repo.get_config("key").unwrap() == "padded");
+    }
+
+    /// `set key` with a whitespace-only value fails with the same error as
+    /// the interactive `p` prompt, and nothing is written to the config.
+    #[test]
+    fn set_key_rejects_whitespace_only_value() {
+        use std::process::Command;
+
+        use path_absolutize::Absolutize;
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().unwrap();
+        Command::new("git")
+            .args(["init"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut repo = Repo::open(&repo_path).unwrap();
+
+        let err = SetField::Key {
+            value: " \t ".to_owned(),
+        }
+        .set(&mut repo)
+        .unwrap_err();
+        assert!(matches!(err, Error::EmptyPassword));
+        // The rejected value must not have reached the config.
+        assert!(repo.get_config("key").is_err());
     }
 }
