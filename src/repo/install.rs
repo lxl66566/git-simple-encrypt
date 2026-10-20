@@ -137,7 +137,7 @@ impl Repo {
             },
         };
         let patterns = self.filter_patterns();
-        let updated = gitattributes::with_managed_block(&content, &patterns);
+        let updated = gitattributes::with_managed_block_bytes(&content, &patterns);
         atomic_write(&attr_path, &updated)
     }
 
@@ -297,7 +297,7 @@ impl Repo {
 fn strip_gitattributes_block(attr_path: &Path) -> Result<()> {
     match std::fs::read(attr_path) {
         Ok(content) => {
-            let rest = gitattributes::without_managed_block(&content);
+            let rest = gitattributes::without_managed_block_bytes(&content);
             if is_blank(&rest) {
                 std::fs::remove_file(attr_path)?;
             } else {

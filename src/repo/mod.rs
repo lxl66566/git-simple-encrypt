@@ -198,7 +198,7 @@ impl Repo {
         if !gitattributes::has_managed_block(&content) {
             return Ok(());
         }
-        let updated = gitattributes::with_managed_block(&content, &self.filter_patterns());
+        let updated = gitattributes::with_managed_block_bytes(&content, &self.filter_patterns());
         if updated != content {
             atomic_write(&attr_path, &updated)?;
         }
