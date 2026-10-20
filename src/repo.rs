@@ -590,11 +590,14 @@ impl Repo {
 
         // 1. Export the managed .gitattributes block.
         let attr_path = self.path.join(".gitattributes");
-        let content = match std::fs::read_to_string(&attr_path) {
+        // Byte-oriented like every other .gitattributes touchpoint: the file
+        // may legally hold non-UTF-8 pattern bytes (raw path bytes under
+        // Unix), which a text read would reject.
+        let content = match std::fs::read(&attr_path) {
             Ok(content) => content,
             // A missing .gitattributes is the common case: start from empty.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            // Any other read failure (encoding, permissions) must surface:
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            // Any other read failure (permissions) must surface:
             // continuing with an empty base would clobber the user's file
             // with a block-only rewrite below.
             Err(e) => {
@@ -605,8 +608,8 @@ impl Repo {
             },
         };
         let patterns = self.filter_patterns();
-        let updated = gitattributes::with_managed_block(&content, &patterns);
-        atomic_write(&attr_path, updated.as_bytes())?;
+        let updated = gitattributes::with_managed_block_bytes(&content, &patterns);
+        atomic_write(&attr_path, &updated)?;
 
         // 2. Configure the filter driver and the diff textconv.
         let f = format!("filter.{}", gitattributes::FILTER_NAME);
@@ -694,7 +697,7 @@ impl Repo {
     /// reinstall) keeps working.
     pub fn uninstall(&self) -> Result<()> {
         let attr_path = self.path.join(".gitattributes");
-        let attrs_installed = std::fs::read_to_string(&attr_path)
+        let attrs_installed = std::fs::read(&attr_path)
             .is_ok_and(|content| gitattributes::has_managed_block(&content));
         let (hooks_dir, _) = self.hooks_dir()?;
         let hook = hooks_dir.join("pre-commit");
@@ -726,13 +729,19 @@ impl Repo {
 
         // 2. Strip the managed .gitattributes block; delete the file when the block was its only
         //    content.
-        if let Ok(content) = std::fs::read_to_string(&attr_path) {
-            let rest = gitattributes::without_managed_block(&content);
-            if rest.trim().is_empty() {
-                std::fs::remove_file(&attr_path)?;
-            } else {
-                atomic_write(&attr_path, rest.as_bytes())?;
-            }
+        match std::fs::read(&attr_path) {
+            Ok(content) => {
+                let rest = gitattributes::without_managed_block_bytes(&content);
+                if is_blank(&rest) {
+                    std::fs::remove_file(&attr_path)?;
+                } else {
+                    atomic_write(&attr_path, &rest)?;
+                }
+            },
+            // A missing file means there is no block to strip (partial
+            // installs are tolerated, like the config unsets above).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => return Err(e.into()),
         }
 
         // 3. Remove the managed pre-commit hook (hook-mode artifact); foreign hooks are never
@@ -825,18 +834,23 @@ impl Repo {
     /// Refresh the managed `.gitattributes` block after crypt-list changes.
     ///
     /// No-op unless the block already exists (i.e. filter mode is active);
-    /// the hook-only workflow never touches `.gitattributes`.
+    /// the hook-only workflow never touches `.gitattributes`. Reading is
+    /// byte-oriented like the other touchpoints, so non-UTF-8 pattern lines
+    /// are preserved instead of aborting the refresh.
     pub fn refresh_gitattributes(&self) -> Result<()> {
         let attr_path = self.path.join(".gitattributes");
-        let Ok(content) = std::fs::read_to_string(&attr_path) else {
-            return Ok(());
+        let content = match std::fs::read(&attr_path) {
+            Ok(content) => content,
+            // A missing .gitattributes means filter mode is not active here.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e.into()),
         };
         if !gitattributes::has_managed_block(&content) {
             return Ok(());
         }
-        let updated = gitattributes::with_managed_block(&content, &self.filter_patterns());
+        let updated = gitattributes::with_managed_block_bytes(&content, &self.filter_patterns());
         if updated != content {
-            atomic_write(&attr_path, updated.as_bytes())?;
+            atomic_write(&attr_path, &updated)?;
         }
         Ok(())
     }
@@ -1227,6 +1241,17 @@ impl Repo {
     }
 }
 
+/// Whether leftover `.gitattributes` content is blank (whitespace only):
+/// uninstall's signal that the managed block was the file's only content and
+/// the file itself can go.
+///
+/// Non-UTF-8 bytes always count as content — matching the byte-oriented
+/// handling everywhere else — while for valid UTF-8 this is exactly
+/// `str::trim().is_empty()`, preserving the pre-existing behavior.
+fn is_blank(bytes: &[u8]) -> bool {
+    std::str::from_utf8(bytes).is_ok_and(|s| s.trim().is_empty())
+}
+
 /// Print the check summary; `Err(FilesNotEncrypted)` when anything is plain.
 fn report_check(not_encrypted: &[String], total: usize) -> Result<()> {
     if not_encrypted.is_empty() {
@@ -1599,6 +1624,48 @@ mod tests {
         std::fs::write(repo_path.join("plain.txt"), fake_header).unwrap();
         let result = repo.check(&[], false);
         assert!(result.is_ok());
+        Ok(())
+    }
+
+    /// A `.gitattributes` holding non-UTF-8 pattern bytes (legal content
+    /// under Unix) must work with install/refresh/uninstall exactly like a
+    /// UTF-8 one.
+    ///
+    /// The managed block is added, updated and stripped, and the raw user
+    /// line survives every step (it also keeps the file from being deleted
+    /// as "blank" at uninstall time).
+    #[test]
+    fn test_gitattributes_non_utf8_install_refresh_uninstall() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize().unwrap().to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+        repo.set_config("key", "test-key")?;
+        std::fs::write(repo_path.join("a.txt"), b"x")?;
+        repo.conf.add_one_path_to_crypt_list("a.txt")?;
+
+        let mut original = b"*.bin text\n".to_vec();
+        original.extend_from_slice(&[0xff, 0xfe, b' ', b'r', b'a', b'w', b'\n']);
+        let attr_path = repo_path.join(".gitattributes");
+        std::fs::write(&attr_path, &original)?;
+
+        // install: appends the managed block, keeps the raw line verbatim
+        repo.install_filter()?;
+        let installed = std::fs::read(&attr_path)?;
+        assert!(gitattributes::has_managed_block(&installed));
+        assert!(installed.starts_with(&original));
+        assert!(String::from_utf8_lossy(&installed).contains("a.txt filter=git-se diff=git-se"));
+
+        // refresh: a crypt-list change rewrites the block in place
+        std::fs::write(repo_path.join("b.txt"), b"y")?;
+        repo.conf.add_one_path_to_crypt_list("b.txt")?;
+        repo.refresh_gitattributes()?;
+        let refreshed = std::fs::read(&attr_path)?;
+        assert!(refreshed.starts_with(&original));
+        assert!(String::from_utf8_lossy(&refreshed).contains("b.txt filter=git-se diff=git-se"));
+
+        // uninstall: strips the block; the non-UTF-8 line keeps the file
+        repo.uninstall()?;
+        assert_eq!(std::fs::read(&attr_path)?, original);
         Ok(())
     }
 }
