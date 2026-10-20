@@ -180,7 +180,7 @@ pub(crate) fn has_git_component(path: &Path) -> bool {
 /// and which additionally applies crypt-list coverage and reports files the
 /// ignore rules exclude from it. This helper remains for source
 /// compatibility with external users.
-#[deprecated(since = "3.1.1", note = "use `resolve_target_files` instead")]
+#[deprecated(since = "3.2.0", note = "use `resolve_target_files` instead")]
 pub fn list_files(
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
     cwd: impl AsRef<Path>,
