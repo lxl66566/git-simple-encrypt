@@ -173,6 +173,14 @@ pub(crate) fn has_git_component(path: &Path) -> bool {
 /// Paths may be relative (resolved against `cwd`) or absolute; paths
 /// resolving outside `cwd` are skipped with a warning — the walker must
 /// never touch files outside the repository.
+///
+/// # Deprecated
+///
+/// Superseded by [`resolve_target_files`], which every internal caller uses
+/// and which additionally applies crypt-list coverage and reports files the
+/// ignore rules exclude from it. This helper remains for source
+/// compatibility with external users.
+#[deprecated(since = "3.2.0", note = "use `resolve_target_files` instead")]
 pub fn list_files(
     paths: impl IntoIterator<Item = impl AsRef<Path>>,
     cwd: impl AsRef<Path>,
@@ -615,6 +623,8 @@ pub fn resolve_target_files(
 }
 
 #[cfg(test)]
+// Exercises the deprecated `list_files` helper as an external caller would.
+#[allow(deprecated)]
 mod tests {
     use std::{env, ffi::OsString};
 
