@@ -195,25 +195,42 @@ pub(super) fn read_prefix(file: &mut std::fs::File, buf: &mut [u8]) -> Result<us
     Ok(filled)
 }
 
+/// Verdict of [`stream_eq_file`].
+pub(super) enum CompareOutcome {
+    /// Both sides read to the blob's end and matched byte-for-byte.
+    Equal,
+    /// The contents differ (a file ending early mid-compare included).
+    Different,
+    /// The file side failed to read mid-compare; the blob session is still
+    /// healthy, so only the file must be treated as unreadable.
+    FileUnreadable,
+}
+
 /// Compare the unconsumed blob payload against the remainder of `file` in
 /// fixed chunks, stopping at the first difference.
 ///
 /// The caller has already matched the total lengths; a file that ends early
 /// — truncated concurrently with the compare — simply reads as differing.
+/// A file read error is reported as [`CompareOutcome::FileUnreadable`] so
+/// callers can fold it into their unreadable-file handling; errors from the
+/// blob side stay `Err` — they mean the batch session is broken, not that
+/// the file is unreadable.
 pub(super) fn stream_eq_file(
     stream: &mut BlobStream<'_>,
     file: &mut std::fs::File,
-) -> Result<bool> {
+) -> Result<CompareOutcome> {
     let mut blob_chunk = [0u8; COMPARE_CHUNK];
     let mut file_chunk = [0u8; COMPARE_CHUNK];
     loop {
         let n = stream.read(&mut blob_chunk)?;
         if n == 0 {
-            return Ok(true);
+            return Ok(CompareOutcome::Equal);
         }
-        let filled = read_prefix(file, &mut file_chunk[..n])?;
+        let Ok(filled) = read_prefix(file, &mut file_chunk[..n]) else {
+            return Ok(CompareOutcome::FileUnreadable);
+        };
         if filled < n || blob_chunk[..n] != file_chunk[..n] {
-            return Ok(false);
+            return Ok(CompareOutcome::Different);
         }
     }
 }

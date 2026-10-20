@@ -12,7 +12,7 @@ use log::warn;
 
 use super::{
     Repo,
-    git::{CatFileBatch, CryptCoverage, nul_records, read_prefix, stream_eq_file},
+    git::{CatFileBatch, CompareOutcome, CryptCoverage, nul_records, read_prefix, stream_eq_file},
 };
 use crate::{
     crypt::HEADER_LEN,
@@ -102,29 +102,46 @@ impl Repo {
             stream.read_exact(&mut blob_head)?;
             let blob_encrypted = is_ciphertext(&blob_head);
 
-            // An unreadable worktree copy has nothing to compare against.
+            // A worktree copy is unreadable not only when the open fails but
+            // also when its reads do (e.g. the path was replaced by a
+            // directory: Unix opens it fine and fails the first read with
+            // EISDIR); both classify the same way. Blob-side errors stay
+            // `?` — a broken batch session is fatal, an unreadable file is
+            // not.
             let opened = std::fs::File::open(self.path.join(&rel))
                 .and_then(|file| file.metadata().map(|meta| (file, meta.len())));
-            let (equal, worktree_encrypted) = match opened {
-                Err(_) => {
-                    stream.skip_to_end()?;
-                    if !blob_encrypted {
-                        plan.needs_renormalize = true;
-                    }
-                    continue;
-                },
-                Ok((mut file, file_len)) => {
-                    // One prefix read feeds both the worktree magic check
-                    // and the first compare segment.
-                    let mut file_head = vec![0u8; blob_head.len()];
-                    let filled = read_prefix(&mut file, &mut file_head)?;
-                    let worktree_encrypted = is_ciphertext(&file_head[..filled]);
-                    let equal = file_len == stream.len() as u64
-                        && filled == blob_head.len()
-                        && file_head == blob_head
-                        && stream_eq_file(&mut stream, &mut file)?;
-                    (equal, worktree_encrypted)
-                },
+            let compared = 'worktree: {
+                let Ok((mut file, file_len)) = opened else {
+                    break 'worktree None;
+                };
+                // One prefix read feeds both the worktree magic check and
+                // the first compare segment.
+                let mut file_head = vec![0u8; blob_head.len()];
+                let Ok(filled) = read_prefix(&mut file, &mut file_head) else {
+                    break 'worktree None;
+                };
+                let worktree_encrypted = is_ciphertext(&file_head[..filled]);
+                if file_len != stream.len() as u64
+                    || filled != blob_head.len()
+                    || file_head != blob_head
+                {
+                    break 'worktree Some((false, worktree_encrypted));
+                }
+                match stream_eq_file(&mut stream, &mut file)? {
+                    CompareOutcome::Equal => Some((true, worktree_encrypted)),
+                    CompareOutcome::Different => Some((false, worktree_encrypted)),
+                    CompareOutcome::FileUnreadable => None,
+                }
+            };
+            let Some((equal, worktree_encrypted)) = compared else {
+                // An unreadable worktree copy has nothing to compare
+                // against; drain the unconsumed payload so the cat-file
+                // session stays aligned for the next file.
+                stream.skip_to_end()?;
+                if !blob_encrypted {
+                    plan.needs_renormalize = true;
+                }
+                continue;
             };
             stream.skip_to_end()?;
 
@@ -308,6 +325,66 @@ mod tests {
         // equality they match none of the renormalize cases either.
         assert_eq!(plan.to_decrypt, ["same.bin"]);
         assert!(!plan.needs_renormalize);
+        Ok(())
+    }
+
+    /// A worktree path that cannot be read must classify the file as
+    /// unreadable instead of failing the whole plan, exactly like an
+    /// unopenable one.
+    ///
+    /// A directory in place of the tracked file exercises the read-failure
+    /// fold on Unix (open succeeds, the first read fails with EISDIR) and
+    /// the unopenable branch on Windows. Either way the file is skipped:
+    /// not in `to_decrypt`, but its plaintext blob still asks for
+    /// renormalize.
+    #[test]
+    fn test_migration_plan_unreadable_worktree_is_skipped() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize()?.to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+
+        // One ciphertext and one plaintext blob, each with a healthy twin
+        // that must keep classifying normally.
+        let mut cipher = fake_ciphertext_header();
+        cipher.extend(0..64u8);
+        for (name, bytes) in [
+            ("enc.bin", cipher.as_slice()),
+            ("enc_ok.bin", cipher.as_slice()),
+            ("plain.bin", b"plaintext\n".as_slice()),
+        ] {
+            std::fs::write(repo_path.join(name), bytes)?;
+            repo.conf.add_one_path_to_crypt_list(name)?;
+        }
+
+        repo.run(&["add", "enc.bin", "enc_ok.bin", "plain.bin"])?;
+        let out = Command::new("git")
+            .current_dir(&repo_path)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Replace one file of each blob kind by a directory.
+        for name in ["enc.bin", "plain.bin"] {
+            std::fs::remove_file(repo_path.join(name))?;
+            std::fs::create_dir(repo_path.join(name))?;
+        }
+
+        let plan = repo.migration_plan()?;
+        assert_eq!(plan.to_decrypt, ["enc_ok.bin"]);
+        // The unreadable plaintext blob keeps the renormalize hint.
+        assert!(plan.needs_renormalize);
         Ok(())
     }
 }
