@@ -111,11 +111,10 @@ impl CatFileBatch {
         })
     }
 
-    /// Read one blob by its object id; `None` when the object is missing.
-    ///
-    /// Response framing: `<oid> <type> <size> LF <size bytes> LF`, or
-    /// `<spec> missing LF`.
-    fn blob(&mut self, oid: &str) -> Result<Option<Vec<u8>>> {
+    /// Send one lookup and parse its response header: `Some(size)` means a
+    /// `<oid> <type> <size> LF` header whose payload of `size` bytes (plus a
+    /// trailing LF) is now waiting on the pipe; `None` means "missing".
+    fn response_header(&mut self, oid: &str) -> Result<Option<usize>> {
         self.stdin.write_all(oid.as_bytes())?;
         self.stdin.write_all(b"\n")?;
         self.stdin.flush()?;
@@ -123,25 +122,171 @@ impl CatFileBatch {
         self.stdout.read_line(&mut header)?;
         let header = header.trim_end();
         // Response header: `<oid> <type> <size>` or `<spec> missing`.
-        let Some(size) = header
+        match header
             .rsplit_once(' ')
             .and_then(|(_, size)| size.parse::<usize>().ok())
-        else {
-            if header.ends_with(" missing") {
-                return Ok(None);
-            }
-            return Err(Error::Other(format!(
+        {
+            Some(size) => Ok(Some(size)),
+            None if header.ends_with(" missing") => Ok(None),
+            None => Err(Error::Other(format!(
                 "unexpected git cat-file response: {header}"
-            )));
+            ))),
+        }
+    }
+
+    /// Read only the leading bytes of one blob (up to `keep`, clamped to the
+    /// payload size) and drain the remainder without buffering it; `None`
+    /// when the object is missing.
+    fn blob_prefix(&mut self, oid: &str, keep: usize) -> Result<Option<Vec<u8>>> {
+        let Some(mut stream) = self.blob_stream(oid)? else {
+            return Ok(None);
         };
-        // Payload of exactly `size` bytes, then one LF terminator.
-        let mut buf = vec![0u8; size + 1];
-        self.stdout.read_exact(&mut buf)?;
-        buf.truncate(size);
-        Ok(Some(buf))
+        stream.take_prefix(keep).map(Some)
+    }
+
+    /// Begin reading one blob payload; `None` when the object is missing.
+    /// The returned stream must be fully consumed, or ended via
+    /// [`BlobStream::skip_to_end`], before the next lookup on this session:
+    /// leftover bytes would desync every later response.
+    fn blob_stream(&mut self, oid: &str) -> Result<Option<BlobStream<'_>>> {
+        let Some(size) = self.response_header(oid)? else {
+            return Ok(None);
+        };
+        Ok(Some(BlobStream {
+            batch: self,
+            size,
+            remaining: size,
+        }))
     }
 }
 
+/// A blob payload currently being read from a [`CatFileBatch`] session.
+///
+/// Holds the borrow while the caller consumes the payload piecewise; the
+/// session stays aligned as long as every stream is read to its end or
+/// explicitly skipped.
+struct BlobStream<'a> {
+    batch: &'a mut CatFileBatch,
+    /// Payload size advertised by the response header.
+    size: usize,
+    /// Payload bytes not yet consumed.
+    remaining: usize,
+}
+
+impl BlobStream<'_> {
+    /// The payload size advertised by the response header.
+    #[must_use]
+    const fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Read exactly `buf.len()` payload bytes; the caller must stay within
+    /// [`BlobStream::len`].
+    fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
+        debug_assert!(
+            buf.len() <= self.remaining,
+            "blob read past the advertised payload size"
+        );
+        self.batch.stdout.read_exact(buf)?;
+        self.remaining -= buf.len();
+        Ok(())
+    }
+
+    /// Read up to `buf.len()` payload bytes (fewer only at the payload end).
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
+        let want = buf.len().min(self.remaining);
+        let n = self.batch.stdout.read(&mut buf[..want])?;
+        self.remaining -= n;
+        Ok(n)
+    }
+
+    /// Read the first `keep` payload bytes (clamped to the payload size),
+    /// end the stream and return them: magic checks only need the leading
+    /// bytes, and draining keeps the session aligned without holding the
+    /// whole blob in memory.
+    fn take_prefix(&mut self, keep: usize) -> Result<Vec<u8>> {
+        let mut head = vec![0u8; keep.min(self.size)];
+        self.read_exact(&mut head)?;
+        self.skip_to_end()?;
+        Ok(head)
+    }
+
+    /// Consume and discard the unread payload plus the trailing LF
+    /// terminator, leaving the session ready for the next request. The
+    /// payload bytes still cross the pipe (the protocol leaves no way
+    /// around them) but never the heap.
+    fn skip_to_end(&mut self) -> Result<()> {
+        if self.remaining > 0 {
+            let remaining = self.remaining as u64;
+            let mut payload = self.batch.stdout.by_ref().take(remaining);
+            let copied = std::io::copy(&mut payload, &mut std::io::sink())?;
+            if copied < remaining {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "git cat-file payload ended early",
+                )
+                .into());
+            }
+            self.remaining = 0;
+        }
+        let mut lf = [0u8; 1];
+        self.batch.stdout.read_exact(&mut lf)?;
+        Ok(())
+    }
+}
+
+/// Chunk size for the streaming blob-vs-file compare.
+const COMPARE_CHUNK: usize = 8 * 1024;
+
+/// Read up to `buf.len()` bytes from `file`, filling as much as possible
+/// before EOF; returns the number of bytes read.
+fn read_prefix(file: &mut std::fs::File, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
+/// Verdict of [`stream_eq_file`].
+enum CompareOutcome {
+    /// Both sides read to the blob's end and matched byte-for-byte.
+    Equal,
+    /// The contents differ (a file ending early mid-compare included).
+    Different,
+    /// The file side failed to read mid-compare; the blob session is still
+    /// healthy, so only the file must be treated as unreadable.
+    FileUnreadable,
+}
+
+/// Compare the unconsumed blob payload against the remainder of `file` in
+/// fixed chunks, stopping at the first difference.
+///
+/// The caller has already matched the total lengths; a file that ends early
+/// — truncated concurrently with the compare — simply reads as differing.
+/// A file read error is reported as [`CompareOutcome::FileUnreadable`] so
+/// callers can fold it into their unreadable-file handling; errors from the
+/// blob side stay `Err` — they mean the batch session is broken, not that
+/// the file is unreadable.
+fn stream_eq_file(stream: &mut BlobStream<'_>, file: &mut std::fs::File) -> Result<CompareOutcome> {
+    let mut blob_chunk = [0u8; COMPARE_CHUNK];
+    let mut file_chunk = [0u8; COMPARE_CHUNK];
+    loop {
+        let n = stream.read(&mut blob_chunk)?;
+        if n == 0 {
+            return Ok(CompareOutcome::Equal);
+        }
+        let Ok(filled) = read_prefix(file, &mut file_chunk[..n]) else {
+            return Ok(CompareOutcome::FileUnreadable);
+        };
+        if filled < n || blob_chunk[..n] != file_chunk[..n] {
+            return Ok(CompareOutcome::Different);
+        }
+    }
+}
 impl Drop for CatFileBatch {
     fn drop(&mut self) {
         // The session lives exactly as long as the caller's questions;
@@ -356,9 +501,12 @@ impl Repo {
         let mut first_error: Option<Error> = None;
         let mut batch = CatFileBatch::spawn(&self.path)?;
         for (rel, oid) in &targets {
-            match batch.blob(oid) {
-                Ok(Some(blob)) => {
-                    if !is_ciphertext(&blob) {
+            // The magic check only needs the leading header bytes; the rest
+            // of the payload is drained without buffering, so staged blobs
+            // of any size cost a fixed ~64-byte allocation.
+            match batch.blob_prefix(oid, HEADER_LEN) {
+                Ok(Some(head)) => {
+                    if !is_ciphertext(&head) {
                         not_encrypted.push(rel.clone());
                     }
                 },
@@ -965,7 +1113,11 @@ impl Repo {
     /// plan happens in [`Repo::execute_migration`].
     ///
     /// Unlike the pre-refactor code (one `git cat-file` spawn per file), the
-    /// HEAD blobs are streamed through a single [`CatFileBatch`] session.
+    /// HEAD blobs are streamed through a single [`CatFileBatch`] session and
+    /// compared chunk-by-chunk against the worktree files: a size mismatch
+    /// classifies without reading the file body, and a matching size stops
+    /// at the first differing chunk. No side of the compare is ever held in
+    /// memory in full.
     fn migration_plan(&self) -> Result<MigrationPlan> {
         let mut plan = MigrationPlan::default();
         if self.conf.crypt_list.is_empty() {
@@ -987,17 +1139,59 @@ impl Repo {
             if !crypt_covers(&self.conf.crypt_list, &rel) {
                 continue;
             }
-            let Some(blob) = batch.blob(oid)? else {
+            let Some(mut stream) = batch.blob_stream(oid)? else {
                 continue;
             };
-            let blob_encrypted = is_ciphertext(&blob);
-            let Ok(worktree) = std::fs::read(self.path.join(&rel)) else {
+            // The header prefix decides both magic checks; the payload body
+            // is only consumed when a full compare is actually needed.
+            let mut blob_head = vec![0u8; HEADER_LEN.min(stream.len())];
+            stream.read_exact(&mut blob_head)?;
+            let blob_encrypted = is_ciphertext(&blob_head);
+
+            // A worktree copy is unreadable not only when the open fails but
+            // also when its reads do (e.g. the path was replaced by a
+            // directory: Unix opens it fine and fails the first read with
+            // EISDIR); both classify the same way. Blob-side errors stay
+            // `?` — a broken batch session is fatal, an unreadable file is
+            // not.
+            let opened = std::fs::File::open(self.path.join(&rel))
+                .and_then(|file| file.metadata().map(|meta| (file, meta.len())));
+            let compared = 'worktree: {
+                let Ok((mut file, file_len)) = opened else {
+                    break 'worktree None;
+                };
+                // One prefix read feeds both the worktree magic check and
+                // the first compare segment.
+                let mut file_head = vec![0u8; blob_head.len()];
+                let Ok(filled) = read_prefix(&mut file, &mut file_head) else {
+                    break 'worktree None;
+                };
+                let worktree_encrypted = is_ciphertext(&file_head[..filled]);
+                if file_len != stream.len() as u64
+                    || filled != blob_head.len()
+                    || file_head != blob_head
+                {
+                    break 'worktree Some((false, worktree_encrypted));
+                }
+                match stream_eq_file(&mut stream, &mut file)? {
+                    CompareOutcome::Equal => Some((true, worktree_encrypted)),
+                    CompareOutcome::Different => Some((false, worktree_encrypted)),
+                    CompareOutcome::FileUnreadable => None,
+                }
+            };
+            let Some((equal, worktree_encrypted)) = compared else {
+                // An unreadable worktree copy has nothing to compare
+                // against; drain the unconsumed payload so the cat-file
+                // session stays aligned for the next file.
+                stream.skip_to_end()?;
                 if !blob_encrypted {
                     plan.needs_renormalize = true;
                 }
                 continue;
             };
-            if worktree == blob {
+            stream.skip_to_end()?;
+
+            if equal {
                 // untouched since the last checkout: safe to re-smudge
                 if blob_encrypted {
                     plan.to_decrypt.push(rel);
@@ -1005,7 +1199,7 @@ impl Repo {
                     // committed as plaintext before the filter existed
                     plan.needs_renormalize = true;
                 }
-            } else if blob_encrypted && !is_ciphertext(&worktree) {
+            } else if blob_encrypted && !worktree_encrypted {
                 // decrypted outside git (e.g. `git-se d`): the cached stat
                 // no longer matches; renormalize refreshes it losslessly
                 plan.needs_renormalize = true;
@@ -1407,7 +1601,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-    use crate::crypt::HEADER_LEN;
+    use crate::crypt::{HEADER_LEN, VERSION};
 
     #[test]
     fn test_repo_open() -> Result<()> {
@@ -1473,6 +1667,213 @@ mod tests {
             .output()
             .unwrap();
         dir
+    }
+
+    /// Write `bytes` into the object store of the repo at `repo_path` and
+    /// return the printed blob oid.
+    fn hash_object(repo_path: &Path, bytes: &[u8]) -> Result<String> {
+        use std::process::Stdio;
+
+        let mut child = Command::new("git")
+            .current_dir(repo_path)
+            .args(["hash-object", "-w", "--stdin"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(bytes)?;
+        // EOF before git prints the oid.
+        drop(stdin);
+        let out = child.wait_with_output()?;
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    }
+
+    /// Read a whole blob payload through the stream interface (the mirror of
+    /// the former whole-blob `blob` method, exercising `read_exact` over the
+    /// full payload).
+    fn read_full(batch: &mut CatFileBatch, oid: &str) -> Result<Option<Vec<u8>>> {
+        let Some(mut stream) = batch.blob_stream(oid)? else {
+            return Ok(None);
+        };
+        let mut buf = vec![0u8; stream.len()];
+        stream.read_exact(&mut buf)?;
+        stream.skip_to_end()?;
+        Ok(Some(buf))
+    }
+
+    /// `blob_prefix` drains exactly the unread payload.
+    ///
+    /// Across any mix of prefix reads, full reads and missing-object
+    /// responses, the session stays aligned and later responses still
+    /// parse. Covers the exact `HEADER_LEN` boundary (prefix covers the
+    /// whole payload, only the LF gets drained) and blobs smaller than the
+    /// prefix.
+    #[test]
+    fn test_cat_file_batch_prefix_keeps_session_aligned() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize()?.to_path_buf();
+
+        let big: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+        let big_oid = hash_object(&repo_path, &big)?;
+        let edge: Vec<u8> = (0..HEADER_LEN)
+            .map(u8::try_from)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let edge_oid = hash_object(&repo_path, &edge)?;
+        let small = b"tiny blob".to_vec();
+        let small_oid = hash_object(&repo_path, &small)?;
+
+        let mut batch = CatFileBatch::spawn(&repo_path)?;
+        let head = batch.blob_prefix(&big_oid, HEADER_LEN)?.unwrap();
+        assert_eq!(head, &big[..HEADER_LEN]);
+
+        let head = batch.blob_prefix(&edge_oid, HEADER_LEN)?.unwrap();
+        assert_eq!(head, edge);
+
+        // A missing object between two hits must not shift the framing.
+        assert!(
+            batch
+                .blob_prefix("0000000000000000000000000000000000000000", HEADER_LEN)?
+                .is_none()
+        );
+
+        let head = batch.blob_prefix(&small_oid, HEADER_LEN)?.unwrap();
+        assert_eq!(head, small);
+
+        // Full reads still work after all the prefix reads.
+        assert_eq!(read_full(&mut batch, &big_oid)?, Some(big));
+        assert_eq!(read_full(&mut batch, &small_oid)?, Some(small));
+        Ok(())
+    }
+
+    /// A 64-byte header that `is_ciphertext` recognizes: magic, current
+    /// version, known algorithm (1 = XChaCha20-Poly1305).
+    fn fake_ciphertext_header() -> Vec<u8> {
+        let mut header = vec![0u8; HEADER_LEN];
+        header[..5].copy_from_slice(b"GITSE");
+        header[5] = VERSION;
+        header[7] = 1;
+        header
+    }
+
+    /// The streamed migration compare must catch differences behind the
+    /// shared 64-byte header.
+    ///
+    /// One byte different late in the body (equal size), an extra tail and a
+    /// truncation all classify without landing in `to_decrypt`, while the
+    /// byte-for-byte equal copy does.
+    #[test]
+    fn test_migration_plan_streamed_compare_edges() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize()?.to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+
+        // Every variant starts as the same committed ciphertext; the edits
+        // below then diverge only the worktree copies, all behind the
+        // shared 64-byte header.
+        let mut blob = fake_ciphertext_header();
+        blob.extend((0..200u32).map(|i| (i % 251) as u8));
+
+        for name in ["same.bin", "mid.bin", "longer.bin", "shorter.bin"] {
+            std::fs::write(repo_path.join(name), &blob)?;
+            repo.conf.add_one_path_to_crypt_list(name)?;
+        }
+
+        repo.run(&["add", "same.bin", "mid.bin", "longer.bin", "shorter.bin"])?;
+        let out = Command::new("git")
+            .current_dir(&repo_path)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Worktree-only edits after the commit: one byte different late in
+        // the body (equal size), one extra tail, one truncation.
+        let mut mid = blob.clone();
+        *mid.last_mut().unwrap() ^= 0xff;
+        std::fs::write(repo_path.join("mid.bin"), &mid)?;
+        let mut longer = blob.clone();
+        longer.push(0);
+        std::fs::write(repo_path.join("longer.bin"), &longer)?;
+        std::fs::write(repo_path.join("shorter.bin"), &blob[..blob.len() - 1])?;
+
+        let plan = repo.migration_plan()?;
+        // The variants keep their ciphertext headers, so besides missing the
+        // equality they match none of the renormalize cases either.
+        assert_eq!(plan.to_decrypt, ["same.bin"]);
+        assert!(!plan.needs_renormalize);
+        Ok(())
+    }
+
+    /// A worktree path that cannot be read must classify the file as
+    /// unreadable instead of failing the whole plan, exactly like an
+    /// unopenable one.
+    ///
+    /// A directory in place of the tracked file exercises the read-failure
+    /// fold on Unix (open succeeds, the first read fails with EISDIR) and
+    /// the unopenable branch on Windows. Either way the file is skipped:
+    /// not in `to_decrypt`, but its plaintext blob still asks for
+    /// renormalize.
+    #[test]
+    fn test_migration_plan_unreadable_worktree_is_skipped() -> Result<()> {
+        let dir = init_temp_repo();
+        let repo_path = dir.path().absolutize()?.to_path_buf();
+        let mut repo = Repo::open(&repo_path)?;
+
+        // One ciphertext and one plaintext blob, each with a healthy twin
+        // that must keep classifying normally.
+        let mut cipher = fake_ciphertext_header();
+        cipher.extend(0..64u8);
+        for (name, bytes) in [
+            ("enc.bin", cipher.as_slice()),
+            ("enc_ok.bin", cipher.as_slice()),
+            ("plain.bin", b"plaintext\n".as_slice()),
+        ] {
+            std::fs::write(repo_path.join(name), bytes)?;
+            repo.conf.add_one_path_to_crypt_list(name)?;
+        }
+
+        repo.run(&["add", "enc.bin", "enc_ok.bin", "plain.bin"])?;
+        let out = Command::new("git")
+            .current_dir(&repo_path)
+            .args([
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "init",
+            ])
+            .output()?;
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // Replace one file of each blob kind by a directory.
+        for name in ["enc.bin", "plain.bin"] {
+            std::fs::remove_file(repo_path.join(name))?;
+            std::fs::create_dir(repo_path.join(name))?;
+        }
+
+        let plan = repo.migration_plan()?;
+        assert_eq!(plan.to_decrypt, ["enc_ok.bin"]);
+        // The unreadable plaintext blob keeps the renormalize hint.
+        assert!(plan.needs_renormalize);
+        Ok(())
     }
 
     #[test]
