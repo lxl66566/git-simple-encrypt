@@ -14,6 +14,11 @@ pub mod repo;
 pub mod salt_cache;
 pub mod utils;
 
+// cargo-fuzz builds with `--cfg fuzzing`; the support surface lives here so
+// fuzz targets drive the real engines without widening the shipped API.
+#[cfg(fuzzing)]
+pub mod fuzzing;
+
 #[cfg(feature = "bin")]
 pub use crate::cli::{Cli, InstallMode, SetField, SubCommand};
 #[cfg(feature = "bin")]

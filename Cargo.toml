@@ -92,6 +92,9 @@ wildcard_imports        = "allow"
 # unsafe code must justify itself locally with #[allow(unsafe_code)].
 unsafe_code           = "deny"
 unused_qualifications = "warn"
+# cargo-fuzz builds with `--cfg fuzzing` for the support surface in
+# src/fuzzing.rs.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [profile.release]
 opt-level     = 3

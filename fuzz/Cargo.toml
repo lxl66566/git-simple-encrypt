@@ -1,0 +1,52 @@
+[package]
+name = "git-simple-encrypt-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+libfuzzer-sys = "0.4"
+path-absolutize = "4"
+tempfile = "3"
+
+[dev-dependencies]
+# Seed generation serializes a small valid cache via the same rkyv major the
+# library uses.
+rkyv = "0.8"
+
+[dependencies.git-simple-encrypt]
+path = ".."
+
+[[bin]]
+name = "roundtrip_encrypt_decrypt"
+path = "fuzz_targets/roundtrip_encrypt_decrypt.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decrypt_arbitrary"
+path = "fuzz_targets/decrypt_arbitrary.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "process_filter_session"
+path = "fuzz_targets/process_filter_session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "salt_cache_parse"
+path = "fuzz_targets/salt_cache_parse.rs"
+test = false
+doc = false
+bench = false

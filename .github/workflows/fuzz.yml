@@ -1,0 +1,35 @@
+name: Fuzz
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src/**
+      - fuzz/**
+      - .github/workflows/fuzz.yml
+
+jobs:
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cargo-bins/cargo-binstall@main
+      - run: cargo binstall -y cargo-fuzz
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build fuzz targets
+        working-directory: fuzz
+        run: cargo fuzz build
+      - name: Smoke-run every target
+        working-directory: fuzz
+        run: |
+          for t in roundtrip_encrypt_decrypt decrypt_arbitrary process_filter_session salt_cache_parse; do
+            timeout 300 cargo fuzz run "$t" -- -max_total_time=90 -rss_limit_mb=2560
+          done
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

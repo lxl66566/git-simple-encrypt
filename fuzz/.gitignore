@@ -1,0 +1,7 @@
+target
+corpus
+artifacts
+coverage
+fuzzlog
+tmp-host
+/report-*.md

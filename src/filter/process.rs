@@ -92,6 +92,30 @@ const fn session_fatal(e: &Error) -> bool {
     matches!(e, Error::Argon2(_))
 }
 
+/// Session engine over caller-provided streams with a caller-owned context.
+///
+/// `serve_io` wraps this with a fresh [`FilterContext`] per git operation;
+/// fuzz targets keep one context alive across sessions to amortize the
+/// password fetch and the Argon2 key cache.
+pub fn run_session<R: Read, W: Write>(ctx: &FilterContext<'_>, input: R, output: W) -> Result<()> {
+    // 4-byte prefix reads must not hit the raw pipe per packet.
+    let mut input = BufReader::with_capacity(64 * 1024, input);
+    // Room for one maximum packet, so a whole packet is one syscall; flushed
+    // after every complete response (git synchronously waits for it).
+    let mut output = BufWriter::with_capacity(pktline::MAX_PAYLOAD + 64, output);
+
+    handshake(&mut input, &mut output)?;
+    let mut scratch = SessionScratch::default();
+    let result = command_loop(ctx, &mut input, &mut output, &mut scratch);
+    // Flush the staged smudge records at every session end: normal EOF, a
+    // sent abort, or an error bubbling out of the loop all pass here (a
+    // handshake failure returns above, before anything can be staged).
+    // Explicit on every path — release builds abort on panic, so no
+    // Drop-based fallback exists.
+    ctx.flush_records();
+    result
+}
+
 /// Entry point of the `git-se filter-process` subcommand: serve the process
 /// filter protocol on stdin/stdout until git closes the pipe.
 pub fn serve(repo: &Repo) -> Result<()> {
@@ -101,23 +125,8 @@ pub fn serve(repo: &Repo) -> Result<()> {
 /// Protocol engine over arbitrary streams, so tests can drive a full session
 /// in-process.
 pub fn serve_io<R: Read, W: Write>(repo: &Repo, input: R, output: W) -> Result<()> {
-    // 4-byte prefix reads must not hit the raw pipe per packet.
-    let mut input = BufReader::with_capacity(64 * 1024, input);
-    // Room for one maximum packet, so a whole packet is one syscall; flushed
-    // after every complete response (git synchronously waits for it).
-    let mut output = BufWriter::with_capacity(pktline::MAX_PAYLOAD + 64, output);
-
-    handshake(&mut input, &mut output)?;
     let ctx = FilterContext::new(repo, SaltSource::Process);
-    let mut scratch = SessionScratch::default();
-    let result = command_loop(&ctx, &mut input, &mut output, &mut scratch);
-    // Flush the staged smudge records at every session end: normal EOF, a
-    // sent abort, or an error bubbling out of the loop all pass here (a
-    // handshake failure returns above, before anything can be staged).
-    // Explicit on every path — release builds abort on panic, so no
-    // Drop-based fallback exists.
-    ctx.flush_records();
-    result
+    run_session(&ctx, input, output)
 }
 
 /// Version and capability negotiation (the only version is 2; the reply must
