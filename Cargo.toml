@@ -50,10 +50,9 @@ rkyv                  = "0.8"
 serde                 = { version = "1", features = ["derive"] }
 tempfile              = "3.26.0"
 thiserror             = "2"
-# Under --all-features cargo reports this as unused: rayon-backend cfg-swaps
-# the parallel backend away. The lint cannot model mutually exclusive
-# features; keep the dependency (it is the default backend).
-youpipe               = { version = "0.8", default-features = false }
+# Parallel backend, cfg-selected in src/utils/parallel.rs; enabled via the
+# default `youpipe-backend` feature.
+youpipe               = { version = "0.8", default-features = false, optional = true }
 zeroize               = "1.9"
 zstdx                 = "0.3"
 
@@ -64,18 +63,22 @@ colored = "3"
 tap     = "1"
 
 [features]
-default       = ["bin", "colored", "progress"]
+default         = ["bin", "colored", "progress", "youpipe-backend"]
 ## Enable the `git-se` binary: CLI parsing (`clap`) and logger initialization
 ## (`pretty_env_logger`). Disable for a leaner library-only build.
-bin           = ["dep:clap", "dep:pretty_env_logger"]
+bin             = ["dep:clap", "dep:pretty_env_logger"]
 ## Colored terminal output using `colored` crate. Disable for environments
 ## that do not support ANSI escape codes (e.g. CI logs, GUI apps).
-colored       = ["dep:colored"]
+colored         = ["dep:colored"]
 ## Use `indicatif` progress bars during repo-wide encrypt/decrypt/check. When
 ## disabled, progress is reported via plain `log`/`println!` instead.
-progress      = ["dep:indicatif"]
+progress        = ["dep:indicatif"]
 ## Use rayon instead of youpipe as the parallel backend (for A/B benchmarking).
-rayon-backend = ["dep:rayon"]
+## Features are additive, so combine with `--no-default-features` to keep
+## youpipe out of the build. Takes precedence over youpipe when both are on.
+rayon-backend   = ["dep:rayon"]
+## Use youpipe as the parallel backend (default).
+youpipe-backend = ["dep:youpipe"]
 
 [lints.clippy]
 all                     = { level = "warn", priority = -1 }
@@ -88,13 +91,13 @@ pedantic                = { level = "warn", priority = -1 }
 wildcard_imports        = "allow"
 
 [lints.rust]
+# cargo-fuzz builds with `--cfg fuzzing` for the support surface in
+# src/fuzzing.rs.
+unexpected_cfgs       = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
 # Unsafe is allowed only at the audited spots (repr(C) header casts); new
 # unsafe code must justify itself locally with #[allow(unsafe_code)].
 unsafe_code           = "deny"
 unused_qualifications = "warn"
-# cargo-fuzz builds with `--cfg fuzzing` for the support surface in
-# src/fuzzing.rs.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }
 
 [profile.release]
 opt-level     = 3
