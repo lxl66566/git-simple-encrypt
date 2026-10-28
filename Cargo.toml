@@ -1,6 +1,6 @@
 [package]
 name         = "git-simple-encrypt"
-version      = "3.1.1"
+version      = "3.1.2"
 edition      = "2024"
 rust-version = "1.89"
 description  = "Encrypt/decrypt files in your git repo using only one password"
@@ -9,16 +9,7 @@ repository   = "https://github.com/lxl66566/git-simple-encrypt"
 license      = "MIT"
 keywords     = ["encryption", "git"]
 categories   = ["cryptography"]
-exclude      = [
-  ".gitattributes",
-  ".github",
-  ".tombi.toml",
-  "AGENTS.md",
-  "clippy.toml",
-  "docs",
-  "git_simple_encrypt.toml",
-  "rustfmt.toml"
-]
+include      = ["LICENSE", "src/", "tests/"]
 
 [lib]
 path = "src/lib.rs"
@@ -41,7 +32,7 @@ blake3                = "1"
 chacha20poly1305-simd = { version = "0.3", features = ["zeroize"] }
 clap                  = { version = "4.6", features = ["derive"], optional = true }
 colored               = { version = "3", optional = true }
-config-file2          = "0.7"
+config-file2          = "0.8"
 const-str             = "1"
 copy-metadata         = "0.3"
 dashmap               = "6"
@@ -49,7 +40,7 @@ fuck-backslash        = "0.1"
 ignore                = { version = "0.4", features = ["simd-accel"] }
 indicatif             = { version = "0.18", optional = true }
 log                   = "0.4"
-parking_lot           = "0.12.5"
+parking_lot           = "0.13"
 path-absolutize       = "4"
 pathdiff              = "0.2"
 pretty_env_logger     = { version = "0.5", optional = true }
@@ -62,9 +53,9 @@ thiserror             = "2"
 # Under --all-features cargo reports this as unused: rayon-backend cfg-swaps
 # the parallel backend away. The lint cannot model mutually exclusive
 # features; keep the dependency (it is the default backend).
-youpipe               = { version = "0.6", default-features = false }
+youpipe               = { version = "0.8", default-features = false }
 zeroize               = "1.9"
-zstdx                 = "0.2"
+zstdx                 = "0.3"
 
 [dev-dependencies]
 anyhow  = "1.0"
