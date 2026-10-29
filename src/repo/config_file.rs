@@ -72,11 +72,7 @@ impl Repo {
     fn local_config_file(&self) -> Result<PathBuf> {
         let out = self.run_with_output(&["rev-parse", "--git-path", "config"])?;
         let path = PathBuf::from(out.trim());
-        Ok(if path.is_absolute() {
-            path
-        } else {
-            self.path.join(path)
-        })
+        Ok(if path.is_absolute() { path } else { self.path.join(path) })
     }
 
     /// Write to an unprefixed git config key (e.g. `filter.git-se.clean`) in

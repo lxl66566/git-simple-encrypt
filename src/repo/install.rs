@@ -96,11 +96,7 @@ impl Repo {
     /// the plan (absent when there is no key to decrypt with).
     fn analyze_install_migration(&self) -> Result<(bool, Option<MigrationPlan>)> {
         let has_key = self.get_key().is_ok();
-        let plan = if has_key {
-            Some(self.migration_plan()?)
-        } else {
-            None
-        };
+        let plan = if has_key { Some(self.migration_plan()?) } else { None };
         if let Some(plan) = &plan
             && !plan.to_decrypt.is_empty()
             && self.has_staged_changes(&plan.to_decrypt)?

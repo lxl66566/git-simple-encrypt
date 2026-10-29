@@ -205,7 +205,11 @@ impl<'a> FilterContext<'a> {
                     // the manual e/d path (Error::EmptyKey) instead of
                     // encrypting with a near-zero-security password.
                     .and_then(|key| {
-                        if key.is_empty() { Err(Error::EmptyKey) } else { Ok(key) }
+                        if key.is_empty() {
+                            Err(Error::EmptyKey)
+                        } else {
+                            Ok(key)
+                        }
                     })
                     .map_err(|e| e.to_string())
             })

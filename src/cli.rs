@@ -230,11 +230,7 @@ fn validate_zstd_level(value: &str) -> Result<u8, String> {
     let value = value
         .parse::<u8>()
         .map_err(|_| "value should be a number")?;
-    if (1..=22_u8).contains(&value) {
-        Ok(value)
-    } else {
-        Err("value should be 1-22".to_string())
-    }
+    if (1..=22_u8).contains(&value) { Ok(value) } else { Err("value should be 1-22".to_string()) }
 }
 
 fn validate_bool(value: &str) -> Result<bool, String> {

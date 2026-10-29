@@ -185,11 +185,7 @@ pub fn without_managed_block_bytes(content: &[u8]) -> Vec<u8> {
     };
     // One byte of the "\n\n" separator before an appended block goes with
     // the block, keeping the user's own trailing blank line intact.
-    let prefix_end = if content[..start].ends_with(b"\n\n") {
-        start - 1
-    } else {
-        start
-    };
+    let prefix_end = if content[..start].ends_with(b"\n\n") { start - 1 } else { start };
     let mut out = Vec::with_capacity(prefix_end + (content.len() - end));
     out.extend_from_slice(&content[..prefix_end]);
     out.extend_from_slice(&content[end..]);

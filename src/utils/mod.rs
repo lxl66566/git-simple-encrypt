@@ -212,11 +212,7 @@ fn repo_walk_root(path: &Path, repo_root: &Path) -> Option<PathBuf> {
 /// Join a repo-relative path (possibly empty, meaning the root itself)
 /// back onto `repo_root` without relying on `join("")` semantics.
 fn join_repo_relative(repo_root: &Path, relative: &Path) -> PathBuf {
-    if relative.as_os_str().is_empty() {
-        repo_root.to_path_buf()
-    } else {
-        repo_root.join(relative)
-    }
+    if relative.as_os_str().is_empty() { repo_root.to_path_buf() } else { repo_root.join(relative) }
 }
 
 /// Collect all regular files under `roots` (recursively for directories).
@@ -776,11 +772,7 @@ mod tests {
 
     #[test]
     fn test_path_relative_to() {
-        let root = if cfg!(windows) {
-            PathBuf::from("C:\\repo")
-        } else {
-            PathBuf::from("/repo")
-        };
+        let root = if cfg!(windows) { PathBuf::from("C:\\repo") } else { PathBuf::from("/repo") };
         let outside = if cfg!(windows) {
             PathBuf::from("D:\\elsewhere")
         } else {

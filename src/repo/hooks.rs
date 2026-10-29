@@ -133,21 +133,13 @@ impl Repo {
             let local = local.trim();
             if !local.is_empty() {
                 let path = PathBuf::from(local);
-                let dir = if path.is_absolute() {
-                    path
-                } else {
-                    self.path.join(path)
-                };
+                let dir = if path.is_absolute() { path } else { self.path.join(path) };
                 return Ok((dir, false));
             }
         }
         let common = self.run_with_output(&["rev-parse", "--git-common-dir"])?;
         let path = PathBuf::from(common.trim());
-        let dir = if path.is_absolute() {
-            path
-        } else {
-            self.path.join(path)
-        };
+        let dir = if path.is_absolute() { path } else { self.path.join(path) };
         Ok((dir.join("hooks"), foreign))
     }
 }

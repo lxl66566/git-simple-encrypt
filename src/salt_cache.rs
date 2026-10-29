@@ -141,11 +141,7 @@ fn resolve_git_dir(repo_path: &Path) -> PathBuf {
         let target = Path::new(target.trim());
         // The target is the per-worktree gitdir, e.g.
         // `<main>/.git/worktrees/<name>` or `<parent>/.git/modules/<name>`.
-        return if target.is_absolute() {
-            target.to_path_buf()
-        } else {
-            repo_path.join(target)
-        };
+        return if target.is_absolute() { target.to_path_buf() } else { repo_path.join(target) };
     }
     // Not a directory and not a parseable pointer: keep the legacy location
     // so behavior degrades exactly as before (writes fail loudly in logs).
