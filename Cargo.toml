@@ -54,7 +54,7 @@ thiserror             = "2"
 # default `youpipe-backend` feature.
 youpipe               = { version = "0.8", default-features = false, optional = true }
 zeroize               = "1.9"
-zstdx                 = "0.3"
+zstdx                 = "0.4"
 
 [dev-dependencies]
 anyhow  = "1.0"
