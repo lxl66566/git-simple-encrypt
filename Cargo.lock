@@ -736,9 +736,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.34"
+version = "0.4.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
+checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "loom"
@@ -1574,10 +1574,11 @@ checksum = "cfe53a6657fd280eaa890a3bc59152892ffa3e30101319d168b781ed6529b049"
 
 [[package]]
 name = "youpipe"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da6172a3a79701448e8f89c52d71f7f295f94ceac473053626a1db330618f097"
+checksum = "71dc733423e37a00cc8fef8d4938135f59caa633512e74f89a41d7d5d4354709"
 dependencies = [
+ "futures-util",
  "loom",
  "youpipe-concurrent-queue",
  "youpipe-crossfire",
@@ -1587,9 +1588,9 @@ dependencies = [
 
 [[package]]
 name = "youpipe-concurrent-queue"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf5b26bf8f49d4ce3ac5ed7ebdafe82853276b71bbcee3c8de86219caea9fc53"
+checksum = "423345b25caf3d90e648a54c9533a0943a97f951a94f79742dfb410e6dd6cae8"
 dependencies = [
  "crossbeam-utils",
  "loom",
@@ -1597,9 +1598,9 @@ dependencies = [
 
 [[package]]
 name = "youpipe-crossfire"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e55e21aff9478cb88dc2c530a5ddf3728f02af16a1a5914a1dbca98be2f51d3"
+checksum = "6db4ced2455386f9f9d56024fc7096f0763e5a99387cd1ab2069994cc5e7f1f7"
 dependencies = [
  "crossbeam-utils",
  "futures-core",
@@ -1610,9 +1611,9 @@ dependencies = [
 
 [[package]]
 name = "youpipe-st3"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08d87d6539d2bafd14afe1fb8fc030b0a47ad1846a2d3d86e7ddae4cbe0f3f9d"
+checksum = "dc5c9eadd5b0c1d7bd4b7e28c8e2308f4b5a50d45422c26467533cfb516cb9c7"
 dependencies = [
  "crossbeam-utils",
  "loom",
@@ -1620,9 +1621,9 @@ dependencies = [
 
 [[package]]
 name = "youpipe-sys"
-version = "0.8.0"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "109c1c2a56c0e95456f465f4792b6c9b83541ef1ea043ebc8acf0dbfe59a693f"
+checksum = "2376e89315155486fdf862698d11656d7478a68ca8d2f63035629901296dadc3"
 dependencies = [
  "libc",
  "loom",
@@ -1637,9 +1638,9 @@ checksum = "e13084392c5e4bc371903e2935a5eaeed24905a7511356b883835e18a78f6879"
 
 [[package]]
 name = "zstdx"
-version = "0.3.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ec584fd342b3f18d0d516e3d6d6ad081464ea5ca3b89b81122d9912d0b501a3"
+checksum = "0a7c29f10ef44c979c53c1de6cb89701f7f54c63dbaed950761462ae9880f0aa"
 dependencies = [
  "libc",
  "thiserror",

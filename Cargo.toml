@@ -52,9 +52,9 @@ tempfile              = "3.26.0"
 thiserror             = "2"
 # Parallel backend, cfg-selected in src/utils/parallel.rs; enabled via the
 # default `youpipe-backend` feature.
-youpipe               = { version = "0.8", default-features = false, optional = true }
+youpipe               = { version = "0.9", default-features = false, optional = true }
 zeroize               = "1.9"
-zstdx                 = "0.3"
+zstdx                 = "0.5"
 
 [dev-dependencies]
 anyhow  = "1.0"
