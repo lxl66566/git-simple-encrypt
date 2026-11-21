@@ -1,7 +1,6 @@
 use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
-use fuck_backslash::FuckBackslash;
 use log::warn;
 use pathdiff::diff_paths;
 use rand::prelude::Rng;
@@ -17,13 +16,15 @@ use crate::{
     error::{Error, Result},
     repo::Repo,
     salt_cache::{self, CacheRef},
-    utils::{Progress, print_post_report, print_pre_report, resolve_target_files},
+    utils::{
+        Progress, normalize_separators, print_post_report, print_pre_report, resolve_target_files,
+    },
 };
 
 /// Compute a repo-relative cache key from a file path.
 ///
-/// Separators are normalized to `/` (via the same `fuck_backslash` helper the
-/// crypt list uses) so the raw-byte key stays consistent across platforms.
+/// Separators are normalized to `/` on Windows (see [`normalize_separators`])
+/// so the raw-byte key stays consistent across platforms.
 #[must_use]
 pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     let relative = if file_path.is_absolute() {
@@ -31,8 +32,7 @@ pub fn cache_key(file_path: &Path, repo_path: &Path) -> Vec<u8> {
     } else {
         file_path.to_path_buf()
     };
-    relative
-        .fuck_backslash()
+    normalize_separators(relative)
         .into_os_string()
         .into_encoded_bytes()
 }

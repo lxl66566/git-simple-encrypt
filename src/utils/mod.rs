@@ -11,6 +11,7 @@ use std::{
     sync::mpsc,
 };
 
+use fuck_backslash::FuckBackslash;
 use ignore::{WalkBuilder, WalkState, gitignore::gitconfig_excludes_path};
 use log::warn;
 use path_absolutize::Absolutize as _;
@@ -117,7 +118,7 @@ pub enum PathRelativeTo {
 /// layered on top of this function.
 #[must_use]
 pub fn path_relative_to(path: &Path, repo_root: &Path) -> PathRelativeTo {
-    let absolute = path.absolutize_from(repo_root);
+    let absolute = path.absolutize_from(repo_root).into_owned();
     // A different root component (e.g. another drive on Windows) can never
     // be expressed relative to the repo, and `diff_paths` silently mangles
     // such pairs into a path without a leading `..` — reject them up front.
@@ -125,18 +126,29 @@ pub fn path_relative_to(path: &Path, repo_root: &Path) -> PathRelativeTo {
         && repo_root.is_absolute()
         && absolute.components().next() != repo_root.components().next()
     {
-        return PathRelativeTo::Outside(absolute.into_owned());
+        return PathRelativeTo::Outside(absolute);
     }
-    diff_paths(absolute.as_ref(), repo_root).map_or_else(
+    diff_paths(&absolute, repo_root).map_or_else(
         // Unexpressible relation (e.g. mixed absolute/relative inputs).
-        || PathRelativeTo::Outside(absolute.into_owned()),
+        || PathRelativeTo::Outside(absolute.clone()),
         |relative| match relative.components().next() {
             // diff_paths yields an empty path only when both sides are equal.
             None => PathRelativeTo::Root,
+            // An absolute escape keeps its absolute form (`/elsewhere`, not
+            // `../elsewhere`).
+            Some(Component::ParentDir) if path.is_absolute() => {
+                PathRelativeTo::Outside(absolute.clone())
+            },
             Some(Component::ParentDir) => PathRelativeTo::Outside(relative),
             Some(_) => PathRelativeTo::Inside(relative),
         },
     )
+}
+
+/// Normalize Windows `\` separators to `/`; a no-op on other platforms,
+/// where `\` is a legal filename byte.
+pub(crate) fn normalize_separators(path: PathBuf) -> PathBuf {
+    if cfg!(windows) { path.fuck_backslash() } else { path }
 }
 
 /// Whether `path` equals `ancestor` or lies underneath it.

@@ -863,9 +863,15 @@ mod tests {
             assert_eq!(reader.get(b"foo.txt"), None);
         }
 
-        // resolve_or_insert also converges spellings on the same entry
+        // resolve_or_insert also converges spellings on the same entry;
+        // case-sensitive platforms treat the spelling as a new file and
+        // keep the candidate.
         let candidate = make_entry(0x33, 0x44);
-        let resolved = resolve_or_insert(repo, b"foo.TXT", candidate);
-        assert_eq!(resolved, entry);
+        let resolved = resolve_or_insert(repo, b"foo.TXT", candidate.clone());
+        if CASE_INSENSITIVE_FS {
+            assert_eq!(resolved, entry);
+        } else {
+            assert_eq!(resolved, candidate);
+        }
     }
 }

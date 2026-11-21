@@ -1,13 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use config_file2::Storable;
-use fuck_backslash::FuckBackslash;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
 use crate::{
     error::{Error, Result},
-    utils::{PathRelativeTo, has_git_component, path_relative_to, style::Colorize},
+    utils::{
+        PathRelativeTo, has_git_component, normalize_separators, path_relative_to, style::Colorize,
+    },
 };
 
 pub const CONFIG_FILE_NAME: &str = concat!(env!("CARGO_CRATE_NAME"), ".toml");
@@ -124,7 +125,7 @@ impl Config {
         debug!("adding path to crypt list: {}", path.display());
         match path_relative_to(path, &self.repo_path) {
             PathRelativeTo::Outside(offending) => {
-                Err(Error::PathNotRelative(offending.fuck_backslash()))
+                Err(Error::PathNotRelative(normalize_separators(offending)))
             },
             PathRelativeTo::Root => Err(Error::Other(format!(
                 "refusing to add `{}`: the repository root itself cannot go on the crypt list; \
@@ -154,7 +155,9 @@ impl Config {
                          would make every later command (including decrypt) fail to load it",
                     )));
                 }
-                let path_str = relative.fuck_backslash().to_string_lossy().into_owned();
+                let path_str = normalize_separators(relative)
+                    .to_string_lossy()
+                    .into_owned();
                 // Entries are stored as repo-relative `/`-separated lossy strings;
                 // compare in exactly that form so a path never enters the list twice
                 // (duplicates would inflate the skip count and dirty the config).
