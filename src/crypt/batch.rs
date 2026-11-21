@@ -5,10 +5,7 @@
 //! succeeded/skipped/failed accounting instead of per-caller hand-rolled
 //! counters).
 
-use std::{
-    path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
 use rand::Rng;
@@ -20,7 +17,7 @@ use crate::{
         key::{KeyCache, KeyDerivation},
     },
     error::{Error, Result},
-    utils::{Progress, parallel},
+    utils::{FileOutcome, Progress, parallel},
 };
 
 /// Summary of a batch encrypt/decrypt run.
@@ -40,31 +37,40 @@ impl BatchSummary {
     }
 }
 
-/// Run `op` over `files` in parallel and tally per-file outcomes into a
-/// [`BatchSummary`].
+/// Run `op` over `files` in parallel and tally per-file outcomes.
+///
+/// Returns the [`BatchSummary`] tally plus one `(path, outcome)` record per
+/// non-failure file (the outcome records feeding the directory-level
+/// report; failures live in `errors` with full context). The tally is
+/// derived from those records, keeping one source of truth.
 ///
 /// Outcome mapping: `Ok(Some(_))` counts as succeeded, `Ok(None)` as skipped,
 /// `Err` as failed and is recorded with its file path. `progress`, when given,
 /// is advanced exactly once per file regardless of outcome.
-pub(super) fn run_batch<T, F>(files: &[PathBuf], progress: Option<&Progress>, op: F) -> BatchSummary
+pub(super) fn run_batch<T, F>(
+    files: &[PathBuf],
+    progress: Option<&Progress>,
+    op: F,
+) -> (BatchSummary, Vec<(PathBuf, FileOutcome)>)
 where
     F: Fn(&Path) -> Result<Option<T>> + Sync,
 {
-    let succeeded = AtomicUsize::new(0);
-    let skipped = AtomicUsize::new(0);
     let errors: parking_lot::Mutex<Vec<(PathBuf, Error)>> = parking_lot::Mutex::new(Vec::new());
+    let outcomes: parking_lot::Mutex<Vec<(PathBuf, FileOutcome)>> =
+        parking_lot::Mutex::new(Vec::new());
 
     parallel::for_each(files, |path| {
-        match op(path) {
-            Ok(Some(_)) => {
-                succeeded.fetch_add(1, Ordering::Relaxed);
-            },
-            Ok(None) => {
-                skipped.fetch_add(1, Ordering::Relaxed);
-            },
+        // None = failure, already recorded in `errors` with its path.
+        let outcome = match op(path) {
+            Ok(Some(_)) => Some(FileOutcome::Transformed),
+            Ok(None) => Some(FileOutcome::PassedThrough),
             Err(e) => {
                 errors.lock().push((path.clone(), e));
+                None
             },
+        };
+        if let Some(outcome) = outcome {
+            outcomes.lock().push((path.clone(), outcome));
         }
         if let Some(pb) = progress {
             pb.inc(1);
@@ -72,13 +78,19 @@ where
     });
 
     let errors = errors.into_inner();
-    BatchSummary {
+    let outcomes = outcomes.into_inner();
+    let succeeded = outcomes
+        .iter()
+        .filter(|(_, o)| *o == FileOutcome::Transformed)
+        .count();
+    let summary = BatchSummary {
         total: files.len(),
-        succeeded: succeeded.load(Ordering::Relaxed),
-        skipped: skipped.load(Ordering::Relaxed),
+        succeeded,
+        skipped: outcomes.len() - succeeded,
         failed: errors.len(),
         errors,
-    }
+    };
+    (summary, outcomes)
 }
 
 /// Decrypt multiple files in parallel, each to a caller-determined destination.
@@ -98,7 +110,7 @@ where
         .collect();
 
     let key_cache: KeyCache = DashMap::new();
-    run_batch(&sources, None, |src| {
+    let (summary, _) = run_batch(&sources, None, |src| {
         let Some(dst) = mapper(src) else {
             return Ok(None);
         };
@@ -109,7 +121,8 @@ where
             KeyDerivation::Shared(&key_cache),
             None,
         )
-    })
+    });
+    summary
 }
 
 /// Encrypt multiple files in parallel, each from a caller-determined source to
@@ -138,10 +151,11 @@ where
     rand::rng().fill_bytes(&mut batch_salt);
     let derived_key = crate::crypt::key::derive_key(master_key, &batch_salt)?;
 
-    Ok(run_batch(&sources, None, |src| {
+    let (summary, _) = run_batch(&sources, None, |src| {
         let Some(dst) = mapper(src) else {
             return Ok(None);
         };
         encrypt_file_to(src, &dst, &derived_key, batch_salt, None, zstd)
-    }))
+    });
+    Ok(summary)
 }

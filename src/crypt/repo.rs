@@ -17,7 +17,8 @@ use crate::{
     repo::Repo,
     salt_cache::{self, CacheRef},
     utils::{
-        Progress, normalize_separators, print_post_report, print_pre_report, resolve_target_files,
+        DirReport, FileOutcome, Progress, ReportAction, ReportMode, normalize_separators,
+        print_pre_report, resolve_target_files,
     },
 };
 
@@ -48,11 +49,24 @@ fn with_file_context(action: &str, file: &Path, e: Error) -> Error {
     }
 }
 
-/// Report a completed run: post-report line, every per-file failure logged
-/// (messages already embed the file path), and the first failure surfaced as
-/// the return value.
-fn report_summary(action: &str, summary: BatchSummary) -> Result<()> {
-    print_post_report(action, summary.total, summary.skipped, summary.failed);
+/// Report a completed run and surface the first failure.
+///
+/// Prints the result report (directory summary, or every file under
+/// `verbose`), logs every per-file failure (messages already embed the
+/// file path), and returns the first failure.
+fn report_summary(
+    action: ReportAction,
+    summary: BatchSummary,
+    outcomes: &[(PathBuf, FileOutcome)],
+    repo_root: &Path,
+    mode: ReportMode,
+) -> Result<()> {
+    let mut report = DirReport::default();
+    for (path, outcome) in outcomes {
+        report.record(path, *outcome);
+    }
+    report.record_failures(summary.errors.len());
+    report.print(action, repo_root, mode);
 
     for (_, e) in &summary.errors {
         warn!("{e}");
@@ -66,6 +80,11 @@ fn report_summary(action: &str, summary: BatchSummary) -> Result<()> {
 
 /// Encrypt given files in the repo.
 pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
+    encrypt_reported(repo, paths, ReportMode::Summary)
+}
+
+/// [`encrypt_repo`] with control over the result report's verbosity.
+pub fn encrypt_reported(repo: &Repo, paths: &[PathBuf], mode: ReportMode) -> Result<()> {
     let key = repo.get_key()?;
     if key.is_empty() {
         return Err(Error::EmptyKey);
@@ -76,7 +95,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         return Err(Error::NoFile("encrypt"));
     }
 
-    print_pre_report("Encrypting", &target_files, repo.path());
+    print_pre_report(ReportAction::Encrypt, target_files.len());
 
     let reader = salt_cache::SaltCacheReader::load(repo.path());
     let (sender, saver) = salt_cache::create_writer(repo.path());
@@ -87,7 +106,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     let pb = Progress::new(target_files.len(), "Encrypt");
 
-    let summary = run_batch(&target_files, Some(&pb), |f| {
+    let (summary, outcomes) = run_batch(&target_files, Some(&pb), |f| {
         let relative_key = cache_key(f, repo.path());
         // On a miss, mint the pair but do NOT persist it up front: what
         // belongs in the cache is decided by `encrypt_file_impl` from the
@@ -127,7 +146,7 @@ pub fn encrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     pb.finish_and_clear();
 
-    report_summary("Encrypt", summary)
+    report_summary(ReportAction::Encrypt, summary, &outcomes, repo.path(), mode)
 }
 
 /// Files per parallel decrypt chunk; also the interval between the first
@@ -172,6 +191,11 @@ impl CheckpointSchedule {
 
 /// Decrypt given files in the repo.
 pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
+    decrypt_reported(repo, paths, ReportMode::Summary)
+}
+
+/// [`decrypt_repo`] with control over the result report's verbosity.
+pub fn decrypt_reported(repo: &Repo, paths: &[PathBuf], mode: ReportMode) -> Result<()> {
     let key = repo.get_key()?;
     if key.is_empty() {
         return Err(Error::EmptyKey);
@@ -182,7 +206,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         return Err(Error::NoFile("decrypt"));
     }
 
-    print_pre_report("Decrypting", &target_files, repo.path());
+    print_pre_report(ReportAction::Decrypt, target_files.len());
 
     let key_cache: KeyCache = DashMap::new();
     let (sender, mut saver) = salt_cache::create_writer(repo.path());
@@ -193,12 +217,13 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         total: target_files.len(),
         ..BatchSummary::default()
     };
+    let mut outcomes: Vec<(PathBuf, FileOutcome)> = Vec::new();
     let mut schedule = CheckpointSchedule {
         next: DECRYPT_CHECKPOINT_EVERY,
     };
     let mut processed = 0;
     for chunk in target_files.chunks(DECRYPT_CHECKPOINT_EVERY) {
-        let part = run_batch(chunk, Some(&pb), |f| {
+        let (part, part_outcomes) = run_batch(chunk, Some(&pb), |f| {
             let relative_key = cache_key(f, repo.path());
 
             decrypt_file_impl(
@@ -216,6 +241,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
         summary.succeeded += part.succeeded;
         summary.skipped += part.skipped;
         summary.errors.extend(part.errors);
+        outcomes.extend(part_outcomes);
         processed += chunk.len();
         if schedule.checkpoint_due(processed) {
             saver.checkpoint();
@@ -228,7 +254,7 @@ pub fn decrypt_repo(repo: &Repo, paths: &[PathBuf]) -> Result<()> {
 
     pb.finish_and_clear();
 
-    report_summary("Decrypt", summary)
+    report_summary(ReportAction::Decrypt, summary, &outcomes, repo.path(), mode)
 }
 
 #[cfg(test)]

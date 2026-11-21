@@ -36,7 +36,7 @@
 use std::{
     fs::File,
     io::{self, BufReader, BufWriter, Cursor, Read, Seek, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use log::error;
@@ -46,6 +46,7 @@ use crate::{
     crypt::cache_key,
     error::{Error, Result},
     repo::Repo,
+    utils::{DirReport, FileOutcome, ReportAction},
 };
 
 /// What the session does after one handled request.
@@ -92,12 +93,72 @@ const fn session_fatal(e: &Error) -> bool {
     matches!(e, Error::Argon2(_))
 }
 
+/// Per-direction outcome tallies of one filter session.
+///
+/// Rendered as one stderr line per active direction when the session ends
+/// cleanly: stdout carries protocol bytes only, and a non-tty stderr means
+/// a script or CI pipeline whose output must stay parseable (opting back
+/// in is `RUST_LOG=info`, which also shows the per-file lines).
+#[derive(Default)]
+pub struct SessionStats {
+    clean: DirReport,
+    smudge: DirReport,
+    /// An abort was sent: git discards the whole operation, so the partial
+    /// tallies would mislead.
+    aborted: bool,
+}
+
+impl SessionStats {
+    fn record(&mut self, command: Command, path: &Path, outcome: FileOutcome) {
+        match command {
+            Command::Clean => &mut self.clean,
+            Command::Smudge => &mut self.smudge,
+        }
+        .record(path, outcome);
+    }
+
+    const fn record_failure(&mut self, command: Command) {
+        match command {
+            Command::Clean => &mut self.clean,
+            Command::Smudge => &mut self.smudge,
+        }
+        .record_failure();
+    }
+
+    const fn mark_aborted(&mut self) {
+        self.aborted = true;
+    }
+
+    /// Print the one-line-per-direction summary; silent when aborted, when
+    /// nothing was served, or when stderr is not a terminal.
+    fn print_stderr_summary(&self, repo_root: &Path) {
+        use std::io::IsTerminal as _;
+
+        if self.aborted || !io::stderr().is_terminal() {
+            return;
+        }
+        for (report, action) in [
+            (&self.clean, ReportAction::Encrypt),
+            (&self.smudge, ReportAction::Decrypt),
+        ] {
+            if !report.is_empty() {
+                eprintln!("git-se: {}", report.inline(action, repo_root));
+            }
+        }
+    }
+}
+
 /// Session engine over caller-provided streams with a caller-owned context.
 ///
 /// `serve_io` wraps this with a fresh [`FilterContext`] per git operation;
 /// fuzz targets keep one context alive across sessions to amortize the
-/// password fetch and the Argon2 key cache.
-pub fn run_session<R: Read, W: Write>(ctx: &FilterContext<'_>, input: R, output: W) -> Result<()> {
+/// password fetch and the Argon2 key cache. Returns the session's outcome
+/// tallies for the caller's summary.
+pub fn run_session<R: Read, W: Write>(
+    ctx: &FilterContext<'_>,
+    input: R,
+    output: W,
+) -> Result<SessionStats> {
     // 4-byte prefix reads must not hit the raw pipe per packet.
     let mut input = BufReader::with_capacity(64 * 1024, input);
     // Room for one maximum packet, so a whole packet is one syscall; flushed
@@ -106,25 +167,31 @@ pub fn run_session<R: Read, W: Write>(ctx: &FilterContext<'_>, input: R, output:
 
     handshake(&mut input, &mut output)?;
     let mut scratch = SessionScratch::default();
-    let result = command_loop(ctx, &mut input, &mut output, &mut scratch);
+    let mut stats = SessionStats::default();
+    let result = command_loop(ctx, &mut input, &mut output, &mut scratch, &mut stats);
     // Flush the staged smudge records at every session end: normal EOF, a
     // sent abort, or an error bubbling out of the loop all pass here (a
     // handshake failure returns above, before anything can be staged).
     // Explicit on every path — release builds abort on panic, so no
     // Drop-based fallback exists.
     ctx.flush_records();
-    result
+    result?;
+    Ok(stats)
 }
 
 /// Entry point of the `git-se filter-process` subcommand: serve the process
-/// filter protocol on stdin/stdout until git closes the pipe.
+/// filter protocol on stdin/stdout until git closes the pipe, then report
+/// what the session encrypted/decrypted on stderr.
 pub fn serve(repo: &Repo) -> Result<()> {
-    serve_io(repo, io::stdin().lock(), io::stdout().lock())
+    let stats = serve_io(repo, io::stdin().lock(), io::stdout().lock())?;
+    stats.print_stderr_summary(repo.path());
+    Ok(())
 }
 
 /// Protocol engine over arbitrary streams, so tests can drive a full session
-/// in-process.
-pub fn serve_io<R: Read, W: Write>(repo: &Repo, input: R, output: W) -> Result<()> {
+/// in-process. Returns the session's outcome tallies for the caller's
+/// summary.
+pub fn serve_io<R: Read, W: Write>(repo: &Repo, input: R, output: W) -> Result<SessionStats> {
     let ctx = FilterContext::new(repo, SaltSource::Process);
     run_session(&ctx, input, output)
 }
@@ -218,13 +285,14 @@ fn command_loop<R: Read, W: Write>(
     input: &mut BufReader<R>,
     output: &mut BufWriter<W>,
     scratch: &mut SessionScratch,
+    stats: &mut SessionStats,
 ) -> Result<()> {
     loop {
         // None = git closed the pipe: normal end of the session.
         let Some(request) = read_request(input)? else {
             return Ok(());
         };
-        match handle_request(ctx, input, output, request, scratch)? {
+        match handle_request(ctx, input, output, request, scratch, stats)? {
             Flow::Continue => {},
             Flow::Stop => return Ok(()),
         }
@@ -340,6 +408,7 @@ fn handle_request<R: Read, W: Write>(
     output: &mut BufWriter<W>,
     request: Request,
     scratch: &mut SessionScratch,
+    stats: &mut SessionStats,
 ) -> Result<Flow> {
     let mut content = pktline::PktReader::new(input);
 
@@ -361,6 +430,7 @@ fn handle_request<R: Read, W: Write>(
         pktline::write_line(output, "status=abort")?;
         pktline::write_flush(output)?;
         output.flush()?;
+        stats.mark_aborted();
         return Ok(Flow::Stop);
     }
 
@@ -390,16 +460,21 @@ fn handle_request<R: Read, W: Write>(
     body.reclaim(scratch);
 
     match result {
-        Ok(()) => pktline::write_flush(output)?, // empty list: keep success
+        Ok(outcome) => {
+            stats.record(command, &pathname, outcome);
+            pktline::write_flush(output)?; // empty list: keep success
+        },
         Err(e) if session_fatal(&e) => {
             error!("git-se filter-process: {} ({})", e, pathname.display());
             pktline::write_line(output, "status=abort")?;
             pktline::write_flush(output)?;
             output.flush()?;
+            stats.mark_aborted();
             return Ok(Flow::Stop);
         },
         Err(e) => {
             error!("git-se filter-process: {} ({})", e, pathname.display());
+            stats.record_failure(command);
             pktline::write_line(output, "status=error")?;
             pktline::write_flush(output)?;
         },
@@ -571,13 +646,7 @@ mod tests {
         let ctx = FilterContext::new(&repo, SaltSource::PerFile);
         let mut ciphertext = Vec::new();
         let mut input = Cursor::new(b"alpha".to_vec());
-        clean_stream(
-            &ctx,
-            std::path::Path::new("a.txt"),
-            &mut input,
-            &mut ciphertext,
-        )
-        .unwrap();
+        clean_stream(&ctx, Path::new("a.txt"), &mut input, &mut ciphertext).unwrap();
         assert!(is_ciphertext(&ciphertext));
 
         let script = concat(&[
@@ -607,6 +676,43 @@ mod tests {
 
         // the second clean reproduces the first ciphertext byte for byte
         assert_eq!(responses[2].1, responses[0].1);
+    }
+
+    /// A session's stats aggregate per direction: clean counts both real
+    /// encryptions and passthroughs (with the encrypted files' directories
+    /// inline), smudge counts its decryptions.
+    #[test]
+    fn session_stats_aggregate_outcomes_per_direction() {
+        let (_dir, repo) = init_repo();
+
+        let one_shot = FilterContext::new(&repo, SaltSource::PerFile);
+        let mut ciphertext = Vec::new();
+        let mut input = Cursor::new(b"ciphertext payload".to_vec());
+        clean_stream(
+            &one_shot,
+            Path::new("secrets/ct.bin"),
+            &mut input,
+            &mut ciphertext,
+        )
+        .unwrap();
+
+        let script = concat(&[
+            &handshake_request(),
+            &command("clean", "secrets/a.txt", b"alpha"),
+            &command("clean", "top.bin", &ciphertext), // passthrough
+            &command("smudge", "secrets/b.bin", &ciphertext),
+        ]);
+        let mut output = Vec::new();
+        let stats = serve_io(&repo, Cursor::new(script), &mut output).unwrap();
+
+        assert_eq!(
+            stats.clean.inline(ReportAction::Encrypt, Path::new("")),
+            "1 encrypted, 1 passed through (secrets/ 1)"
+        );
+        assert_eq!(
+            stats.smudge.inline(ReportAction::Decrypt, Path::new("")),
+            "1 decrypted (secrets/ 1)"
+        );
     }
 
     #[test]
@@ -664,7 +770,7 @@ mod tests {
             .map(|(path, plain)| {
                 let mut out = Vec::new();
                 let mut input = Cursor::new(plain.to_vec());
-                clean_stream(&one_shot, std::path::Path::new(path), &mut input, &mut out).unwrap();
+                clean_stream(&one_shot, Path::new(path), &mut input, &mut out).unwrap();
                 (*path, out)
             })
             .collect();
@@ -707,7 +813,7 @@ mod tests {
         for ((path, plain), (_, ciphertext)) in files.iter().zip(&ciphertexts) {
             let mut out = Vec::new();
             let mut input = Cursor::new(plain.to_vec());
-            clean_stream(&one_shot, std::path::Path::new(path), &mut input, &mut out).unwrap();
+            clean_stream(&one_shot, Path::new(path), &mut input, &mut out).unwrap();
             assert_eq!(out, *ciphertext);
         }
     }
@@ -722,13 +828,7 @@ mod tests {
         let one_shot = FilterContext::new(&repo, SaltSource::PerFile);
         let mut ciphertext = Vec::new();
         let mut input = Cursor::new(b"alpha".to_vec());
-        clean_stream(
-            &one_shot,
-            std::path::Path::new("a.txt"),
-            &mut input,
-            &mut ciphertext,
-        )
-        .unwrap();
+        clean_stream(&one_shot, Path::new("a.txt"), &mut input, &mut ciphertext).unwrap();
 
         let mut script = handshake_request();
         script.extend(command("smudge", "a.txt", &ciphertext));
@@ -813,13 +913,7 @@ mod tests {
         let ctx = FilterContext::new(&repo, SaltSource::PerFile);
         let mut ciphertext = Vec::new();
         let mut input = Cursor::new(b"secret".to_vec());
-        clean_stream(
-            &ctx,
-            std::path::Path::new("a.txt"),
-            &mut input,
-            &mut ciphertext,
-        )
-        .unwrap();
+        clean_stream(&ctx, Path::new("a.txt"), &mut input, &mut ciphertext).unwrap();
 
         repo.set_config("key", "a-different-key").unwrap();
 

@@ -1,5 +1,6 @@
 pub(crate) mod parallel;
 mod progress;
+pub(crate) mod report;
 pub(crate) mod style;
 
 use std::{
@@ -17,6 +18,7 @@ use log::warn;
 use path_absolutize::Absolutize as _;
 use pathdiff::diff_paths;
 pub use progress::Progress;
+pub use report::{DirReport, FileOutcome, ReportAction, ReportMode};
 use tempfile::NamedTempFile;
 use zeroize::Zeroizing;
 
@@ -495,56 +497,10 @@ fn warn_ignored_in_crypt_entries(ignored: &[PathBuf], repo_path: &Path) {
 
 // --- Reporting & Progress Helpers ---
 
-/// Maximum number of files to display individually before collapsing.
-const REPORT_LIST_LIMIT: usize = 10;
-
-/// Print a pre-operation report listing the target files and total count.
-/// If the list exceeds `REPORT_LIST_LIMIT`, show the first few and summarize
-/// the rest as "... and N more files".
-pub fn print_pre_report(action: &str, files: &[impl AsRef<Path>], repo_path: &Path) {
-    let count = files.len();
-    println!(
-        "\n{} {} {}",
-        action.bold(),
-        format!("({count} files)").cyan(),
-        ":".dimmed()
-    );
-
-    for f in &files[..count.min(REPORT_LIST_LIMIT)] {
-        let relative =
-            diff_paths(f.as_ref(), repo_path).unwrap_or_else(|| f.as_ref().to_path_buf());
-        println!("  {}", relative.display());
-    }
-
-    if count > REPORT_LIST_LIMIT {
-        let remaining = count - REPORT_LIST_LIMIT;
-        println!("  {}", format!("... and {remaining} more files").dimmed());
-    }
-    println!();
-}
-
-/// Print a post-operation summary report.
-pub fn print_post_report(action: &str, total: usize, skipped: usize, failed: usize) {
-    let succeeded = total - skipped - failed;
-    let label = format!("{action} complete").bold();
-
-    if failed > 0 {
-        println!(
-            "\n{}: {} succeeded, {} skipped, {} {}",
-            label,
-            succeeded.to_string().green(),
-            skipped.to_string().yellow(),
-            failed.to_string().red(),
-            "failed".red(),
-        );
-    } else {
-        println!(
-            "\n{}: {} succeeded, {} skipped",
-            label,
-            succeeded.to_string().green(),
-            skipped.to_string().yellow(),
-        );
-    }
+/// Print a one-line pre-operation notice; the directory-level result
+/// report follows when the run finishes.
+pub fn print_pre_report(action: ReportAction, count: usize) {
+    println!("\n{} {} files...", action.label().bold(), count);
 }
 
 /// Check whether a single file is ciphertext produced by this tool.

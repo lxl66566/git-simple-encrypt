@@ -62,7 +62,7 @@ pub use header::{
 // growing the public API.
 pub(crate) use header::{Sniffed, has_gitse_magic, read_header_bytes, sniff};
 pub use key::{KeyCache, KeyDerivation, derive_key, get_or_derive_key};
-pub use repo::{cache_key, decrypt_repo, encrypt_repo};
+pub use repo::{cache_key, decrypt_repo, decrypt_reported, encrypt_repo, encrypt_reported};
 pub use stream::{decrypt_into, decrypt_into_with, encrypt_into};
 
 #[cfg(test)]

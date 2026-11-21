@@ -63,6 +63,7 @@ git-se e                    # Encrypt all files in the encryption list
 git-se d                    # Decrypt all files in the list
 git-se e xxx.txt dir1 ...   # Encrypt selected files
 git-se d xxx.txt dir1 ...   # Decrypt selected files
+git-se e -v                 # List every processed file individually instead of the directory summary
 git-se check                # Check that all files in the encryption list are encrypted (alias: c)
 git-se check --staged       # Only check files staged for commit (used by the pre-commit hook)
 git-se i --mode hook        # Install a pre-commit hook to check that all files are encrypted before each commit

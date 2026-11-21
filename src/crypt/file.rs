@@ -79,7 +79,7 @@ pub(super) fn encrypt_file_impl(
     if let Some(bytes) = read_header_bytes(&mut src_file)? {
         let sniffed = sniff(&bytes);
         if sniffed.is_our_ciphertext() {
-            warn!("Source file already encrypted, skipping: {}", src.display());
+            debug!("Source file already encrypted, skipping: {}", src.display());
             if let Some(cache) = salt_cache
                 && let Ok(header) = FileHeader::from_bytes(&bytes)
             {

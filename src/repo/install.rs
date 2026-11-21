@@ -63,9 +63,7 @@ impl Repo {
         );
         println!(
             "{}",
-            "Working-tree files stay plaintext; git encrypts them on `git add` and decrypts on \
-             checkout."
-                .dimmed()
+            "git-se encrypts them on `git add` and decrypts on checkout.".dimmed()
         );
         if !has_key {
             println!(

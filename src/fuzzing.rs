@@ -42,7 +42,7 @@ impl<'a> FilterProcessSession<'a> {
     /// stream, response bytes land in `output`. Protocol violations return
     /// `Err`; a panic is always a bug.
     pub fn serve(&self, input: &mut dyn Read, output: &mut dyn Write) -> Result<()> {
-        crate::filter::process::run_session(&self.ctx, input, output)
+        crate::filter::process::run_session(&self.ctx, input, output).map(|_| ())
     }
 }
 

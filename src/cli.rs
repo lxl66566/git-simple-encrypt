@@ -15,6 +15,7 @@ git-se p                    # Set/update master password
 git-se add file.txt  mydir  # Add files/folders to the encryption list
 git-se e                    # Encrypt all files in the list
 git-se d                    # Decrypt all files in the list
+git-se e -v                 # List every processed file individually
 git-se e xxx.txt dir1 ...   # Encrypt specific files
 git-se d xxx.txt dir1 ...   # Decrypt specific files
 git-se i                    # Install git filter integration: automatic encryption / decryption
@@ -60,6 +61,9 @@ pub enum SubCommand {
         /// The files or folders to be encrypted.
         #[clap(value_parser = cwd_path_parser)]
         paths: Vec<PathBuf>,
+        /// List every file individually instead of the directory summary.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Decrypt all files with crypt attr and `.enc` extension.
     #[clap(alias("d"))]
@@ -67,6 +71,9 @@ pub enum SubCommand {
         /// The files or folders to be decrypted.
         #[clap(value_parser = cwd_path_parser)]
         paths: Vec<PathBuf>,
+        /// List every file individually instead of the directory summary.
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Mark files or folders as need-to-be-crypted.
     Add {

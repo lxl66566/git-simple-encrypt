@@ -22,7 +22,7 @@ pub mod fuzzing;
 #[cfg(feature = "bin")]
 pub use crate::cli::{Cli, InstallMode, SetField, SubCommand};
 #[cfg(feature = "bin")]
-use crate::crypt::{decrypt_repo, encrypt_repo};
+use crate::crypt::{decrypt_reported, encrypt_reported};
 #[cfg(feature = "bin")]
 use crate::repo::Repo;
 pub use crate::{
@@ -45,8 +45,12 @@ pub fn run(cli: Cli) -> Result<()> {
     // exactly like `Repo::open`.
     let mut repo = Repo::discover(&cli.repo)?;
     match cli.command {
-        SubCommand::Encrypt { paths } => encrypt_repo(&repo, &paths)?,
-        SubCommand::Decrypt { paths } => decrypt_repo(&repo, &paths)?,
+        SubCommand::Encrypt { paths, verbose } => {
+            encrypt_reported(&repo, &paths, verbose.into())?;
+        },
+        SubCommand::Decrypt { paths, verbose } => {
+            decrypt_reported(&repo, &paths, verbose.into())?;
+        },
         SubCommand::Add { paths } => {
             repo.conf.add_paths_to_crypt_list(&paths)?;
             // Keep the managed .gitattributes block in sync in filter mode.

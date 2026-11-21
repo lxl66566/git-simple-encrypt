@@ -61,6 +61,7 @@ git-se e                    # 加密列表中的所有文件
 git-se d                    # 解密列表中的所有文件
 git-se e xxx.txt dir1 ...   # 部分加密文件
 git-se d xxx.txt dir1 ...   # 部分解密文件
+git-se e -v                 # 逐个列出处理的文件，而不是目录汇总
 git-se check                # 检查加密列表中的所有文件是否已加密（别名：c）
 git-se check --staged       # 仅检查已暂存待提交的文件（pre-commit hook 使用）
 git-se i --mode hook        # 安装 pre commit hook，在每次提交前检查是否所有文件都已加密

@@ -70,6 +70,7 @@ use crate::{
     error::{Error, Result},
     repo::Repo,
     salt_cache::{self, CachedEntry, SaltCacheReader},
+    utils::{FileOutcome, ReportAction},
 };
 
 /// Read up to `n` bytes from `reader`, returning exactly what was consumed
@@ -268,13 +269,14 @@ impl<'a> FilterContext<'a> {
 }
 
 /// Clean filter core: encrypt the stream. Already-encrypted input passes
-/// through unchanged (idempotency).
+/// through unchanged (idempotency). The return value tells the caller
+/// which happened, for per-file logging and session tallies.
 pub(crate) fn clean_stream<W: Write>(
     ctx: &FilterContext<'_>,
     path: &Path,
     input: &mut dyn Read,
     out: &mut W,
-) -> Result<()> {
+) -> Result<FileOutcome> {
     let prefix = peek(input, HEADER_LEN)?;
     match prefix
         .first_chunk::<HEADER_LEN>()
@@ -285,7 +287,8 @@ pub(crate) fn clean_stream<W: Write>(
         // would double-wrap data that no current build can unwrap in one
         // step, so it is left byte-identical instead.
         Sniffed::Ciphertext | Sniffed::FutureVersion(_) => {
-            return passthrough(&prefix, input, out);
+            passthrough(&prefix, input, out)?;
+            return Ok(FileOutcome::PassedThrough);
         },
         Sniffed::UnknownAlgo(algo) => {
             warn!("GITSE magic with unknown algorithm byte {algo}; encrypting as plaintext");
@@ -324,26 +327,30 @@ pub(crate) fn clean_stream<W: Write>(
         ctx.repo.conf.use_zstd.then_some(ctx.repo.conf.zstd_level),
     )?;
     out.flush()?;
-    Ok(())
+    Ok(FileOutcome::Transformed)
 }
 
 /// Decrypt-stream core shared by smudge and diff.
 ///
 /// Non-encrypted input passes through unchanged. `record`, when not
 /// [`Record::Skip`], persists the header entry for deterministic
-/// re-encryption (smudge only, see module docs).
+/// re-encryption (smudge only, see module docs). The return value tells the
+/// caller whether content was decrypted or passed through.
 pub(crate) fn decrypt_stream<W: Write>(
     ctx: &FilterContext<'_>,
     input: &mut dyn Read,
     out: &mut W,
     record: Record<'_>,
-) -> Result<()> {
+) -> Result<FileOutcome> {
     let prefix = peek(input, HEADER_LEN)?;
     match prefix
         .first_chunk::<HEADER_LEN>()
         .map_or(Sniffed::Plaintext, sniff)
     {
-        Sniffed::Plaintext => return passthrough(&prefix, input, out),
+        Sniffed::Plaintext => {
+            passthrough(&prefix, input, out)?;
+            return Ok(FileOutcome::PassedThrough);
+        },
         // A GITSE file this build cannot handle fails loudly: silently
         // passing the ciphertext through would hand it to the worktree as
         // fake "plaintext" (and via `filter.required=true`, git aborts the
@@ -375,7 +382,7 @@ pub(crate) fn decrypt_stream<W: Write>(
         #[cfg(feature = "bin")]
         Record::Session(key) => ctx.stage_record(key, entry),
     }
-    Ok(())
+    Ok(FileOutcome::Transformed)
 }
 
 fn random_salt() -> [u8; SALT_LEN] {
@@ -388,18 +395,43 @@ fn random_salt() -> [u8; SALT_LEN] {
 /// the file path relative to the repo root.
 pub fn clean(repo: &Repo, path: &Path) -> Result<()> {
     let ctx = FilterContext::new(repo, SaltSource::PerFile);
-    let mut stdin = io::stdin().lock();
-    let mut stdout = BufWriter::new(io::stdout().lock());
-    clean_stream(&ctx, path, &mut stdin, &mut stdout)
+    let outcome = {
+        let mut stdin = io::stdin().lock();
+        let mut stdout = BufWriter::new(io::stdout().lock());
+        clean_stream(&ctx, path, &mut stdin, &mut stdout)?
+    };
+    log_outcome(ReportAction::Encrypt, path, outcome);
+    Ok(())
 }
 
 /// Git smudge filter: decrypt stdin to stdout and record the salt cache.
 pub fn smudge(repo: &Repo, path: &Path) -> Result<()> {
     let ctx = FilterContext::new(repo, SaltSource::PerFile);
     let key = cache_key(path, repo.path());
-    let mut stdin = io::stdin().lock();
-    let mut stdout = BufWriter::new(io::stdout().lock());
-    decrypt_stream(&ctx, &mut stdin, &mut stdout, Record::Disk(&key))
+    let outcome = {
+        let mut stdin = io::stdin().lock();
+        let mut stdout = BufWriter::new(io::stdout().lock());
+        decrypt_stream(&ctx, &mut stdin, &mut stdout, Record::Disk(&key))?
+    };
+    log_outcome(ReportAction::Decrypt, path, outcome);
+    Ok(())
+}
+
+/// Per-file visibility for the one-shot drivers, one line on stderr each.
+///
+/// The filter-driver log level defaults to Error, so this stays silent
+/// unless the user opts in with `RUST_LOG=info` (git shows the filter's
+/// stderr directly); the process filter aggregates a session summary
+/// instead.
+fn log_outcome(action: ReportAction, path: &Path, outcome: FileOutcome) {
+    match outcome {
+        FileOutcome::Transformed => {
+            log::info!("git-se: {} {}", action.past(), path.display());
+        },
+        FileOutcome::PassedThrough => {
+            log::info!("git-se: passed through {}", path.display());
+        },
+    }
 }
 
 /// Diff textconv: decrypt the ciphertext blob in `file` (the temp file git
@@ -409,10 +441,10 @@ pub fn diff(repo: &Repo, file: Option<&Path>) -> Result<()> {
     let mut stdout = BufWriter::new(io::stdout().lock());
     let Some(path) = file else {
         let mut stdin = io::stdin().lock();
-        return decrypt_stream(&ctx, &mut stdin, &mut stdout, Record::Skip);
+        return decrypt_stream(&ctx, &mut stdin, &mut stdout, Record::Skip).map(|_| ());
     };
     let mut input = std::fs::File::open(path)?;
-    decrypt_stream(&ctx, &mut input, &mut stdout, Record::Skip)
+    decrypt_stream(&ctx, &mut input, &mut stdout, Record::Skip).map(|_| ())
 }
 
 #[cfg(test)]

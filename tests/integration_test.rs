@@ -52,6 +52,22 @@ fn run(cmd: SubCommand, pwd: impl Into<PathBuf>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Encrypt/Decrypt commands with the default summary report; runs needing
+/// verbosity construct the variant directly.
+fn encrypt(paths: Vec<PathBuf>) -> SubCommand {
+    SubCommand::Encrypt {
+        paths,
+        verbose: false,
+    }
+}
+
+fn decrypt(paths: Vec<PathBuf>) -> SubCommand {
+    SubCommand::Decrypt {
+        paths,
+        verbose: false,
+    }
+}
+
 trait PathExt {
     fn is_encrypted(&self) -> bool;
     fn is_compressed(&self) -> bool;
@@ -156,7 +172,7 @@ fn test_basic() -> anyhow::Result<()> {
     )?;
 
     // Encrypt (added files)
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     // Test
     temp_dir.read_dir()?.for_each(|x| println!("{x:?}"));
@@ -167,7 +183,7 @@ fn test_basic() -> anyhow::Result<()> {
     assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     // Decrypt
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
     println!("{}", "After Decrypt".green());
 
     // Test decrypt result
@@ -207,9 +223,9 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     )?;
 
     // Encrypt multiple times
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     // Test
     temp_dir.read_dir()?.for_each(|x| println!("{x:?}"));
@@ -221,7 +237,7 @@ fn test_encrypt_multiple_times() -> anyhow::Result<()> {
     assert!(temp_dir.join("dir/t4.txt").is_encrypted());
 
     // Decrypt
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
     println!("{}", "After Decrypt".green());
 
     // Test
@@ -265,9 +281,9 @@ fn test_many_files() -> anyhow::Result<()> {
     )?;
 
     // Encrypt
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
     // Decrypt
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
 
     // Test
     for _ in 1..10 {
@@ -297,10 +313,10 @@ fn test_large_file_encrypt_decrypt() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     assert!(file_path.is_encrypted());
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
 
     let decrypted_data = fs::read(&file_path)?;
     assert_eq!(decrypted_data, original_data);
@@ -334,7 +350,7 @@ fn test_compressible_multichunk_roundtrip() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     assert!(file_path.is_compressed());
     // The compressed stream exceeds one chunk: 64B header + at least two
@@ -345,12 +361,12 @@ fn test_compressible_multichunk_roundtrip() -> anyhow::Result<()> {
     );
     let ciphertext = fs::read(&file_path)?;
 
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
     assert_eq!(fs::read(&file_path)?, original);
 
     // Re-encrypting the unchanged file must reproduce the same compressed
     // ciphertext byte for byte.
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
     assert_eq!(fs::read(&file_path)?, ciphertext);
 
     Ok(())
@@ -374,15 +390,10 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     )?;
 
     // Encrypt
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     // Partial decrypt
-    run(
-        SubCommand::Decrypt {
-            paths: vec!["dir".into()],
-        },
-        temp_dir,
-    )?;
+    run(decrypt(vec!["dir".into()]), temp_dir)?;
 
     // Test
     for entry in temp_dir.read_dir()? {
@@ -392,15 +403,10 @@ fn test_partial_decrypt() -> anyhow::Result<()> {
     assert!(temp_dir.join("dir/t4.txt").exists());
 
     // Reencrypt
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     // Partial decrypt
-    run(
-        SubCommand::Decrypt {
-            paths: vec!["t1.txt".into()],
-        },
-        temp_dir,
-    )?;
+    run(decrypt(vec!["t1.txt".into()]), temp_dir)?;
 
     // Test
     for entry in temp_dir.read_dir()? {
@@ -427,7 +433,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
         },
         temp_dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     assert!(file_path.is_encrypted());
     let mut encrypted_data = fs::read(&file_path)?;
@@ -441,7 +447,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     fs::write(&file_path, &encrypted_data)?;
 
     // 尝试解密，应该失败（AAD 校验不通过）
-    let decrypt_result = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
+    let decrypt_result = run(decrypt(vec![]), temp_dir);
     dbg!(&decrypt_result);
     assert!(decrypt_result.is_err());
     // 可选：验证文件仍然处于加密状态（因为解密失败，文件未被修改）
@@ -452,7 +458,7 @@ fn test_tampered_encrypted_file_fails_aad() -> anyhow::Result<()> {
     encrypted_data2.truncate(encrypted_data2.len().saturating_sub(10));
     fs::write(&file_path, &encrypted_data2)?;
 
-    let decrypt_result2 = run(SubCommand::Decrypt { paths: vec![] }, temp_dir);
+    let decrypt_result2 = run(decrypt(vec![]), temp_dir);
     dbg!(&decrypt_result);
     assert!(decrypt_result2.is_err());
 
@@ -478,7 +484,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     )?;
 
     // ---- First encrypt ----
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
     assert!(temp_dir.join("t1.txt").is_encrypted());
     assert!(temp_dir.join("t2.txt").is_compressed());
     assert!(temp_dir.join("dir/t3.txt").is_encrypted());
@@ -488,7 +494,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     let enc1_t3 = fs::read(temp_dir.join("dir/t3.txt"))?;
 
     // ---- Decrypt ----
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
     assert_eq!(
         fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
@@ -503,7 +509,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     );
 
     // ---- Re-encrypt (should produce identical ciphertext) ----
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
 
     let enc2_t1 = fs::read(temp_dir.join("t1.txt"))?;
     let enc2_t2 = fs::read(temp_dir.join("t2.txt"))?;
@@ -523,7 +529,7 @@ fn test_deterministic_reencryption() -> anyhow::Result<()> {
     );
 
     // Verify the files still decrypt correctly
-    run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+    run(decrypt(vec![]), temp_dir)?;
     assert_eq!(
         fs::read_to_string(temp_dir.join("t1.txt"))?,
         "Hello, world!"
@@ -555,18 +561,18 @@ fn test_deterministic_reencryption_multiple_cycles() -> anyhow::Result<()> {
     )?;
 
     // Encrypt and capture ciphertext from 3 decrypt→encrypt cycles
-    run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+    run(encrypt(vec![]), temp_dir)?;
     let reference = fs::read(temp_dir.join("data.txt"))?;
 
     for cycle in 1..=3 {
-        run(SubCommand::Decrypt { paths: vec![] }, temp_dir)?;
+        run(decrypt(vec![]), temp_dir)?;
         assert_eq!(
             fs::read_to_string(temp_dir.join("data.txt"))?,
             "persistent data",
             "Data corrupted at cycle {cycle}"
         );
 
-        run(SubCommand::Encrypt { paths: vec![] }, temp_dir)?;
+        run(encrypt(vec![]), temp_dir)?;
         let ciphertext = fs::read(temp_dir.join("data.txt"))?;
         assert_eq!(ciphertext, reference, "Ciphertext changed at cycle {cycle}");
     }
@@ -593,12 +599,7 @@ fn test_check_staged() -> anyhow::Result<()> {
     )?;
 
     // Encrypt only encrypted.txt, leave unencrypted.txt as-is
-    run(
-        SubCommand::Encrypt {
-            paths: vec!["encrypted.txt".into()],
-        },
-        temp_dir,
-    )?;
+    run(encrypt(vec!["encrypted.txt".into()]), temp_dir)?;
     assert!(temp_dir.join("encrypted.txt").is_encrypted());
     assert!(temp_dir.join("unencrypted.txt").is_not_encrypted());
 
@@ -1323,23 +1324,13 @@ fn walker_encrypt_root_dot_skips_git_dir() -> anyhow::Result<()> {
     fs::write(temp_dir.join("plain.txt"), "data")?;
     assert!(temp_dir.join(".git").join("HEAD").is_file());
 
-    run(
-        SubCommand::Encrypt {
-            paths: vec![".".into()],
-        },
-        temp_dir,
-    )?;
+    run(encrypt(vec![".".into()]), temp_dir)?;
     assert!(temp_dir.join("plain.txt").is_encrypted());
     assert!(temp_dir.join(".git").join("HEAD").is_not_encrypted());
     assert!(temp_dir.join(".git").join("config").is_not_encrypted());
 
     // Recovery still works: `d .` decrypts the worktree only.
-    run(
-        SubCommand::Decrypt {
-            paths: vec![".".into()],
-        },
-        temp_dir,
-    )?;
+    run(decrypt(vec![".".into()]), temp_dir)?;
     assert_eq!(fs::read_to_string(temp_dir.join("plain.txt"))?, "data");
     Ok(())
 }
@@ -1415,12 +1406,7 @@ fn escape_encrypt_outside_paths_are_skipped() -> anyhow::Result<()> {
     let relative_target = PathBuf::from("..").join(&name).join("secret.txt");
 
     for escaping in [absolute_target.clone(), relative_target] {
-        let result = run(
-            SubCommand::Encrypt {
-                paths: vec![escaping],
-            },
-            temp_dir,
-        );
+        let result = run(encrypt(vec![escaping]), temp_dir);
         assert!(result.is_err(), "encrypting outside the repo must fail");
     }
     assert!(
@@ -1441,20 +1427,10 @@ fn walker_absolute_path_roundtrip() -> anyhow::Result<()> {
     assert!(file.is_absolute());
     fs::write(&file, "absolute path content")?;
 
-    run(
-        SubCommand::Encrypt {
-            paths: vec![file.clone()],
-        },
-        temp_dir,
-    )?;
+    run(encrypt(vec![file.clone()]), temp_dir)?;
     assert!(file.is_encrypted());
 
-    run(
-        SubCommand::Decrypt {
-            paths: vec![file.clone()],
-        },
-        temp_dir,
-    )?;
+    run(decrypt(vec![file.clone()]), temp_dir)?;
     assert_eq!(fs::read_to_string(&file)?, "absolute path content");
     Ok(())
 }
@@ -1613,7 +1589,7 @@ fn subdir_encrypt_check_decrypt() -> anyhow::Result<()> {
     )?;
 
     let sub = dir.join("sub");
-    run(SubCommand::Encrypt { paths: vec![] }, &sub)?;
+    run(encrypt(vec![]), &sub)?;
     assert!(dir.join("sub/s.txt").is_encrypted());
     run(
         SubCommand::Check {
@@ -1622,7 +1598,7 @@ fn subdir_encrypt_check_decrypt() -> anyhow::Result<()> {
         },
         &sub,
     )?;
-    run(SubCommand::Decrypt { paths: vec![] }, &sub)?;
+    run(decrypt(vec![]), &sub)?;
     assert_eq!(fs::read_to_string(dir.join("sub/s.txt"))?, "secret\n");
     Ok(())
 }
@@ -1727,7 +1703,7 @@ fn stagedblob_special_char_paths_are_checked() -> anyhow::Result<()> {
     );
 
     // After encrypting and re-staging, the blobs are ciphertext and pass.
-    run(SubCommand::Encrypt { paths: vec![] }, dir)?;
+    run(encrypt(vec![]), dir)?;
     git(dir, &add_args)?;
     run(
         SubCommand::Check {
@@ -1790,7 +1766,7 @@ fn stagedblob_encrypted_worktree_cannot_mask_staged_plaintext() -> anyhow::Resul
         dir,
     )?;
     git(dir, &["add", "s.txt"])?; // stages the plaintext bytes
-    run(SubCommand::Encrypt { paths: vec![] }, dir)?; // worktree now ciphertext
+    run(encrypt(vec![]), dir)?; // worktree now ciphertext
     assert!(dir.join("s.txt").is_encrypted());
 
     let result = run(
@@ -1832,7 +1808,7 @@ fn installguard_refuses_to_reset_staged_changes() -> anyhow::Result<()> {
         },
         dir,
     )?;
-    run(SubCommand::Encrypt { paths: vec![] }, dir)?;
+    run(encrypt(vec![]), dir)?;
     git(dir, &["add", "s.txt"])?;
     git(dir, &["commit", "-m", "enc"])?;
 
@@ -1896,8 +1872,7 @@ fn keyscope_global_config_key_is_not_adopted() -> anyhow::Result<()> {
         },
         dir,
     )?;
-    let err = run(SubCommand::Encrypt { paths: vec![] }, dir)
-        .expect_err("encrypt must fail without a repo-local key");
+    let err = run(encrypt(vec![]), dir).expect_err("encrypt must fail without a repo-local key");
     assert!(
         err.to_string().contains("Key not found"),
         "expected a key-not-found error, got: {err}"
